@@ -25,7 +25,7 @@ flowchart TD
 
     subgraph HAL["Thin SP-1 Hardware Abstraction Layer (src/hal/)"]
         AUDIO["hal_audio: I2S0 EasyDMA Pump + CS42L42 / TAS2505 Init"]
-        INPUT["hal_input: SAADC Faders (AIN2/3/6/7) + Button Ladders (AIN0/1) + Fn GPIO"]
+        INPUT["hal_controls: SAADC Faders (AIN2/3/6/7) + Button Ladders (AIN0/1) + Fn GPIO"]
         LEDS["hal_leds: PWM2 Track LEDs + PWM3 Play LEDs"]
         MIDI["hal_midi: USB-C MIDI UMP 24 PPQN Clock & CC Bridge"]
     end

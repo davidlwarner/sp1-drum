@@ -13,6 +13,7 @@ These rules govern all code written for the SP-1 4-track Euclidean drum machine 
   - `src/hal/`: Thin SP-1 Zephyr hardware abstraction layer (I2S0 DMA audio pump, CS42L42/TAS2505 init, SAADC faders/buttons, PWM LEDs, USB-C MIDI UMP bridge).
 - **Never** interleave drum-machine application logic into upstream `sp1-midi` files (`boards/`, `drivers/`, `subsys/`, `app/`) beyond minimal glue/dispatch hooks when Milestone 1+ integration begins. This preserves clean upstream merges and keeps future rebasing onto `Worldwave/Wakes` straightforward.
 - `src/core/` and `src/dsp/` **must remain 100% portable C11** with zero `#include <zephyr/...>` or Nordic HAL headers so every module compiles and executes natively in the host `ctest` suite.
+- Because the upstream Zephyr entrypoint (`app/main.cpp`) is compiled as C++17, **all public headers under `src/core/`, `src/dsp/`, and `src/hal/` must include `#ifdef __cplusplus extern "C" { #endif` guards**.
 
 ## 3. Zero Dynamic Memory Allocation After Startup
 - **Forbidden** anywhere after startup initialization (and forbidden entirely inside `src/core/` and `src/dsp/`):

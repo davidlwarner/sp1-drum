@@ -57,7 +57,7 @@ static inline uint32_t sp1_hz_to_phase_inc(float freq_hz) {
 /* phase += phase_inc; */
 ```
 
-- **Phase Modulation (2-op FM):** Add `(uint32_t)((int32_t)(mod_sample * mod_index_u32))` to the carrier read index without mutating the carrier's running accumulator (true phase modulation, zero DC pitch drift).
+- **Phase Modulation (2-op FM):** Add `(uint32_t)((int32_t)(mod_sample * mod_phase_scale))` (with `float mod_phase_scale` clamped to `<= 2.0e9f`, or cast via `int64_t`, so `mod_sample * mod_phase_scale` never exceeds `INT32_MAX` and avoids C11 float-to-int overflow UB or Cortex-M4F `vcvt.s32.f32` saturation) to the carrier read index without mutating the carrier's running accumulator (true phase modulation, zero DC pitch drift).
 
 ---
 
@@ -122,7 +122,7 @@ typedef struct {
     float k;      /* damping = 1 / Q */
 } sp1_svf_t;      /* Static RAM: 24 bytes per instance */
 
-/* Fast tan(pi * fc / fs) approximation accurate to <0.2% for fc <= 0.42 * fs.
+/* Fast tan(pi * fc / fs) approximation accurate to <0.2% for fc <= 0.30 * fs (<1.6% at 0.42 * fs).
  * Call at block rate or on parameter change — NOT per sample. */
 static inline float sp1_fast_tan_pi(float w) {
     /* w = fc / fs clamped to [0.0004f, 0.42f] => pi*w in [0.00125, 1.32] */
@@ -171,7 +171,7 @@ static inline void sp1_svf_process(sp1_svf_t *f, float v0,
 
 ## 5. Fast Noise, Envelopes & Static Delay Buffers
 
-- **PRNG Noise (Snare/Hat):** 32-bit `xorshift32` (~4 cycles/sample) scaled by `(1.0f / 2147483648.0f)` into `[-1.0f, +1.0f]`. Seed with non-zero constant per voice.
+- **PRNG Noise (Snare/Hat):** 32-bit `xorshift32` (~4 cycles/sample) cast to signed `int32_t` and scaled via `(float)(int32_t)state * (1.0f / 2147483648.0f)` into `[-1.0f, +1.0f)`. Seed with non-zero constant per voice.
 - **Exponential Decay Envelopes:** `env *= coeff` where `coeff = expf(-1.0f / (tau_sec * 48000.0f))` computed once on trigger/param change; snap to `0.0f` when `env < 1e-5f` so idle voices short-circuit and save CPU.
 - **Delay / Stutter Buffer:** Size to a power of two (e.g., `16384` `int16_t` mono samples = `32 KB` SRAM = `341 ms` @ 48 kHz, or `32768` `int16_t` = `64 KB` SRAM = `682 ms`) so index wrapping uses `idx & (BUF_LEN - 1U)` (1 cycle, zero modulo).
 - **One-Pole Parameter Smoothing:** Smooth fader-driven parameters (cutoff, pitch, drive, wet/dry) inside the audio callback via `cur += 0.002f * (target - cur)` to eliminate zipper noise without per-sample divisions.

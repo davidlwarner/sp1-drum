@@ -14,6 +14,7 @@ Before running broad `grep`, `rg`, or file-by-file searches across `reference/` 
      graphify path "<node-A>" "<node-B>" --graph graphify-out/graph.json
      ```
 3. **Targeted file inspection:** Open only the specific source files and line ranges identified by the graph query.
+4. **Ephemeral VM fallback:** Because `graphify-out/` and `reference/` are gitignored, if `graphify-out/graph.json` or `reference/` is absent in a newly provisioned container, either run `graphify extract . --code-only --no-gitignore` (if `graphify` is installed) or inspect tracked repository files directly without blocking on missing graph artifacts.
 
 ## Keeping the Graph Fresh
 

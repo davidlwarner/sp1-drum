@@ -55,6 +55,8 @@ All SAADC channels are configured in `stem_player.dts` with 12-bit resolution (`
 | Track 4 (`T4`) | `INPUT_KEY_4` | `1091, 1178, 1259, 1334, 1403, 1467, 1528, 1584` |
 | Play | `INPUT_KEY_PLAY` | `1587, 1589, 1591, 1592` |
 
+  - **Chord Restriction Caveat:** Because `play_key` (`1587–1592 mV`) shares the `AIN0` resistor ladder with `T1..T4` (`T1+T2+T3+T4 = 1584 mV`) and dominates the ladder voltage when pressed, `Play + T1..T4` cannot be decoded as distinct button chords. Always use **Function (`P0.27`, independent GPIO)** or **Transport buttons (`AIN1`, separate ADC channel)** as shift/modifier keys with `T1..T4`.
+
 - **Transport + Volume Ladder (`AIN1` / `P0.03`, `adc_keys_transport`, `vref-mv = 825`, 20 ms poll):**
 
 | Button | Zephyr Keycode | Thresholds (mV) |
@@ -91,7 +93,7 @@ All 8 LEDs use `PWM_USEC(1024)` period (`~976.6 Hz`). Clear all LEDs before `sys
 
 ### I2S0 Audio Streaming (`&i2s0`, Master Mode)
 - **Pins:** `BCLK (SCK_M) = P0.12`, `LRCK_M = P0.11`, `SDOUT = P1.09`.
-- **Format:** 48,000 Hz stereo, 16-bit or 24-bit frames (`Wakes` uses 96-frame / 2 ms stereo `int16_t` EasyDMA blocks via `K_MEM_SLAB_DEFINE_STATIC` + `i2s_write()` with `CONFIG_I2S_NRFX_TX_BLOCK_COUNT` tuned for ~8 ms end-to-end latency).
+- **Format:** 48,000 Hz stereo. Note that upstream `drivers/audio/cs42l42_codec.c` (`cs42l42_configure()`) explicitly requires **`word_size = 24U`** (returning `-ENOTSUP` otherwise) and `drivers/audio/tas2505_codec.c` hardcodes Page 0 Reg 27 = `0x20` (24-bit I2S in 32-bit slots, 64-SCLK/frame = 3.072 MHz BCLK), so `src/hal/hal_audio` should pack 24-bit PCM into 32-bit stereo EasyDMA words when using the unmodified upstream codec drivers (whereas `Wakes`'s custom register script uses 96-frame / 2 ms stereo `int16_t` EasyDMA blocks via `K_MEM_SLAB_DEFINE_STATIC` + `i2s_write()`).
 
 ---
 
@@ -127,6 +129,6 @@ All 8 LEDs use `PWM_USEC(1024)` period (`~976.6 Hz`). Clear all LEDs before `sys
 
 ### Mandatory Pre-Flash Safety Checklist
 - [ ] `CONFIG_USE_DT_CODE_PARTITION=y` enabled (image linked at `0x20000`, never `0x0`).
-- [ ] Watchdog fed `< 5 s` in every blocking loop (`subsys/system/Watchdog.cpp`).
-- [ ] `k_sys_fatal_error_handler()` reboots rather than halting.
+- [ ] Two-tier watchdog (`subsys/system/Watchdog.cpp`): hardware `NRF_WDT0` timeout is `2000 ms` (serviced every `100 ms` by `k_timer`), while registered software channels (`5000 ms`) are fed `< 5 s` (and any pre-timer blocking init loop feeds `< 2 s`).
+- [ ] `k_sys_fatal_error_handler()` wired in `src/hal/` to reboot rather than halt (not overridden in stock `sp1-midi`).
 - [ ] Function 3-second hold cleanly shuts down codecs, oscillator, LEDs, and enters `sys_poweroff()`.
