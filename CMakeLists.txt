@@ -24,17 +24,24 @@ set(APP_SOURCES
     app/Leds.cpp
 )
 
-# ── Drum Machine HAL sources (strict C11) ────────────────────────
+# ── Drum Machine Core & HAL sources (strict C11) ─────────────────
+set(CORE_SOURCES
+    src/core/euclid.c
+    src/core/clock_sync.c
+    src/core/sequencer.c
+    src/core/ui_mapper.c
+)
+
 set(HAL_SOURCES
     src/hal/sp1_hal_common.c
     src/hal/sp1_hal_zephyr.c
 )
 
-set_source_files_properties(${HAL_SOURCES} PROPERTIES
+set_source_files_properties(${CORE_SOURCES} ${HAL_SOURCES} PROPERTIES
     COMPILE_OPTIONS "-std=c11;-Wall;-Wextra;-Werror"
 )
 
-target_sources(app PRIVATE ${BSP_SOURCES} ${APP_SOURCES} ${HAL_SOURCES})
+target_sources(app PRIVATE ${BSP_SOURCES} ${APP_SOURCES} ${CORE_SOURCES} ${HAL_SOURCES})
 target_include_directories(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/app
     ${CMAKE_CURRENT_SOURCE_DIR}/src
