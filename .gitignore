@@ -52,3 +52,14 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Build outputs
+build/
+build-host/
+
+# Local reference repositories
+reference/
+
+# Knowledge graph outputs
+graphify-out/
+
