@@ -19,6 +19,7 @@ extern "C" {
 #include "MidiController.hpp"
 #include "power/PowerManager.hpp"
 #include "system/Watchdog.hpp"
+#include "hal/sp1_hal.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -108,12 +109,14 @@ static void on_midi_rx(const struct device*, const struct midi_ump ump) {
         ump_stream_respond(&responder_cfg, ump);
         return;
     }
+    sp1_hal_midi_on_rx_ump32(ump.data[0]);
     g_midi.on_rx(ump);
 }
 
 static void on_midi_ready(const struct device*, const bool ready) {
     LOG_INF("USB MIDI %s", ready ? "ready" : "disconnected");
     g_midi.ready.store(ready, std::memory_order_relaxed);
+    sp1_hal_midi_set_ready(ready);
 
     // Status LED: play LED 1
     g_leds.set_play(0, ready ? 128 : 0);
@@ -126,6 +129,22 @@ static const struct usbd_midi_ops midi_ops = {
 
 // ── Input subsystem callback (buttons → MIDI) ───────────────────
 
+static bool map_input_key_to_sp1_btn(uint16_t code, sp1_button_id_t *out) {
+    switch (code) {
+    case INPUT_KEY_1:           *out = SP1_BTN_TRACK_1;  return true;
+    case INPUT_KEY_2:           *out = SP1_BTN_TRACK_2;  return true;
+    case INPUT_KEY_3:           *out = SP1_BTN_TRACK_3;  return true;
+    case INPUT_KEY_4:           *out = SP1_BTN_TRACK_4;  return true;
+    case INPUT_KEY_PLAY:        *out = SP1_BTN_PLAY;     return true;
+    case INPUT_KEY_BACK:        *out = SP1_BTN_RWD;      return true;
+    case INPUT_KEY_VOLUMEDOWN:  *out = SP1_BTN_VOL_DOWN; return true;
+    case INPUT_KEY_FASTFORWARD: *out = SP1_BTN_FWD;      return true;
+    case INPUT_KEY_VOLUMEUP:    *out = SP1_BTN_VOL_UP;   return true;
+    case INPUT_KEY_MENU:        *out = SP1_BTN_FN;       return true;
+    default:                    return false;
+    }
+}
+
 static void on_input_event(struct input_event *evt, void*) {
     if (evt == nullptr || evt->type != INPUT_EV_KEY) {
         return;
@@ -133,6 +152,11 @@ static void on_input_event(struct input_event *evt, void*) {
 
     // Only act on press edges (not release) for toggle controls
     const bool pressed = (evt->value != 0);
+
+    sp1_button_id_t hal_btn = SP1_BTN_TRACK_1;
+    if (map_input_key_to_sp1_btn(evt->code, &hal_btn)) {
+        sp1_hal_controls_on_button_event(hal_btn, pressed);
+    }
 
     switch (evt->code) {
     // ── Track buttons → MIDI notes (offset by current octave) ────
@@ -260,6 +284,12 @@ int main(void) {
         LOG_INF("USB MIDI configured");
     } else {
         LOG_ERR("MIDI device not ready");
+    }
+    core::watchdog::feed(main_wdt);
+
+    // ── Portable SP-1 HAL ───────────────────────────────────────
+    if (sp1_hal_init() < 0) {
+        LOG_WRN("SP-1 HAL init returned error");
     }
     core::watchdog::feed(main_wdt);
 

@@ -1,6 +1,7 @@
 #include "AppStateMachine.hpp"
 #include "power/PowerManager.hpp"
 #include "system/Watchdog.hpp"
+#include "hal/sp1_hal.h"
 
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/poweroff.h>
@@ -95,6 +96,7 @@ static smf_state_result running_run(void* o) {
     if (m.midi != nullptr) {
         m.midi->poll_faders();
     }
+    sp1_hal_service_background();
 
     if (m.leds != nullptr) {
         m.leds->tick_fade();
@@ -146,6 +148,7 @@ static void deep_sleep_entry(void* o) {
     if (m.leds != nullptr) {
         m.leds->all_off();
     }
+    sp1_hal_shutdown();
 
     if (m.power != nullptr) {
         m.power->prepare_for_system_off();

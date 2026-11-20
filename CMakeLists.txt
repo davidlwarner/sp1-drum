@@ -24,9 +24,20 @@ set(APP_SOURCES
     app/Leds.cpp
 )
 
-target_sources(app PRIVATE ${BSP_SOURCES} ${APP_SOURCES})
+# ── Drum Machine HAL sources (strict C11) ────────────────────────
+set(HAL_SOURCES
+    src/hal/sp1_hal_common.c
+    src/hal/sp1_hal_zephyr.c
+)
+
+set_source_files_properties(${HAL_SOURCES} PROPERTIES
+    COMPILE_OPTIONS "-std=c11;-Wall;-Wextra;-Werror"
+)
+
+target_sources(app PRIVATE ${BSP_SOURCES} ${APP_SOURCES} ${HAL_SOURCES})
 target_include_directories(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/app
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/subsys
     ${CMAKE_CURRENT_SOURCE_DIR}/drivers
     ${CMAKE_CURRENT_SOURCE_DIR}/include
