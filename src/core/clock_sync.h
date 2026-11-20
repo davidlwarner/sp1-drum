@@ -52,6 +52,7 @@ typedef struct {
     sp1_clock_event_type_t type;
     uint64_t sample_frame;
     uint32_t tick_index;
+    uint8_t midi_tx_status;           /* Non-zero (0xFA/0xF8) when internal master MIDI TX applies */
 } sp1_clock_event_t;
 
 /* Optional callback receiving non-clock MIDI RX messages (Notes/CCs) popped while
@@ -66,8 +67,9 @@ typedef struct {
     bool pending_start;
     bool ext_bpm_locked;
     bool ext_has_prev_tick;
+    bool defer_midi_tx;               /* True when sp1_seq_process_block() interleaves MIDI TX */
 
-    uint32_t bpm_x100;                /* Configured/active internal tempo [4000..24000] */
+    uint32_t bpm_x100;                /* Configured/active internal tempo [4000..24000], 0 if ext-adopted */
     uint32_t tick_index;              /* Monotonic 24 PPQN tick count since Start */
     uint32_t prev_ext_rx_ts_us;       /* Timestamp of previous incoming 0xF8 message */
 

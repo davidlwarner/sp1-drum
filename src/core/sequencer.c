@@ -38,6 +38,29 @@ static void clear_all_lookahead_rings(sp1_sequencer_t *seq) {
     }
 }
 
+static void clear_lookahead_fired_flags(sp1_sequencer_t *seq) {
+    for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
+        seq->tracks[t].lookahead_fired = false;
+    }
+}
+
+static void clamp_track_step_indices(sp1_seq_track_t *trk) {
+    const uint8_t n = trk->pattern.steps;
+    if (trk->next_eval_step >= n) {
+        trk->next_eval_step = 0U;
+    }
+    if (trk->playhead_step >= n) {
+        trk->playhead_step = 0U;
+    }
+    for (uint8_t i = 0U; i < trk->ring_count; ++i) {
+        if (trk->ring[i].track_step >= n) {
+            trk->ring[i].track_step = 0U;
+            trk->ring[i].accent = 1U;
+            trk->ring[i].velocity = SP1_SEQ_VEL_ACCENT;
+        }
+    }
+}
+
 static uint64_t compute_step_fire_frame(const sp1_sequencer_t *seq,
                                         uint8_t track_idx,
                                         uint32_t global_step,
@@ -101,7 +124,8 @@ static void evaluate_and_enqueue_step(sp1_sequencer_t *seq,
                                       uint32_t global_step,
                                       uint64_t nominal_grid_frame,
                                       uint32_t step_frames,
-                                      uint64_t min_frame) {
+                                      uint64_t min_frame,
+                                      bool skip_already_fired) {
     for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
         sp1_seq_track_t *trk = &seq->tracks[t];
         const uint8_t n = trk->pattern.steps;
@@ -110,7 +134,8 @@ static void evaluate_and_enqueue_step(sp1_sequencer_t *seq,
             local_step = 0U;
         }
 
-        if (sp1_euclid_step_active(trk->pattern.mask, local_step)) {
+        const bool already_fired = (skip_already_fired && trk->lookahead_fired);
+        if (!already_fired && sp1_euclid_step_active(trk->pattern.mask, local_step)) {
             sp1_seq_lookahead_event_t evt;
             evt.fire_frame = compute_step_fire_frame(
                 seq, t, global_step, nominal_grid_frame, step_frames, min_frame);
@@ -151,6 +176,64 @@ static void reanchor_pending_step_events(sp1_sequencer_t *seq,
             ring_resort_small(trk);
         }
     }
+}
+
+static void reanchor_all_pending_events(sp1_sequencer_t *seq,
+                                        uint64_t next_grid_frame,
+                                        uint64_t min_frame) {
+    if (!seq->has_scheduled_steps || !seq->clock.running || seq->clock.pending_start) {
+        return;
+    }
+
+    const uint32_t step_frames = sp1_clock_get_step_frames(&seq->clock);
+
+    for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
+        sp1_seq_track_t *trk = &seq->tracks[t];
+        bool modified = false;
+
+        for (uint8_t i = 0U; i < trk->ring_count; ++i) {
+            if (trk->ring[i].fire_frame < min_frame) {
+                continue;
+            }
+            if (trk->ring[i].global_step == seq->cur_grid_step) {
+                trk->ring[i].fire_frame = compute_step_fire_frame(
+                    seq, t, seq->cur_grid_step, seq->last_grid_frame, step_frames, min_frame);
+                modified = true;
+            } else if (trk->ring[i].global_step == seq->scheduled_up_to_step) {
+                trk->ring[i].fire_frame = compute_step_fire_frame(
+                    seq, t, seq->scheduled_up_to_step, next_grid_frame, step_frames, min_frame);
+                modified = true;
+            }
+        }
+
+        if (modified) {
+            ring_resort_small(trk);
+        }
+    }
+}
+
+static void reanchor_lookahead_from_control(sp1_sequencer_t *seq) {
+    if (!seq->has_scheduled_steps || !seq->clock.running || seq->clock.pending_start) {
+        return;
+    }
+
+    uint64_t next_grid_frame;
+    if (seq->clock.mode == SP1_CLOCK_MODE_INTERNAL) {
+        const uint32_t after_ticks =
+            (seq->sub_tick == 0U) ? 0U : (uint32_t)(SP1_CLOCK_TICKS_PER_16TH - seq->sub_tick);
+        const uint64_t total_q32 =
+            (uint64_t)seq->clock.next_tick_frac +
+            (seq->clock.frames_per_tick_q32 * (uint64_t)after_ticks);
+        next_grid_frame = seq->clock.next_tick_frame + (total_q32 >> 32U);
+    } else {
+        const uint32_t rem_ticks =
+            (seq->sub_tick == 0U) ? 1U : (uint32_t)(SP1_CLOCK_TICKS_PER_16TH + 1U - seq->sub_tick);
+        const uint32_t rem_frames =
+            (uint32_t)(((seq->clock.frames_per_tick_q32 * (uint64_t)rem_ticks) + 0x80000000ULL) >> 32U);
+        next_grid_frame = seq->clock.prev_ext_tick_frame + (uint64_t)rem_frames;
+    }
+
+    reanchor_all_pending_events(seq, next_grid_frame, seq->clock.current_frame);
 }
 
 static void drain_events_before(sp1_sequencer_t *seq,
@@ -204,6 +287,9 @@ static void drain_events_before(sp1_sequencer_t *seq,
 
         sp1_seq_lookahead_event_t sched;
         ring_pop_front(trk, &sched);
+        if (sched.global_step > seq->cur_grid_step) {
+            trk->lookahead_fired = true;
+        }
 
         if (!trk->muted) {
             /* Cleanly release any still-held note on this drum track before retriggering. */
@@ -247,6 +333,7 @@ static void drain_events_before(sp1_sequencer_t *seq,
 static void handle_clock_start(sp1_sequencer_t *seq, uint64_t frame) {
     release_all_active_notes(seq, frame);
     clear_all_lookahead_rings(seq);
+    clear_lookahead_fired_flags(seq);
 
     for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
         seq->tracks[t].next_eval_step = 0U;
@@ -277,6 +364,19 @@ static void handle_clock_stop(sp1_sequencer_t *seq, uint64_t frame) {
     seq->armed_for_start = false;
 }
 
+static void handle_clock_mode_change(sp1_sequencer_t *seq) {
+    if (seq->clock.mode == SP1_CLOCK_MODE_INTERNAL && seq->has_scheduled_steps) {
+        /* After a 500 ms external clock timeout, the pre-queued lookahead step
+         * (scheduled_up_to_step) already drained during the timeout window.
+         * Align to a fresh 16th-note boundary at the fallback tick so internal
+         * takeover immediately schedules next_eval_step without a 1-step gap. */
+        clear_lookahead_fired_flags(seq);
+        seq->cur_grid_step = seq->scheduled_up_to_step;
+        seq->has_scheduled_steps = false;
+        seq->sub_tick = 0U;
+    }
+}
+
 static void handle_clock_tick(sp1_sequencer_t *seq, const sp1_clock_event_t *evt) {
     const uint64_t tick_frame = evt->sample_frame;
     const uint32_t step_frames = sp1_clock_get_step_frames(&seq->clock);
@@ -288,15 +388,16 @@ static void handle_clock_tick(sp1_sequencer_t *seq, const sp1_clock_event_t *evt
         seq->sub_tick = 0U;
         seq->cur_grid_step = 0U;
         seq->last_grid_frame = tick_frame;
+        clear_lookahead_fired_flags(seq);
 
         for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
             seq->tracks[t].playhead_step = 0U;
             seq->tracks[t].next_eval_step = 0U;
         }
 
-        evaluate_and_enqueue_step(seq, 0U, tick_frame, step_frames, tick_frame);
+        evaluate_and_enqueue_step(seq, 0U, tick_frame, step_frames, tick_frame, false);
         evaluate_and_enqueue_step(
-            seq, 1U, tick_frame + (uint64_t)step_frames, step_frames, tick_frame);
+            seq, 1U, tick_frame + (uint64_t)step_frames, step_frames, tick_frame, false);
 
         seq->scheduled_up_to_step = 1U;
         seq->has_scheduled_steps = true;
@@ -313,13 +414,15 @@ static void handle_clock_tick(sp1_sequencer_t *seq, const sp1_clock_event_t *evt
                 trk->playhead_step = sp1_euclid_next_step(trk->playhead_step, trk->pattern.steps);
             }
         } else {
-            /* Resuming via MIDI Continue (0xFB): schedule current step + 1-step lookahead. */
+            /* Resuming via MIDI Continue (0xFB) or timeout fallback: schedule current step
+             * (skipping any track whose negative-nudge hit already fired before Stop). */
             seq->cur_grid_step++;
             for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
                 sp1_seq_track_t *trk = &seq->tracks[t];
                 trk->playhead_step = trk->next_eval_step;
             }
-            evaluate_and_enqueue_step(seq, seq->cur_grid_step, tick_frame, step_frames, tick_frame);
+            evaluate_and_enqueue_step(
+                seq, seq->cur_grid_step, tick_frame, step_frames, tick_frame, true);
             seq->scheduled_up_to_step = seq->cur_grid_step;
             seq->has_scheduled_steps = true;
         }
@@ -332,12 +435,32 @@ static void handle_clock_tick(sp1_sequencer_t *seq, const sp1_clock_event_t *evt
         /* 1-Step Lookahead: evaluate cur_grid_step + 1 exactly once. */
         const uint32_t lookahead_step = seq->cur_grid_step + 1U;
         if (lookahead_step > seq->scheduled_up_to_step) {
+            clear_lookahead_fired_flags(seq);
             evaluate_and_enqueue_step(seq,
                                       lookahead_step,
                                       tick_frame + (uint64_t)step_frames,
                                       step_frames,
-                                      tick_frame);
+                                      tick_frame,
+                                      false);
             seq->scheduled_up_to_step = lookahead_step;
+        }
+    } else {
+        const uint32_t rem_ticks = (uint32_t)(SP1_CLOCK_TICKS_PER_16TH - seq->sub_tick);
+        const uint32_t rem_frames =
+            (uint32_t)(((seq->clock.frames_per_tick_q32 * (uint64_t)rem_ticks) + 0x80000000ULL) >> 32U);
+        const uint64_t next_grid_frame = tick_frame + (uint64_t)rem_frames;
+
+        if (!seq->has_scheduled_steps) {
+            /* Resuming via MIDI Continue (0xFB) mid-step (sub_tick in 1..5):
+             * re-enqueue lookahead for cur_grid_step + 1, skipping tracks that already fired. */
+            const uint32_t lookahead_step = seq->cur_grid_step + 1U;
+            evaluate_and_enqueue_step(
+                seq, lookahead_step, next_grid_frame, step_frames, tick_frame, true);
+            seq->scheduled_up_to_step = lookahead_step;
+            seq->has_scheduled_steps = true;
+        } else if (seq->clock.mode == SP1_CLOCK_MODE_EXTERNAL) {
+            /* Keep lookahead step synchronized with PLL-updated external 0xF8 tick periods. */
+            reanchor_all_pending_events(seq, next_grid_frame, tick_frame);
         }
     }
 
@@ -395,6 +518,7 @@ void sp1_seq_set_bpm_x100(sp1_sequencer_t *seq, uint32_t bpm_x100) {
         return;
     }
     sp1_clock_set_bpm_x100(&seq->clock, bpm_x100);
+    reanchor_lookahead_from_control(seq);
 }
 
 void sp1_seq_set_bpm(sp1_sequencer_t *seq, float bpm) {
@@ -402,6 +526,7 @@ void sp1_seq_set_bpm(sp1_sequencer_t *seq, float bpm) {
         return;
     }
     sp1_clock_set_bpm(&seq->clock, bpm);
+    reanchor_lookahead_from_control(seq);
 }
 
 uint32_t sp1_seq_get_bpm_x100(const sp1_sequencer_t *seq) {
@@ -419,6 +544,7 @@ void sp1_seq_set_swing(sp1_sequencer_t *seq, float swing_ratio) {
     }
     seq->swing_ratio = swing_ratio;
     seq->swing_offset_scale = 2.0f * (swing_ratio - SP1_SEQ_SWING_MIN);
+    reanchor_lookahead_from_control(seq);
 }
 
 float sp1_seq_get_swing(const sp1_sequencer_t *seq) {
@@ -429,7 +555,11 @@ void sp1_seq_set_midi_channel(sp1_sequencer_t *seq, uint8_t channel_0_to_15) {
     if (seq == NULL) {
         return;
     }
-    seq->midi_channel = (uint8_t)(channel_0_to_15 & 0x0FU);
+    const uint8_t next_ch = (uint8_t)(channel_0_to_15 & 0x0FU);
+    if (next_ch != seq->midi_channel) {
+        release_all_active_notes(seq, seq->clock.current_frame);
+        seq->midi_channel = next_ch;
+    }
 }
 
 void sp1_seq_set_track_pattern(sp1_sequencer_t *seq,
@@ -441,12 +571,7 @@ void sp1_seq_set_track_pattern(sp1_sequencer_t *seq,
         return;
     }
     sp1_euclid_pattern_set(&seq->tracks[track].pattern, pulses, steps, rotation);
-    if (seq->tracks[track].next_eval_step >= seq->tracks[track].pattern.steps) {
-        seq->tracks[track].next_eval_step = 0U;
-    }
-    if (seq->tracks[track].playhead_step >= seq->tracks[track].pattern.steps) {
-        seq->tracks[track].playhead_step = 0U;
-    }
+    clamp_track_step_indices(&seq->tracks[track]);
 }
 
 void sp1_seq_set_track_pulses(sp1_sequencer_t *seq, uint8_t track, uint8_t pulses) {
@@ -461,12 +586,7 @@ void sp1_seq_set_track_steps(sp1_sequencer_t *seq, uint8_t track, uint8_t steps)
         return;
     }
     sp1_euclid_pattern_set_steps(&seq->tracks[track].pattern, steps);
-    if (seq->tracks[track].next_eval_step >= seq->tracks[track].pattern.steps) {
-        seq->tracks[track].next_eval_step = 0U;
-    }
-    if (seq->tracks[track].playhead_step >= seq->tracks[track].pattern.steps) {
-        seq->tracks[track].playhead_step = 0U;
-    }
+    clamp_track_step_indices(&seq->tracks[track]);
 }
 
 void sp1_seq_set_track_rotation(sp1_sequencer_t *seq, uint8_t track, uint8_t rotation) {
@@ -496,6 +616,8 @@ void sp1_seq_set_track_nudge_ms(sp1_sequencer_t *seq, uint8_t track, float nudge
     } else {
         seq->tracks[track].nudge_frames = (int16_t)frames;
     }
+
+    reanchor_lookahead_from_control(seq);
 }
 
 int16_t sp1_seq_get_track_nudge_frames(const sp1_sequencer_t *seq, uint8_t track) {
@@ -560,14 +682,17 @@ uint32_t sp1_seq_process_block(sp1_sequencer_t *seq,
                                uint32_t num_frames,
                                sp1_seq_trigger_event_t *out_triggers,
                                uint32_t max_triggers) {
-    if (seq == NULL) {
+    if (seq == NULL || num_frames == 0U) {
         return 0U;
     }
 
     const uint64_t block_end_frame = block_start_frame + (uint64_t)num_frames;
     sp1_clock_event_t clock_events[SP1_CLOCK_MAX_BLOCK_EVENTS];
+
+    seq->clock.defer_midi_tx = true;
     const uint32_t clk_count = sp1_clock_process_block(
         &seq->clock, block_start_frame, num_frames, clock_events, SP1_CLOCK_MAX_BLOCK_EVENTS);
+    seq->clock.defer_midi_tx = false;
 
     uint32_t trig_count = 0U;
 
@@ -581,6 +706,12 @@ uint32_t sp1_seq_process_block(sp1_sequencer_t *seq,
         drain_events_before(seq, block_start_frame, evt_limit, num_frames,
                             out_triggers, max_triggers, &trig_count);
 
+        if (evt->midi_tx_status != 0U) {
+            const sp1_midi_msg_t rt_msg =
+                sp1_midi_msg_realtime(evt->midi_tx_status, sp1_clock_frame_to_us(evt->sample_frame));
+            (void)sp1_hal_midi_send(&rt_msg);
+        }
+
         switch (evt->type) {
         case SP1_CLOCK_EVT_START:
             handle_clock_start(seq, evt->sample_frame);
@@ -591,8 +722,10 @@ uint32_t sp1_seq_process_block(sp1_sequencer_t *seq,
         case SP1_CLOCK_EVT_TICK:
             handle_clock_tick(seq, evt);
             break;
-        case SP1_CLOCK_EVT_CONTINUE:
         case SP1_CLOCK_EVT_MODE_CHANGE:
+            handle_clock_mode_change(seq);
+            break;
+        case SP1_CLOCK_EVT_CONTINUE:
         case SP1_CLOCK_EVT_NONE:
         default:
             break;

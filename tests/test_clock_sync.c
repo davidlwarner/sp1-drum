@@ -16,16 +16,23 @@ static void init_silent_host_hal(void) {
 }
 
 static void test_frame_to_us_exact_division_free(void) {
-    /* Spot-check exact floor(frame * 125 / 6) across all mod-6 remainders & large frames */
+    /* Spot-check exact floor(frame * 125 / 6) mod 2^32 across all mod-6 remainders & 64-bit frames */
     const uint64_t probes[] = {
         0ULL, 1ULL, 2ULL, 3ULL, 4ULL, 5ULL, 6ULL, 96ULL,
-        1000ULL, 6000ULL, 48000ULL, 192000ULL, 4800000ULL, 0xFFFFFFFFULL
+        1000ULL, 6000ULL, 48000ULL, 192000ULL, 4800000ULL, 0xFFFFFFFFULL,
+        0x100000000ULL, 0x100000001ULL, 0x100000005ULL, 0x123456789ULL, 0x3FFFFFFFFULL
     };
     for (uint32_t i = 0U; i < (uint32_t)(sizeof(probes) / sizeof(probes[0])); ++i) {
         const uint64_t f = probes[i];
         const uint32_t expected = (uint32_t)((f * 125ULL) / 6ULL);
         TEST_ASSERT_EQ_U32(expected, sp1_clock_frame_to_us(f));
     }
+
+    sp1_clock_sync_t clk;
+    sp1_clock_init(&clk);
+    sp1_clock_start(&clk);
+    sp1_clock_event_t evts[SP1_CLOCK_MAX_BLOCK_EVENTS];
+    TEST_ASSERT_EQ_U32(0U, sp1_clock_process_block(&clk, 0ULL, 0U, evts, SP1_CLOCK_MAX_BLOCK_EVENTS));
 }
 
 static void test_internal_master_120bpm_exact_ticks(void) {

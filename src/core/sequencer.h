@@ -83,7 +83,8 @@ typedef struct {
 
     sp1_seq_lookahead_event_t ring[SP1_SEQ_LOOKAHEAD_CAP];
     uint8_t ring_count;
-    uint8_t pad[3];
+    bool lookahead_fired;       /* True if cur_grid_step + 1 already fired early via negative nudge */
+    uint8_t pad[2];
     uint32_t dropped_events;
 } sp1_seq_track_t;
 
