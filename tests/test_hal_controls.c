@@ -132,9 +132,63 @@ static void test_host_controls_edges_faders_and_leds(void) {
     sp1_hal_shutdown();
 }
 
+static void test_single_writer_poll_isolation(void) {
+    const sp1_hal_host_config_t cfg = {
+        .wav_path = NULL,
+        .midi_csv_path = NULL,
+        .midi_log_stdout = false,
+    };
+    sp1_hal_host_configure(&cfg);
+    TEST_ASSERT_EQ_INT(0, sp1_hal_init());
+
+    /* Producer writes 2 button events (seq = 2). */
+    sp1_hal_controls_on_button_event(SP1_BTN_FN, true);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, true);
+
+    sp1_controls_snapshot_t snap;
+    sp1_hal_controls_poll(&snap);
+    TEST_ASSERT_EQ_U32(2U, snap.seq);
+    TEST_ASSERT_EQ_U32((uint32_t)(SP1_BTN_BIT(SP1_BTN_FN) | SP1_BTN_BIT(SP1_BTN_TRACK_1)),
+                       snap.buttons_pressed);
+    TEST_ASSERT_EQ_U32(0U, snap.buttons_released);
+
+    /* Repeated consumer polls report zero edges and never mutate producer bus or seq. */
+    for (uint32_t i = 0U; i < 4U; ++i) {
+        sp1_hal_controls_poll(&snap);
+        TEST_ASSERT_EQ_U32(2U, snap.seq);
+        TEST_ASSERT_EQ_U32(0U, snap.buttons_pressed);
+        TEST_ASSERT_EQ_U32(0U, snap.buttons_released);
+        TEST_ASSERT_EQ_U32((uint32_t)(SP1_BTN_BIT(SP1_BTN_FN) | SP1_BTN_BIT(SP1_BTN_TRACK_1)),
+                           snap.buttons_down);
+    }
+
+    /* Concurrent fader + button updates between polls preserve fader data and report exact edges. */
+    sp1_hal_controls_on_fader_raw(1U, 3060);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, false);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_3, true);
+
+    sp1_hal_controls_poll(&snap);
+    TEST_ASSERT_EQ_U32(5U, snap.seq);
+    TEST_ASSERT_EQ_INT(3060, snap.fader_raw[1]);
+    TEST_ASSERT_EQ_U32(SP1_BTN_BIT(SP1_BTN_TRACK_3), snap.buttons_pressed);
+    TEST_ASSERT_EQ_U32(SP1_BTN_BIT(SP1_BTN_TRACK_1), snap.buttons_released);
+    TEST_ASSERT_EQ_U32((uint32_t)(SP1_BTN_BIT(SP1_BTN_FN) | SP1_BTN_BIT(SP1_BTN_TRACK_3)),
+                       snap.buttons_down);
+
+    /* Subsequent poll clears both pressed and released edges while preserving fader & down state. */
+    sp1_hal_controls_poll(&snap);
+    TEST_ASSERT_EQ_U32(5U, snap.seq);
+    TEST_ASSERT_EQ_INT(3060, snap.fader_raw[1]);
+    TEST_ASSERT_EQ_U32(0U, snap.buttons_pressed);
+    TEST_ASSERT_EQ_U32(0U, snap.buttons_released);
+
+    sp1_hal_shutdown();
+}
+
 int main(void) {
     RUN_TEST(test_fader_clamping_deadband_and_scaling);
     RUN_TEST(test_hardware_shift_chord_constraints);
     RUN_TEST(test_host_controls_edges_faders_and_leds);
+    RUN_TEST(test_single_writer_poll_isolation);
     return sp1_test_summary();
 }

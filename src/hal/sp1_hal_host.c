@@ -20,11 +20,12 @@ static sp1_midi_spsc_queue_t g_midi_rx_q;
 static sp1_midi_spsc_queue_t g_midi_tx_q;
 static bool g_midi_ready = true;
 
-/* Static RAM: 16 B fader filters + 40 B live snapshot + 84 B bus + 8 B LEDs = 148 B */
+/* Static RAM: 16 B fader filters + 40 B live snapshot + 84 B bus + 8 B LEDs + 2 B edge state = 150 B */
 static sp1_fader_filter_t g_fader_filters[SP1_NUM_FADERS];
 static sp1_controls_snapshot_t g_live_controls;
 static sp1_controls_bus_t g_controls_bus;
 static sp1_led_frame_t g_led_frame;
+static uint16_t g_prev_polled_buttons_down = 0U;
 
 static sp1_audio_render_cb_t g_audio_cb = NULL;
 static void *g_audio_ctx = NULL;
@@ -141,6 +142,7 @@ int sp1_hal_controls_init(void) {
     sp1_controls_snapshot_init(&g_live_controls);
     sp1_controls_bus_init(&g_controls_bus);
     memset(&g_led_frame, 0, sizeof(g_led_frame));
+    g_prev_polled_buttons_down = 0U;
     return 0;
 }
 
@@ -150,18 +152,10 @@ void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
     }
 
     const uint16_t bit = SP1_BTN_BIT(btn);
-    const bool was_down = (g_live_controls.buttons_down & bit) != 0U;
-
     if (pressed) {
         g_live_controls.buttons_down |= bit;
-        if (!was_down) {
-            g_live_controls.buttons_pressed |= bit;
-        }
     } else {
         g_live_controls.buttons_down &= (uint16_t)(~bit);
-        if (was_down) {
-            g_live_controls.buttons_released |= bit;
-        }
     }
 
     g_live_controls.seq++;
@@ -185,14 +179,19 @@ void sp1_hal_controls_on_fader_raw(uint8_t fader_idx, int16_t raw_sample) {
 }
 
 void sp1_hal_controls_poll(sp1_controls_snapshot_t *out_snapshot) {
+    sp1_controls_snapshot_t snap;
+    sp1_controls_bus_read(&g_controls_bus, &snap);
+
+    /* Derive one-shot rising/falling edge masks purely on the consumer side
+     * so the producer remains the sole writer to g_live_controls / g_controls_bus. */
+    const uint16_t cur_down = snap.buttons_down;
+    const uint16_t prev_down = g_prev_polled_buttons_down;
+    snap.buttons_pressed = (uint16_t)(cur_down & (uint16_t)(~prev_down));
+    snap.buttons_released = (uint16_t)((uint16_t)(~cur_down) & prev_down);
+    g_prev_polled_buttons_down = cur_down;
+
     if (out_snapshot != NULL) {
-        sp1_controls_bus_read(&g_controls_bus, out_snapshot);
-    }
-    /* Clear one-shot press/release edge latches after consumption. */
-    if (g_live_controls.buttons_pressed != 0U || g_live_controls.buttons_released != 0U) {
-        g_live_controls.buttons_pressed = 0U;
-        g_live_controls.buttons_released = 0U;
-        sp1_controls_bus_publish(&g_controls_bus, &g_live_controls);
+        *out_snapshot = snap;
     }
 }
 

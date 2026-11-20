@@ -69,10 +69,11 @@ static sp1_midi_spsc_queue_t g_midi_rx_q;
 static sp1_midi_spsc_queue_t g_midi_tx_q;
 static uint32_t g_midi_ready_flag = 0U;
 
-/* Static RAM: 16 B fader filters + 40 B live controls + 84 B double-buffered bus = 140 B */
+/* Static RAM: 16 B fader filters + 40 B live controls + 84 B double-buffered bus + 2 B edge state = 142 B */
 static sp1_fader_filter_t g_fader_filters[SP1_NUM_FADERS];
 static sp1_controls_snapshot_t g_live_controls;
 static sp1_controls_bus_t g_controls_bus;
+static uint16_t g_prev_polled_buttons_down = 0U;
 
 static sp1_audio_render_cb_t g_audio_cb = NULL;
 static void *g_audio_ctx = NULL;
@@ -113,6 +114,7 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
             k_mem_slab_free(&g_i2s_tx_slab, dma_block);
         }
     }
+    g_audio_thread_created = false;
 }
 
 /* ── HAL Controls & 8-Channel PWM LEDs ───────────────────────────────────── */
@@ -123,6 +125,7 @@ int sp1_hal_controls_init(void) {
     }
     sp1_controls_snapshot_init(&g_live_controls);
     sp1_controls_bus_init(&g_controls_bus);
+    g_prev_polled_buttons_down = 0U;
     return 0;
 }
 
@@ -132,18 +135,10 @@ void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
     }
 
     const uint16_t bit = SP1_BTN_BIT(btn);
-    const bool was_down = (g_live_controls.buttons_down & bit) != 0U;
-
     if (pressed) {
         g_live_controls.buttons_down |= bit;
-        if (!was_down) {
-            g_live_controls.buttons_pressed |= bit;
-        }
     } else {
         g_live_controls.buttons_down &= (uint16_t)(~bit);
-        if (was_down) {
-            g_live_controls.buttons_released |= bit;
-        }
     }
 
     g_live_controls.seq++;
@@ -167,13 +162,19 @@ void sp1_hal_controls_on_fader_raw(uint8_t fader_idx, int16_t raw_sample) {
 }
 
 void sp1_hal_controls_poll(sp1_controls_snapshot_t *out_snapshot) {
+    sp1_controls_snapshot_t snap;
+    sp1_controls_bus_read(&g_controls_bus, &snap);
+
+    /* Derive one-shot rising/falling edge masks purely on the consumer side
+     * so the producer remains the sole writer to g_live_controls / g_controls_bus. */
+    const uint16_t cur_down = snap.buttons_down;
+    const uint16_t prev_down = g_prev_polled_buttons_down;
+    snap.buttons_pressed = (uint16_t)(cur_down & (uint16_t)(~prev_down));
+    snap.buttons_released = (uint16_t)((uint16_t)(~cur_down) & prev_down);
+    g_prev_polled_buttons_down = cur_down;
+
     if (out_snapshot != NULL) {
-        sp1_controls_bus_read(&g_controls_bus, out_snapshot);
-    }
-    if (g_live_controls.buttons_pressed != 0U || g_live_controls.buttons_released != 0U) {
-        g_live_controls.buttons_pressed = 0U;
-        g_live_controls.buttons_released = 0U;
-        sp1_controls_bus_publish(&g_controls_bus, &g_live_controls);
+        *out_snapshot = snap;
     }
 }
 
@@ -228,12 +229,13 @@ bool sp1_hal_midi_receive(sp1_midi_msg_t *out_msg) {
 }
 
 void sp1_hal_midi_flush_tx(void) {
-    if (!sp1_hal_midi_is_ready() || !device_is_ready(g_usb_midi_dev)) {
-        return;
-    }
+    const bool usb_ready = sp1_hal_midi_is_ready() && device_is_ready(g_usb_midi_dev);
 
     sp1_midi_msg_t msg;
     while (sp1_midi_queue_pop(&g_midi_tx_q, &msg)) {
+        if (!usb_ready) {
+            continue;
+        }
         uint32_t word0 = 0U;
         if (sp1_midi_encode_ump32(&msg, 0U, &word0)) {
             const struct midi_ump ump = { .data = { word0 } };
@@ -257,6 +259,11 @@ int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
 
     if (!device_is_ready(g_i2s_dev)) {
         return -ENODEV;
+    }
+
+    /* Ensure external 3.072 MHz audio oscillator (P0.13) is enabled prior to codec PLL lock. */
+    if (device_is_ready(g_gpio0_dev)) {
+        (void)gpio_pin_configure(g_gpio0_dev, SP1_OSC_EN_PIN, GPIO_OUTPUT_ACTIVE);
     }
 
     struct i2s_config i2s_cfg;
@@ -329,6 +336,7 @@ int sp1_hal_audio_start(void) {
     }
 
     if (!g_audio_thread_created) {
+        g_audio_thread_created = true;
         (void)k_thread_create(&g_audio_thread_data,
                               g_audio_thread_stack,
                               K_THREAD_STACK_SIZEOF(g_audio_thread_stack),
@@ -337,7 +345,6 @@ int sp1_hal_audio_start(void) {
                               SP1_AUDIO_THREAD_PRIO,
                               0U,
                               K_NO_WAIT);
-        g_audio_thread_created = true;
     }
 
     return 0;
@@ -346,14 +353,19 @@ int sp1_hal_audio_start(void) {
 int sp1_hal_audio_stop(void) {
     __atomic_store_n(&g_audio_running_flag, 0U, __ATOMIC_RELEASE);
 
-    if (g_audio_configured && device_is_ready(g_i2s_dev)) {
-        (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
-    }
+    /* Mute speaker amp and headphone DAC before dropping I2S0 clocks to prevent pop. */
     if (device_is_ready(g_tas2505_dev)) {
         audio_codec_stop_output(g_tas2505_dev);
     }
     if (device_is_ready(g_cs42l42_dev)) {
         audio_codec_stop_output(g_cs42l42_dev);
+    }
+    if (g_audio_configured && device_is_ready(g_i2s_dev)) {
+        (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+    }
+    if (g_audio_thread_created) {
+        (void)k_thread_join(&g_audio_thread_data, K_MSEC(50));
+        g_audio_thread_created = false;
     }
     return 0;
 }
@@ -382,8 +394,10 @@ int sp1_hal_audio_submit_block(const int16_t *interleaved_stereo, uint32_t num_f
 
 void sp1_hal_audio_set_volume(uint8_t volume_0_to_127) {
     const uint8_t clamped = (volume_0_to_127 > 127U) ? 127U : volume_0_to_127;
+    /* CS42L42 (0x2601/0x2609) and TAS2505 (Page 1 Reg 46) use hardware attenuation
+     * registers where 0x00 = 0 dB full scale and 0x7F = max attenuation / mute. */
     audio_property_value_t val;
-    val.vol = (int)clamped;
+    val.vol = (int)(127U - clamped);
 
     if (device_is_ready(g_cs42l42_dev)) {
         (void)audio_codec_set_property(
