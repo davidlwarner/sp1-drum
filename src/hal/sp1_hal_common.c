@@ -130,7 +130,7 @@ void sp1_controls_bus_read(const sp1_controls_bus_t *bus,
     *out_snap = bus->buffers[cur];
 }
 
-/* ── Portable Audio Packing (int16_t -> 24-bit-in-32-bit I2S DMA words) ─── */
+/* ── Portable Audio Packing & Cycle Profiling (sp1_hal_common.c) ─────────── */
 
 void sp1_audio_pack_s16_to_i2s24_in_32(const int16_t *src_s16,
                                        int32_t *dst_i2s32,
@@ -145,6 +145,38 @@ void sp1_audio_pack_s16_to_i2s24_in_32(const int16_t *src_s16,
          * Places int16_t into bits [23:8] with sign extension in [31:24]. */
         dst_i2s32[i] = (int32_t)src_s16[i] * SP1_AUDIO_I2S24_SCALE;
     }
+}
+
+void sp1_audio_cycle_stats_reset(sp1_audio_cycle_stats_t *stats) {
+    if (stats == NULL) {
+        return;
+    }
+    memset(stats, 0, sizeof(*stats));
+}
+
+void sp1_audio_cycle_stats_record(sp1_audio_cycle_stats_t *stats, uint32_t elapsed_cycles) {
+    if (stats == NULL) {
+        return;
+    }
+    stats->total_cycles += (uint64_t)elapsed_cycles;
+    stats->block_count += 1U;
+    stats->last_cycles = elapsed_cycles;
+    if (elapsed_cycles > stats->max_cycles) {
+        stats->max_cycles = elapsed_cycles;
+    }
+    if (elapsed_cycles > SP1_AUDIO_TARGET_55PCT_CYCLES) {
+        stats->over_budget_count += 1U;
+    }
+    if (elapsed_cycles > SP1_AUDIO_BLOCK_BUDGET_CYCLES) {
+        stats->underrun_count += 1U;
+    }
+}
+
+uint32_t sp1_audio_cycle_stats_avg(const sp1_audio_cycle_stats_t *stats) {
+    if (stats == NULL || stats->block_count == 0U) {
+        return 0U;
+    }
+    return (uint32_t)(stats->total_cycles / (uint64_t)stats->block_count);
 }
 
 /* ── Portable Lock-Free SPSC MIDI Queue ──────────────────────────────────── */

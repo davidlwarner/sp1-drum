@@ -35,6 +35,19 @@ static uint8_t g_audio_volume = 100U;
 
 static sp1_hal_host_stats_t g_stats;
 
+/* Static RAM: 32 B cycle telemetry + 4 B atomic spinlock for tear-free reads */
+static sp1_audio_cycle_stats_t g_host_cycle_stats;
+static uint32_t g_host_cycle_lock = 0U;
+
+static inline void host_cycle_spin_lock(void) {
+    while (__atomic_exchange_n(&g_host_cycle_lock, 1U, __ATOMIC_ACQUIRE) != 0U) {
+    }
+}
+
+static inline void host_cycle_spin_unlock(void) {
+    __atomic_store_n(&g_host_cycle_lock, 0U, __ATOMIC_RELEASE);
+}
+
 /* ── Little-Endian WAV Helpers ───────────────────────────────────────────── */
 
 static void put_le16(uint8_t *dst, uint16_t val) {
@@ -315,6 +328,7 @@ int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
     g_audio_running = false;
     g_audio_muted = false;
     g_audio_volume = 100U;
+    sp1_hal_audio_reset_cycle_stats();
 
     if (g_wav_file != NULL) {
         fclose(g_wav_file);
@@ -387,6 +401,27 @@ void sp1_hal_audio_set_volume(uint8_t volume_0_to_127) {
 
 void sp1_hal_audio_set_mute(bool muted) {
     g_audio_muted = muted;
+}
+
+void sp1_hal_audio_record_cycles(uint32_t elapsed_cycles) {
+    host_cycle_spin_lock();
+    sp1_audio_cycle_stats_record(&g_host_cycle_stats, elapsed_cycles);
+    host_cycle_spin_unlock();
+}
+
+void sp1_hal_audio_get_cycle_stats(sp1_audio_cycle_stats_t *out_stats) {
+    if (out_stats == NULL) {
+        return;
+    }
+    host_cycle_spin_lock();
+    *out_stats = g_host_cycle_stats;
+    host_cycle_spin_unlock();
+}
+
+void sp1_hal_audio_reset_cycle_stats(void) {
+    host_cycle_spin_lock();
+    sp1_audio_cycle_stats_reset(&g_host_cycle_stats);
+    host_cycle_spin_unlock();
 }
 
 void sp1_hal_audio_shutdown(void) {

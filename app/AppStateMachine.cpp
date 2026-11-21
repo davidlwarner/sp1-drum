@@ -112,6 +112,9 @@ static smf_state_result running_run(void* o) {
     if (m.power != nullptr) {
         m.power->service_tick();
     }
+    sp1_audio_cycle_stats_t cyc_stats{};
+    sp1_hal_audio_get_cycle_stats(&cyc_stats);
+    (void)cyc_stats;
     sp1_hal_service_background();
 
     k_sleep(K_MSEC(kPollCadenceMs));

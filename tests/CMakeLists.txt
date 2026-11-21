@@ -84,6 +84,7 @@ sp1_add_host_test(test_core_cpp_compat test_core_cpp_compat.cpp)
 sp1_add_host_test(test_drum_voices test_drum_voices.c)
 sp1_add_host_test(test_master_fx test_master_fx.c)
 sp1_add_host_test(test_dsp_cpp_compat test_dsp_cpp_compat.cpp)
+sp1_add_host_test(test_cycle_budget test_cycle_budget.c)
 
 add_test(
     NAME test_sim_cli

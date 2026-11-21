@@ -235,7 +235,7 @@ static void test_dub_ping_pong_delay_selective_send(void) {
 
 static void test_12_second_polyrhythm_stress_and_sram_budget(void) {
     /* Static SRAM Budget Verification:
-     * Core + 4-Voice Synth + Master FX (including 64 KB stutter + 8 KB dub delay)
+     * Core + 4-Voice Synth + Master FX (including 32 KB stutter + 8 KB dub delay)
      * MUST stay well within <= 128 KB (131,072 bytes). */
     const size_t synth_bytes = sizeof(sp1_drum_synth_t);
     const size_t fx_bytes = sizeof(sp1_master_fx_t);

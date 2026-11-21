@@ -94,7 +94,7 @@ static midi::MidiController g_midi;
 static leds::Leds g_leds;
 static power::PowerManager g_power;
 
-/* Static RAM: 768 B sequencer + 80 B UI mapper + 296 B 4-voice synth + 73,892 B master FX */
+/* Static RAM: 768 B sequencer + 80 B UI mapper + 296 B 4-voice synth + 41,124 B master FX */
 static sp1_sequencer_t g_sequencer;
 static sp1_ui_mapper_t g_ui_mapper;
 static sp1_drum_synth_t g_drum_synth;

@@ -285,7 +285,7 @@ static void drain_events_before(sp1_sequencer_t *seq,
             continue;
         }
 
-        sp1_seq_lookahead_event_t sched;
+        sp1_seq_lookahead_event_t sched = { 0 };
         ring_pop_front(trk, &sched);
         if (sched.global_step > seq->cur_grid_step) {
             trk->lookahead_fired = true;

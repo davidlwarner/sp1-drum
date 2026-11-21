@@ -14,7 +14,7 @@ void MidiController::send_cc(uint8_t cc, uint8_t value) {
         return;
     }
     const struct midi_ump ump = UMP_MIDI1_CHANNEL_VOICE(
-        kMidiGroup, UMP_MIDI_CONTROL_CHANGE, kMidiChannel, cc, value);
+        static_cast<uint32_t>(kMidiGroup), UMP_MIDI_CONTROL_CHANGE, kMidiChannel, cc, value);
     usbd_midi_send(midi_dev, ump);
 }
 
@@ -24,7 +24,7 @@ void MidiController::send_note(uint8_t note, bool on, uint8_t velocity) {
     }
     const uint8_t cmd = on ? UMP_MIDI_NOTE_ON : UMP_MIDI_NOTE_OFF;
     const struct midi_ump ump = UMP_MIDI1_CHANNEL_VOICE(
-        kMidiGroup, cmd, kMidiChannel, note, on ? velocity : 0);
+        static_cast<uint32_t>(kMidiGroup), cmd, kMidiChannel, note, on ? velocity : 0U);
     usbd_midi_send(midi_dev, ump);
 }
 

@@ -42,6 +42,10 @@ set(HAL_SOURCES
     src/hal/sp1_hal_zephyr.c
 )
 
+set_source_files_properties(${BSP_SOURCES} PROPERTIES
+    COMPILE_OPTIONS "-Wno-unused-function"
+)
+
 set_source_files_properties(${CORE_SOURCES} ${DSP_SOURCES} ${HAL_SOURCES} PROPERTIES
     COMPILE_OPTIONS "-std=c11;-Wall;-Wextra;-Werror"
 )

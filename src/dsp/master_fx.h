@@ -7,8 +7,8 @@
  *
  * Includes:
  *  1. Dub Ping-Pong Delay Send (8 KB static SRAM, tempo-synced L<->R bounce fed by Snare + Perc).
- *  2. Tempo-Synced Beat-Repeat / Stutter Looper (64 KB static SRAM = 16,384 stereo int16_t frames,
- *     quantized 1/4 down to 1/64 ratchet with 64-frame boundary crossfading).
+ *  2. Tempo-Synced Beat-Repeat / Stutter Looper (32 KB static SRAM = 8,192 stereo int16_t frames /
+ *     16,384 int16_t samples, quantized 1/4 down to 1/64 ratchet with 64-frame boundary crossfading).
  *  3. DJ-Style Resonant Cytomic TPT SVF Isolator (center bypass deadzone [0.45..0.55],
  *     LP sweep < 0.45, HP sweep > 0.55, cutoff <= 0.42 * fs, Q <= 12.0).
  *  4. Zero-Order Hold Sample-Rate Decimator / Bitcrusher + Division-Free Master Soft-Clipper.
@@ -23,8 +23,8 @@
 extern "C" {
 #endif
 
-/* 16,384 stereo int16_t frames = 32,768 int16_t samples = 65,536 B (64.0 KB) static SRAM */
-#define SP1_FX_STUTTER_FRAMES           16384U
+/* 8,192 stereo int16_t frames = 16,384 int16_t samples = 32,768 B (32.0 KB) static SRAM */
+#define SP1_FX_STUTTER_FRAMES           8192U
 #define SP1_FX_STUTTER_MASK             (SP1_FX_STUTTER_FRAMES - 1U)
 #define SP1_FX_STUTTER_XFADE_FRAMES     64U
 #define SP1_FX_STUTTER_INV_XFADE        0.015625f   /* 1.0f / 64.0f */
@@ -51,9 +51,9 @@ typedef enum {
 } sp1_stutter_div_t;
 
 /* Complete Stereo Master Performance FX Bus State.
- * Static RAM: 65,536 B (stutter) + 8,192 B (dub delay) + 164 B (SVF/state) = 73,892 B (~72.16 KB). */
+ * Static RAM: 32,768 B (stutter) + 8,192 B (dub delay) + 164 B (SVF/state) = 41,124 B (~40.16 KB). */
 typedef struct {
-    /* 1. Static 64 KB circular stereo stutter buffer (interleaved L, R int16_t) */
+    /* 1. Static 32 KB circular stereo stutter buffer (interleaved L, R int16_t) */
     int16_t stutter_buf[SP1_FX_STUTTER_FRAMES * 2U];
 
     /* 2. Static 8 KB stereo ping-pong dub delay buffers (L tap + R tap int16_t) */

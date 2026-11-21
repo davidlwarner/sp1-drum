@@ -27,8 +27,17 @@ extern "C" {
 
 /* 24-bit signed sample packed in 32-bit I2S EasyDMA word (bits [23:8] <- int16_t,
  * sign-extended in [31:24]; uses multiplication by 256 to avoid C11 signed left-shift UB). */
-#define SP1_AUDIO_I2S24_SHIFT       8U
-#define SP1_AUDIO_I2S24_SCALE       256
+#define SP1_AUDIO_I2S24_SHIFT           8U
+#define SP1_AUDIO_I2S24_SCALE           256
+
+/* nRF52840 Cortex-M4F @ 64 MHz real-time cycle budget per 96-frame (2.0 ms) block:
+ *  - Hard 100% ceiling: 64,000,000 * 96 / 48,000 = 128,000 cycles/block (1,333.3 cyc/frame)
+ *  - Target <= 55% DSP load:                        70,400 cycles/block (  733.3 cyc/frame)
+ *  - Peak   <= 65% stress ceiling:                  83,200 cycles/block (  866.7 cyc/frame) */
+#define SP1_AUDIO_CPU_HZ                64000000U
+#define SP1_AUDIO_BLOCK_BUDGET_CYCLES   128000U
+#define SP1_AUDIO_TARGET_55PCT_CYCLES   70400U
+#define SP1_AUDIO_PEAK_65PCT_CYCLES     83200U
 
 /**
  * Real-time audio block render callback invoked by the audio HAL thread/driver.
@@ -38,7 +47,20 @@ typedef void (*sp1_audio_render_cb_t)(int16_t *interleaved_stereo,
                                       uint32_t num_frames,
                                       void *user_ctx);
 
-/* ── Portable C11 Packing Helper (sp1_hal_common.c) ──────────────────────── */
+/**
+ * Audio block cycle-counter telemetry snapshot (DWT CYCCNT on Cortex-M4F).
+ * Static RAM: 28 bytes (32 bytes aligned).
+ */
+typedef struct {
+    uint64_t total_cycles;      /* Cumulative CPU cycles across all rendered 96-frame blocks */
+    uint32_t block_count;       /* Total 96-frame audio blocks rendered */
+    uint32_t last_cycles;       /* CPU cycles elapsed in most recent 96-frame block */
+    uint32_t max_cycles;        /* Worst-case peak CPU cycles observed across any block */
+    uint32_t over_budget_count; /* Blocks exceeding SP1_AUDIO_TARGET_55PCT_CYCLES (70,400) */
+    uint32_t underrun_count;    /* Blocks exceeding SP1_AUDIO_BLOCK_BUDGET_CYCLES (128,000) or DMA slab timeout */
+} sp1_audio_cycle_stats_t;
+
+/* ── Portable C11 Packing & Cycle Profiling Helpers (sp1_hal_common.c) ───── */
 
 /**
  * Pack interleaved stereo int16_t frames (2 * num_frames samples) into 24-bit-in-32-bit
@@ -47,6 +69,21 @@ typedef void (*sp1_audio_render_cb_t)(int16_t *interleaved_stereo,
 void sp1_audio_pack_s16_to_i2s24_in_32(const int16_t *src_s16,
                                        int32_t *dst_i2s32,
                                        uint32_t num_frames);
+
+/**
+ * Reset a cycle telemetry struct to all zeros.
+ */
+void sp1_audio_cycle_stats_reset(sp1_audio_cycle_stats_t *stats);
+
+/**
+ * Record one 96-frame audio block's elapsed CPU cycles (RT-safe, zero division).
+ */
+void sp1_audio_cycle_stats_record(sp1_audio_cycle_stats_t *stats, uint32_t elapsed_cycles);
+
+/**
+ * Compute mean CPU cycles per rendered 96-frame block (call from non-RT background/test context).
+ */
+uint32_t sp1_audio_cycle_stats_avg(const sp1_audio_cycle_stats_t *stats);
 
 /* ── Platform HAL Audio Lifecycle (sp1_hal_zephyr.c / sp1_hal_host.c) ────── */
 
@@ -62,6 +99,13 @@ int sp1_hal_audio_submit_block(const int16_t *interleaved_stereo, uint32_t num_f
 
 void sp1_hal_audio_set_volume(uint8_t volume_0_to_127);
 void sp1_hal_audio_set_mute(bool muted);
+
+/**
+ * Tear-free spinlock-guarded cycle telemetry accessors.
+ */
+void sp1_hal_audio_record_cycles(uint32_t elapsed_cycles);
+void sp1_hal_audio_get_cycle_stats(sp1_audio_cycle_stats_t *out_stats);
+void sp1_hal_audio_reset_cycle_stats(void);
 
 /**
  * Safe teardown prior to sys_poweroff() (Zephyr) or WAV header finalization (Host):

@@ -76,10 +76,38 @@ static sp1_controls_snapshot_t g_live_controls;
 static sp1_controls_bus_t g_controls_bus;
 static uint16_t g_prev_polled_buttons_down = 0U;
 
+/* Static RAM: 32 B DWT CYCCNT audio block cycle telemetry + spinlock */
+static struct k_spinlock g_cycle_stats_lock;
+static sp1_audio_cycle_stats_t g_audio_cycle_stats;
+
 static sp1_audio_render_cb_t g_audio_cb = NULL;
 static void *g_audio_ctx = NULL;
 static uint32_t g_audio_running_flag = 0U;
 static bool g_audio_configured = false;
+
+/* ── ARMv7E-M DWT CYCCNT Cycle Counter Instrumentation (Cortex-M4F) ──────── */
+
+static inline void sp1_dwt_cyccnt_init(void) {
+#if defined(__ARM_ARCH_7EM__)
+    /* ARMv7E-M CoreDebug DEMCR (0xE000EDFC) bit 24 = TRCENA;
+     * DWT CTRL (0xE0001000) bit 0 = CYCCNTENA; DWT CYCCNT (0xE0001004). */
+    volatile uint32_t *const demcr = (volatile uint32_t *)0xE000EDFCUL;
+    volatile uint32_t *const dwt_ctrl = (volatile uint32_t *)0xE0001000UL;
+    volatile uint32_t *const dwt_cyccnt = (volatile uint32_t *)0xE0001004UL;
+    *demcr |= (1UL << 24U);
+    *dwt_cyccnt = 0UL;
+    *dwt_ctrl |= 1UL;
+#endif
+}
+
+static inline uint32_t sp1_dwt_cyccnt_read(void) {
+#if defined(__ARM_ARCH_7EM__)
+    volatile const uint32_t *const dwt_cyccnt = (volatile const uint32_t *)0xE0001004UL;
+    return *dwt_cyccnt;
+#else
+    return k_cycle_get_32();
+#endif
+}
 
 /* ── Safety Gate: Reboot Rather Than Halt on Fatal Kernel Faults ─────────── */
 
@@ -105,11 +133,18 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
     __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr));
 #endif
 
+    sp1_dwt_cyccnt_init();
+
     while (__atomic_load_n(&g_audio_running_flag, __ATOMIC_ACQUIRE) != 0U) {
         void *dma_block = NULL;
         if (k_mem_slab_alloc(&g_i2s_tx_slab, &dma_block, K_MSEC(20)) != 0) {
+            k_spinlock_key_t key = k_spin_lock(&g_cycle_stats_lock);
+            g_audio_cycle_stats.underrun_count += 1U;
+            k_spin_unlock(&g_cycle_stats_lock, key);
             continue;
         }
+
+        const uint32_t cyc_start = sp1_dwt_cyccnt_read();
 
         if (g_audio_cb != NULL) {
             g_audio_cb(g_audio_dsp_scratch, SP1_AUDIO_BLOCK_FRAMES, g_audio_ctx);
@@ -119,6 +154,9 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
 
         sp1_audio_pack_s16_to_i2s24_in_32(
             g_audio_dsp_scratch, (int32_t *)dma_block, SP1_AUDIO_BLOCK_FRAMES);
+
+        const uint32_t cyc_elapsed = sp1_dwt_cyccnt_read() - cyc_start;
+        sp1_hal_audio_record_cycles(cyc_elapsed);
 
         if (i2s_write(g_i2s_dev, dma_block, SP1_I2S_DMA_BLOCK_BYTES) < 0) {
             k_mem_slab_free(&g_i2s_tx_slab, dma_block);
@@ -274,6 +312,7 @@ void sp1_hal_midi_on_rx_ump32(uint32_t word0) {
 int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
     g_audio_cb = render_cb;
     g_audio_ctx = user_ctx;
+    sp1_hal_audio_reset_cycle_stats();
 
     if (!device_is_ready(g_i2s_dev)) {
         return -ENODEV;
@@ -439,6 +478,30 @@ void sp1_hal_audio_set_mute(bool muted) {
         (void)audio_codec_set_property(
             g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, val);
     }
+}
+
+void sp1_hal_audio_record_cycles(uint32_t elapsed_cycles) {
+    k_spinlock_key_t key = k_spin_lock(&g_cycle_stats_lock);
+    sp1_audio_cycle_stats_record(&g_audio_cycle_stats, elapsed_cycles);
+    k_spin_unlock(&g_cycle_stats_lock, key);
+}
+
+#if defined(__GNUC__)
+__attribute__((used, noinline))
+#endif
+void sp1_hal_audio_get_cycle_stats(sp1_audio_cycle_stats_t *out_stats) {
+    if (out_stats == NULL) {
+        return;
+    }
+    k_spinlock_key_t key = k_spin_lock(&g_cycle_stats_lock);
+    *out_stats = g_audio_cycle_stats;
+    k_spin_unlock(&g_cycle_stats_lock, key);
+}
+
+void sp1_hal_audio_reset_cycle_stats(void) {
+    k_spinlock_key_t key = k_spin_lock(&g_cycle_stats_lock);
+    sp1_audio_cycle_stats_reset(&g_audio_cycle_stats);
+    k_spin_unlock(&g_cycle_stats_lock, key);
 }
 
 void sp1_hal_audio_shutdown(void) {

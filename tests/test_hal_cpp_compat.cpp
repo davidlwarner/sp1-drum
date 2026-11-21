@@ -37,6 +37,16 @@ int main() {
         return 1;
     }
 
+    sp1_hal_audio_reset_cycle_stats();
+    sp1_hal_audio_record_cycles(48000U);
+    sp1_audio_cycle_stats_t cyc{};
+    sp1_hal_audio_get_cycle_stats(&cyc);
+    if (cyc.block_count != 1U || cyc.max_cycles != 48000U ||
+        sp1_audio_cycle_stats_avg(&cyc) != 48000U) {
+        std::fprintf(stderr, "FAIL: cycle stats roundtrip failed from C++17\n");
+        return 1;
+    }
+
     sp1_hal_shutdown();
     std::printf("[PASS] test_hal_cpp_compat\n");
     return 0;
