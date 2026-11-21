@@ -13,8 +13,11 @@ void Leds::apply(int index, uint8_t brightness) {
     } else {
         return;
     }
+    if (!pwm_is_ready_dt(spec)) {
+        return;
+    }
     const uint32_t pulse = (spec->period * brightness) / 255U;
-    pwm_set_pulse_dt(spec, pulse);
+    (void)pwm_set_pulse_dt(spec, pulse);
 }
 
 void Leds::set_track(int index, uint8_t brightness) {

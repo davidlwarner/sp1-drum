@@ -138,22 +138,24 @@ ctest --test-dir build-host --output-on-failure
 
 ### Build Command
 ```bash
-west build -b stem_player . --build-dir build -p auto -- -DSNIPPET=cdc-acm-console
+west build -b stem_player . --build-dir build -p auto
 ```
 
-The flashable binary is emitted at `build/zephyr/zephyr.bin` (linked at `0x00020000`).
+> **Note (Zephyr `v4.3.1`):** Do **not** pass `-DSNIPPET=cdc-acm-console` — `app.overlay` and `prj.conf` already configure the single composite USB CDC ACM console + MIDI 2.0/1.0 device. Passing `-DSNIPPET=cdc-acm-console` on Zephyr `v4.3.1` forces `CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT=y` and injects a duplicate `cdc-acm-uart` node that collides with `init_usb()`.
+
+The flashable raw binary is emitted at `build/zephyr/zephyr.bin` (linked directly at `0x00020000` with a raw ARM Cortex-M4 vector table for the Teenage Engineering SP-1 bootloader and `https://solderless.engineering` — **not** MCUboot-signed).
 
 ---
 
 ## Measured Cortex-M4F Memory & Real-Time Cycle Footprint
 
-Built with **Zephyr `v4.3.1`** + **Zephyr SDK `0.17.4`** (`arm-zephyr-eabi-gcc 12.2.0`, `-O2`, `-mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard`, `CONFIG_NRF_ENABLE_ICACHE=y`):
+Built with **Zephyr `v4.3.1`** + **Zephyr SDK `0.17.4`** (`arm-zephyr-eabi-gcc 12.2.0`, `-O2`, `-mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard`, `CONFIG_NRF_ENABLE_ICACHE=y`, `CONFIG_ARM_MPU=y`, `CONFIG_HW_STACK_PROTECTION=y`):
 
 | Metric | Measured Value | Hardware Capacity / Budget | Utilization | Headroom Remaining |
 |---|---:|---:|---:|---:|
-| **`FLASH` (`slot0_partition` @ `0x20000`)** | **`217,336 B`** (`212.24 KB`) | `892 KB` (`913,408 B`) | **`23.79%`** | `696,072 B` (`76.21%`) |
-| **`SRAM` (`sram0`, `data + bss`)** | **`104,708 B`** (`102.25 KB`) | `256 KB` (`262,144 B`, gate `<= 128 KB`) | **`39.94%`** | `157,436 B` (`60.06%`) |
-| **ELF Sections (`arm-zephyr-eabi-size`)** | `text=213,592` · `data=3,736` · `bss=100,974` | `slot0` load addr `0x00020000` | Bootloader `0x0..0x1FFFF` protected | Zero dynamic allocation |
+| **`FLASH` (`slot0_partition` @ `0x20000`)** | **`172,100 B`** (`168.07 KB`) | `892 KB` (`913,408 B`) | **`18.84%`** | `741,308 B` (`81.16%`) |
+| **`SRAM` (`sram0`, `data + bss`)** | **`105,740 B`** (`103.26 KB`) | `256 KB` (`262,144 B`, gate `<= 128 KB`) | **`40.34%`** | `156,404 B` (`59.66%`) |
+| **ELF Sections (`arm-zephyr-eabi-size`)** | `text=169,076` · `data=3,020` · `bss=102,647` | `slot0` load addr `0x00020000` | Bootloader `0x0..0x1FFFF` protected | Zero dynamic allocation |
 | **Audio Block Cycle Load (96 frames / `2.0 ms`)** | **`60,604` avg / `62,380` peak cyc/block** | `128,000` cyc/block @ 64 MHz (`<= 55%` / `70,400` target) | **`47.3%` avg / `48.7%` peak** | `> 51%` CPU headroom |
 
 ---

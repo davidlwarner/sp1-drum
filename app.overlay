@@ -42,3 +42,8 @@
 		compatible = "zephyr,cdc-acm-uart";
 	};
 };
+
+/* Keep unused CYBT Bluetooth UART disabled so we don't drive its lines. */
+&uart0 {
+	status = "disabled";
+};

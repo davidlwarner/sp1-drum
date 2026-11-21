@@ -265,22 +265,42 @@ INPUT_CALLBACK_DEFINE(NULL, on_input_event, NULL);
 
 // ── main ────────────────────────────────────────────────────────
 
+BUILD_ASSERT(!IS_ENABLED(CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT),
+             "sp1-drum owns the single composite USBD context; do not pass "
+             "-DSNIPPET=cdc-acm-console (it enables CDC_ACM_SERIAL_INITIALIZE_AT_BOOT "
+             "and duplicates cdc_acm_uart0). Build without -DSNIPPET=cdc-acm-console.");
+
+static void run_boot_led_sweep(int wdt_channel) {
+    // Immediate visual proof on hardware that the MCU booted past the SP-1
+    // bootloader (0x00000..0x1FFFF) and reached main(), before USB or audio init.
+    g_leds.all_off();
+    for (int i = 0; i < leds::kNumTrack; ++i) {
+        g_leds.set_track(i, 220U);
+        core::watchdog::feed(wdt_channel);
+        k_msleep(40);
+        g_leds.set_track(i, 40U);
+    }
+    for (int i = 0; i < leds::kNumPlay; ++i) {
+        g_leds.set_play(i, 220U);
+        core::watchdog::feed(wdt_channel);
+        k_msleep(40);
+        g_leds.set_play(i, 40U);
+    }
+    std::array<uint8_t, leds::kNumTotal> pulse{};
+    pulse.fill(180U);
+    g_leds.set_all(pulse);
+    core::watchdog::feed(wdt_channel);
+    k_msleep(80);
+    g_leds.all_off();
+    core::watchdog::feed(wdt_channel);
+}
+
 int main(void) {
     core::watchdog::start();
     const int main_wdt = core::watchdog::register_channel("main", 5000);
     core::watchdog::feed(main_wdt);
 
-    LOG_INF("SP-1 Euclidean Drum Machine Booting...");
-
-    // ── USB composite device (CDC ACM console + MIDI) ───────────
-    if (init_usb() == nullptr) {
-        LOG_ERR("USB init failed");
-    } else {
-        LOG_INF("USB composite device ready (CDC ACM + MIDI)");
-    }
-    core::watchdog::feed(main_wdt);
-
-    // ── LEDs ────────────────────────────────────────────────────
+    // ── LEDs FIRST (immediate visual boot confirmation) ─────────
     g_leds.track[0] = PWM_DT_SPEC_GET(DT_NODELABEL(led_track_1));
     g_leds.track[1] = PWM_DT_SPEC_GET(DT_NODELABEL(led_track_2));
     g_leds.track[2] = PWM_DT_SPEC_GET(DT_NODELABEL(led_track_3));
@@ -289,8 +309,9 @@ int main(void) {
     g_leds.play[1] = PWM_DT_SPEC_GET(DT_NODELABEL(led_play_2));
     g_leds.play[2] = PWM_DT_SPEC_GET(DT_NODELABEL(led_play_3));
     g_leds.play[3] = PWM_DT_SPEC_GET(DT_NODELABEL(led_play_4));
-    g_leds.all_off();
-    core::watchdog::feed(main_wdt);
+    run_boot_led_sweep(main_wdt);
+
+    LOG_INF("SP-1 Euclidean Drum Machine Booting...");
 
     // ── Power monitor ───────────────────────────────────────────
     g_power.init();
@@ -304,7 +325,7 @@ int main(void) {
     }
     core::watchdog::feed(main_wdt);
 
-    // ── MIDI controller ─────────────────────────────────────────
+    // ── MIDI controller (register ops before enabling USB) ──────
     g_midi.midi_dev = midi_dev;
     g_midi.track_led_pwm = nullptr;
     g_midi.fader_adc = {fader1_adc, fader2_adc, fader3_adc, fader4_adc};
@@ -314,6 +335,14 @@ int main(void) {
         LOG_INF("USB MIDI configured");
     } else {
         LOG_ERR("MIDI device not ready");
+    }
+    core::watchdog::feed(main_wdt);
+
+    // ── USB composite device (CDC ACM console + MIDI) ───────────
+    if (init_usb() == nullptr) {
+        LOG_ERR("USB init failed");
+    } else {
+        LOG_INF("USB composite device ready (CDC ACM + MIDI)");
     }
     core::watchdog::feed(main_wdt);
 
@@ -327,24 +356,43 @@ int main(void) {
     sp1_master_fx_init(&g_master_fx);
     g_audio_frame_counter = 0ULL;
     g_audio_ctrl_decim = 0U;
-    __atomic_store_n(&g_led_track_packed, 0U, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_led_play_packed, 0U, __ATOMIC_RELEASE);
     sp1_seq_start(&g_sequencer);
+
+    // Seed initial LED frame immediately so hardware shows live sequencer state.
+    {
+        sp1_led_frame_t init_leds{};
+        sp1_ui_mapper_render_leds(&g_ui_mapper, &g_sequencer, 0U, &init_leds);
+        const uint32_t track_w =
+            static_cast<uint32_t>(init_leds.track[0]) |
+            (static_cast<uint32_t>(init_leds.track[1]) << 8U) |
+            (static_cast<uint32_t>(init_leds.track[2]) << 16U) |
+            (static_cast<uint32_t>(init_leds.track[3]) << 24U);
+        const uint32_t play_w =
+            static_cast<uint32_t>(init_leds.play[0]) |
+            (static_cast<uint32_t>(init_leds.play[1]) << 8U) |
+            (static_cast<uint32_t>(init_leds.play[2]) << 16U) |
+            (static_cast<uint32_t>(init_leds.play[3]) << 24U);
+        __atomic_store_n(&g_led_track_packed, track_w, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_led_play_packed, play_w, __ATOMIC_RELEASE);
+        sp1_hal_leds_set_frame(&init_leds);
+    }
     core::watchdog::feed(main_wdt);
 
+    bool audio_active = false;
     if (sp1_hal_audio_init(sp1_audio_render_cb, nullptr) < 0) {
-        LOG_WRN("SP-1 Audio HAL init failed");
+        LOG_WRN("SP-1 Audio HAL init failed; continuing with live UI/LEDs");
     } else {
         sp1_hal_audio_set_volume(108U);
         if (sp1_hal_audio_start() < 0) {
-            LOG_WRN("SP-1 Audio HAL start failed");
+            LOG_WRN("SP-1 Audio HAL start failed; continuing with live UI/LEDs");
         } else {
+            audio_active = true;
             LOG_INF("48 kHz I2S0 EasyDMA audio streaming active");
         }
     }
     core::watchdog::feed(main_wdt);
 
-    // ── Start HSM ───────────────────────────────────────────────
+    // ── Start HSM (always reached even if USB or audio init failed) ─
     app::AppMachine machine{};
     machine.midi = &g_midi;
     machine.leds = &g_leds;
@@ -356,8 +404,10 @@ int main(void) {
     machine.led_track_packed = &g_led_track_packed;
     machine.led_play_packed = &g_led_play_packed;
     machine.main_watchdog_channel = main_wdt;
+    machine.audio_active = audio_active;
 
-    LOG_INF("Boot complete, entering standalone HSM");
+    LOG_INF("Boot complete, entering standalone HSM (audio=%s)",
+            audio_active ? "active" : "fallback");
     app::run(machine);
 
     return 0;

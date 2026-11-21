@@ -35,6 +35,8 @@ struct AppMachine {
     const uint32_t* led_track_packed = nullptr;
     const uint32_t* led_play_packed = nullptr;
     int main_watchdog_channel = -1;
+    bool audio_active = false;
+    uint64_t fallback_frame_counter = 0ULL;
 
     // Function-button hold detection (for shutdown)
     int64_t fn_hold_start_ms = 0;

@@ -89,23 +89,48 @@ static smf_state_result running_run(void* o) {
         m.midi->poll_faders();
     }
 
-    if (m.led_track_packed != nullptr && m.led_play_packed != nullptr) {
-        const uint32_t track_w = __atomic_load_n(m.led_track_packed, __ATOMIC_ACQUIRE);
-        const uint32_t play_w = __atomic_load_n(m.led_play_packed, __ATOMIC_ACQUIRE);
-        const sp1_led_frame_t led_frame = {
-            {
-                static_cast<uint8_t>(track_w & 0xFFU),
-                static_cast<uint8_t>((track_w >> 8U) & 0xFFU),
-                static_cast<uint8_t>((track_w >> 16U) & 0xFFU),
-                static_cast<uint8_t>((track_w >> 24U) & 0xFFU),
-            },
-            {
-                static_cast<uint8_t>(play_w & 0xFFU),
-                static_cast<uint8_t>((play_w >> 8U) & 0xFFU),
-                static_cast<uint8_t>((play_w >> 16U) & 0xFFU),
-                static_cast<uint8_t>((play_w >> 24U) & 0xFFU),
-            },
-        };
+    if (m.audio_active) {
+        if (m.led_track_packed != nullptr && m.led_play_packed != nullptr) {
+            const uint32_t track_w = __atomic_load_n(m.led_track_packed, __ATOMIC_ACQUIRE);
+            const uint32_t play_w = __atomic_load_n(m.led_play_packed, __ATOMIC_ACQUIRE);
+            const sp1_led_frame_t led_frame = {
+                {
+                    static_cast<uint8_t>(track_w & 0xFFU),
+                    static_cast<uint8_t>((track_w >> 8U) & 0xFFU),
+                    static_cast<uint8_t>((track_w >> 16U) & 0xFFU),
+                    static_cast<uint8_t>((track_w >> 24U) & 0xFFU),
+                },
+                {
+                    static_cast<uint8_t>(play_w & 0xFFU),
+                    static_cast<uint8_t>((play_w >> 8U) & 0xFFU),
+                    static_cast<uint8_t>((play_w >> 16U) & 0xFFU),
+                    static_cast<uint8_t>((play_w >> 24U) & 0xFFU),
+                },
+            };
+            sp1_hal_leds_set_frame(&led_frame);
+        }
+    } else if (m.seq != nullptr && m.ui != nullptr) {
+        /* Fallback 50 Hz visual/control tick when I2S/codec init failed:
+         * keeps all 8 PWM LEDs, Euclidean step playback, buttons, faders,
+         * and USB-MIDI live with exclusive single-thread ownership of seq/ui. */
+        constexpr uint32_t kFallbackBlockFrames =
+            (SP1_AUDIO_SAMPLE_RATE_HZ * static_cast<uint32_t>(kPollCadenceMs)) / 1000U;
+        sp1_controls_snapshot_t snap{};
+        sp1_hal_controls_poll(&snap);
+        sp1_ui_mapper_update(m.ui, m.seq, &snap);
+
+        sp1_seq_trigger_event_t triggers[SP1_SEQ_MAX_BLOCK_TRIGGERS];
+        const uint32_t trig_count = sp1_seq_process_block(m.seq,
+                                                          m.fallback_frame_counter,
+                                                          kFallbackBlockFrames,
+                                                          triggers,
+                                                          SP1_SEQ_MAX_BLOCK_TRIGGERS);
+        sp1_ui_mapper_on_triggers(m.ui, triggers, trig_count);
+        m.fallback_frame_counter += static_cast<uint64_t>(kFallbackBlockFrames);
+
+        sp1_led_frame_t led_frame{};
+        sp1_ui_mapper_render_leds(
+            m.ui, m.seq, static_cast<uint32_t>(kPollCadenceMs), &led_frame);
         sp1_hal_leds_set_frame(&led_frame);
     }
 

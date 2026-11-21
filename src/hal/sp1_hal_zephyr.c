@@ -12,8 +12,13 @@
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/fatal.h>
 #include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/usb/class/usbd_midi2.h>
+
+#include <soc.h>
+
+LOG_MODULE_REGISTER(sp1_hal, LOG_LEVEL_INF);
 
 /* ── Static Hardware Device Bindings (stem_player.dts / app.overlay) ─────── */
 
@@ -51,7 +56,8 @@ static const struct pwm_dt_spec g_play_leds[SP1_NUM_PLAY_LEDS] = {
 #define SP1_I2S_DMA_BLOCK_BYTES     (SP1_AUDIO_BLOCK_SAMPLES * sizeof(int32_t))
 #define SP1_I2S_DMA_BLOCK_COUNT     8U
 #define SP1_AUDIO_THREAD_STACK_SIZE 4096U
-#define SP1_AUDIO_THREAD_PRIO       K_PRIO_COOP(2)
+/* Preemptible high-priority thread (never cooperative, so I2S errors cannot starve main/WDT) */
+#define SP1_AUDIO_THREAD_PRIO       K_PRIO_PREEMPT(0)
 
 /* Static RAM: 8 * 768 B = 6144 B I2S EasyDMA TX slab */
 K_MEM_SLAB_DEFINE_STATIC(g_i2s_tx_slab, SP1_I2S_DMA_BLOCK_BYTES, SP1_I2S_DMA_BLOCK_COUNT, 4);
@@ -84,6 +90,18 @@ static sp1_audio_render_cb_t g_audio_cb = NULL;
 static void *g_audio_ctx = NULL;
 static uint32_t g_audio_running_flag = 0U;
 static bool g_audio_configured = false;
+static bool g_cs42l42_ready = false;
+static bool g_tas2505_ready = false;
+
+/* ── Hardware Watchdog Reload Helper (Safe Across Slow I2C Bring-Up) ─────── */
+
+static inline void sp1_wdt_feed_all(void) {
+#if defined(NRF_WDT)
+    for (uint32_t ch = 0U; ch < 8U; ++ch) {
+        NRF_WDT->RR[ch] = WDT_RR_RR_Reload;
+    }
+#endif
+}
 
 /* ── ARMv7E-M DWT CYCCNT Cycle Counter Instrumentation (Cortex-M4F) ──────── */
 
@@ -117,6 +135,20 @@ void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf) 
     sys_reboot(SYS_REBOOT_COLD);
 }
 
+static void sp1_i2s_prime_silent(uint32_t count) {
+    for (uint32_t i = 0U; i < count; ++i) {
+        void *dma_block = NULL;
+        if (k_mem_slab_alloc(&g_i2s_tx_slab, &dma_block, K_NO_WAIT) != 0) {
+            break;
+        }
+        memset(dma_block, 0, SP1_I2S_DMA_BLOCK_BYTES);
+        if (i2s_write(g_i2s_dev, dma_block, SP1_I2S_DMA_BLOCK_BYTES) < 0) {
+            k_mem_slab_free(&g_i2s_tx_slab, dma_block);
+            break;
+        }
+    }
+}
+
 /* ── High-Priority Audio Render Thread ───────────────────────────────────── */
 
 static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
@@ -135,9 +167,11 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
 
     sp1_dwt_cyccnt_init();
 
+    uint32_t consecutive_write_fails = 0U;
+
     while (__atomic_load_n(&g_audio_running_flag, __ATOMIC_ACQUIRE) != 0U) {
         void *dma_block = NULL;
-        if (k_mem_slab_alloc(&g_i2s_tx_slab, &dma_block, K_MSEC(20)) != 0) {
+        if (k_mem_slab_alloc(&g_i2s_tx_slab, &dma_block, K_MSEC(50)) != 0) {
             k_spinlock_key_t key = k_spin_lock(&g_cycle_stats_lock);
             g_audio_cycle_stats.underrun_count += 1U;
             k_spin_unlock(&g_cycle_stats_lock, key);
@@ -160,7 +194,23 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
 
         if (i2s_write(g_i2s_dev, dma_block, SP1_I2S_DMA_BLOCK_BYTES) < 0) {
             k_mem_slab_free(&g_i2s_tx_slab, dma_block);
+            k_spinlock_key_t key = k_spin_lock(&g_cycle_stats_lock);
+            g_audio_cycle_stats.underrun_count += 1U;
+            k_spin_unlock(&g_cycle_stats_lock, key);
+
+            /* Never spin tightly on I2S error: yield so main/WDT/USB stay responsive. */
+            k_msleep(2);
+            consecutive_write_fails += 1U;
+            if (consecutive_write_fails >= 8U) {
+                consecutive_write_fails = 0U;
+                (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+                k_msleep(5);
+                sp1_i2s_prime_silent(2U);
+                (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
+            }
+            continue;
         }
+        consecutive_write_fails = 0U;
     }
     g_audio_thread_created = false;
 }
@@ -312,32 +362,42 @@ void sp1_hal_midi_on_rx_ump32(uint32_t word0) {
 int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
     g_audio_cb = render_cb;
     g_audio_ctx = user_ctx;
+    g_audio_configured = false;
+    g_cs42l42_ready = false;
+    g_tas2505_ready = false;
     sp1_hal_audio_reset_cycle_stats();
 
     if (!device_is_ready(g_i2s_dev)) {
+        LOG_WRN("I2S0 device not ready");
         return -ENODEV;
     }
 
     /* Ensure external 3.072 MHz audio oscillator (P0.13) is enabled prior to codec PLL lock. */
     if (device_is_ready(g_gpio0_dev)) {
         (void)gpio_pin_configure(g_gpio0_dev, SP1_OSC_EN_PIN, GPIO_OUTPUT_ACTIVE);
+        k_msleep(5);
     }
+    sp1_wdt_feed_all();
 
+    /* On SP-1 hardware, the external 3.072 MHz oscillator drives BCLK (P0.12) and
+     * CS42L42 masters LRCK (P0.11), so nRF52840 I2S0 runs as a clock slave. */
     struct i2s_config i2s_cfg;
     memset(&i2s_cfg, 0, sizeof(i2s_cfg));
     i2s_cfg.word_size = 24U;
     i2s_cfg.channels = SP1_AUDIO_CHANNELS;
     i2s_cfg.format = I2S_FMT_DATA_FORMAT_I2S;
-    i2s_cfg.options = I2S_OPT_BIT_CLK_MASTER | I2S_OPT_FRAME_CLK_MASTER;
+    i2s_cfg.options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE;
     i2s_cfg.frame_clk_freq = SP1_AUDIO_SAMPLE_RATE_HZ;
     i2s_cfg.mem_slab = &g_i2s_tx_slab;
     i2s_cfg.block_size = SP1_I2S_DMA_BLOCK_BYTES;
-    i2s_cfg.timeout = 200;
+    i2s_cfg.timeout = 500;
 
     int err = i2s_configure(g_i2s_dev, I2S_DIR_TX, &i2s_cfg);
     if (err < 0) {
+        LOG_WRN("I2S0 slave configure failed: %d", err);
         return err;
     }
+    sp1_wdt_feed_all();
 
     struct audio_codec_cfg codec_cfg;
     memset(&codec_cfg, 0, sizeof(codec_cfg));
@@ -345,16 +405,33 @@ int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
     codec_cfg.dai_route = AUDIO_ROUTE_PLAYBACK;
     codec_cfg.dai_cfg.i2s = i2s_cfg;
 
+    /* CS42L42 masters the 48 kHz LRCK frame clock; treat I2C failure cleanly without hanging. */
     if (device_is_ready(g_cs42l42_dev)) {
-        err = audio_codec_configure(g_cs42l42_dev, &codec_cfg);
-        if (err < 0) {
-            return err;
+        const int cs_err = audio_codec_configure(g_cs42l42_dev, &codec_cfg);
+        if (cs_err == 0) {
+            g_cs42l42_ready = true;
+        } else {
+            LOG_WRN("CS42L42 configure failed (%d); continuing without headphone DAC", cs_err);
         }
+    } else {
+        LOG_WRN("CS42L42 device not ready");
     }
+    sp1_wdt_feed_all();
 
     /* TAS2505 may NACK when full SWD probe is attached; treat failure as non-fatal. */
     if (device_is_ready(g_tas2505_dev)) {
-        (void)audio_codec_configure(g_tas2505_dev, &codec_cfg);
+        const int tas_err = audio_codec_configure(g_tas2505_dev, &codec_cfg);
+        if (tas_err == 0) {
+            g_tas2505_ready = true;
+        } else {
+            LOG_WRN("TAS2505 configure failed (%d); continuing without speaker amp", tas_err);
+        }
+    }
+    sp1_wdt_feed_all();
+
+    /* Without CS42L42 mastering LRCK, I2S0 slave DMA will not receive frame clocks. */
+    if (!g_cs42l42_ready) {
+        return -EIO;
     }
 
     g_audio_configured = true;
@@ -369,15 +446,7 @@ int sp1_hal_audio_start(void) {
     __atomic_store_n(&g_audio_running_flag, 1U, __ATOMIC_RELEASE);
 
     /* Prime two silent DMA blocks before starting I2S0 EasyDMA. */
-    for (uint32_t i = 0U; i < 2U; ++i) {
-        void *dma_block = NULL;
-        if (k_mem_slab_alloc(&g_i2s_tx_slab, &dma_block, K_NO_WAIT) == 0) {
-            memset(dma_block, 0, SP1_I2S_DMA_BLOCK_BYTES);
-            if (i2s_write(g_i2s_dev, dma_block, SP1_I2S_DMA_BLOCK_BYTES) < 0) {
-                k_mem_slab_free(&g_i2s_tx_slab, dma_block);
-            }
-        }
-    }
+    sp1_i2s_prime_silent(2U);
 
     const int err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
     if (err < 0) {
@@ -385,10 +454,10 @@ int sp1_hal_audio_start(void) {
         return err;
     }
 
-    if (device_is_ready(g_cs42l42_dev)) {
+    if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
         audio_codec_start_output(g_cs42l42_dev);
     }
-    if (device_is_ready(g_tas2505_dev)) {
+    if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
         audio_codec_start_output(g_tas2505_dev);
     }
 
@@ -402,6 +471,7 @@ int sp1_hal_audio_start(void) {
                               SP1_AUDIO_THREAD_PRIO,
                               0U,
                               K_NO_WAIT);
+        (void)k_thread_name_set(&g_audio_thread_data, "sp1_audio");
     }
 
     return 0;
@@ -411,10 +481,10 @@ int sp1_hal_audio_stop(void) {
     __atomic_store_n(&g_audio_running_flag, 0U, __ATOMIC_RELEASE);
 
     /* Mute speaker amp and headphone DAC before dropping I2S0 clocks to prevent pop. */
-    if (device_is_ready(g_tas2505_dev)) {
+    if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
         audio_codec_stop_output(g_tas2505_dev);
     }
-    if (device_is_ready(g_cs42l42_dev)) {
+    if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
         audio_codec_stop_output(g_cs42l42_dev);
     }
     if (g_audio_configured && device_is_ready(g_i2s_dev)) {
@@ -456,11 +526,11 @@ void sp1_hal_audio_set_volume(uint8_t volume_0_to_127) {
     audio_property_value_t val;
     val.vol = (int)(127U - clamped);
 
-    if (device_is_ready(g_cs42l42_dev)) {
+    if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
         (void)audio_codec_set_property(
             g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_VOLUME, AUDIO_CHANNEL_ALL, val);
     }
-    if (device_is_ready(g_tas2505_dev)) {
+    if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
         (void)audio_codec_set_property(
             g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_VOLUME, AUDIO_CHANNEL_ALL, val);
     }
@@ -470,11 +540,11 @@ void sp1_hal_audio_set_mute(bool muted) {
     audio_property_value_t val;
     val.mute = muted;
 
-    if (device_is_ready(g_cs42l42_dev)) {
+    if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
         (void)audio_codec_set_property(
             g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, val);
     }
-    if (device_is_ready(g_tas2505_dev)) {
+    if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
         (void)audio_codec_set_property(
             g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, val);
     }
@@ -508,6 +578,12 @@ void sp1_hal_audio_shutdown(void) {
     (void)sp1_hal_audio_stop();
     sp1_hal_audio_set_mute(true);
 
+#if defined(NRF_I2S)
+    /* Force-halt slave-mode I2S0 at register level before cutting clocks for SYSTEM_OFF. */
+    NRF_I2S->TASKS_STOP = 1U;
+    NRF_I2S->ENABLE = 0U;
+#endif
+
     /* Assert hardware reset on TAS2505 (P0.09) and CS42L42 (P0.15) to prevent pop/drain. */
     if (gpio_is_ready_dt(&g_tas2505_rst)) {
         (void)gpio_pin_configure_dt(&g_tas2505_rst, GPIO_OUTPUT_ACTIVE);
@@ -522,6 +598,8 @@ void sp1_hal_audio_shutdown(void) {
     }
 
     g_audio_configured = false;
+    g_cs42l42_ready = false;
+    g_tas2505_ready = false;
 }
 
 /* ── Top-Level HAL Lifecycle & Monotonic Time ────────────────────────────── */

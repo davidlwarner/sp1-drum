@@ -162,20 +162,9 @@ void feed() {
         return;
     }
 
-    int fed_channels = 0;
-    for (size_t i = 0; i < NRF_WDT_CHANNEL_NUMBER; ++i) {
-        const auto rr = static_cast<nrf_wdt_rr_register_t>(i);
-        if (nrf_wdt_reload_request_enable_check(kWdt, rr)) {
-            nrf_wdt_reload_request_set(kWdt, rr);
-            ++fed_channels;
-        }
-    }
-
-    // Mirror the stock firmware's behavior if the bootloader handed us a
-    // running WDT with an unexpected channel configuration.
-    if (fed_channels == 0) {
-        feed_all_channels();
-    }
+    // Reload all 8 channels unconditionally: the TE SP-1 bootloader may have
+    // armed channels this application does not own.
+    feed_all_channels();
 }
 
 void feed(int channel_id) {

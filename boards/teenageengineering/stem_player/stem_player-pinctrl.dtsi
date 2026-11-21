@@ -37,18 +37,18 @@
         };
     };
 
-    /* I2S0: Audio Streaming (master mode — nRF52840 drives BCLK/LRCK) */
+    /* I2S0: Audio Streaming (slave mode — 3.072 MHz osc drives BCLK, CS42L42 masters LRCK) */
     i2s0_default: i2s0_default {
         group1 {
-            psels = <NRF_PSEL(I2S_SCK_M, 0, 12)>,    /* P0.12 BCLK output */
-                    <NRF_PSEL(I2S_LRCK_M, 0, 11)>,   /* P0.11 LRCK output */
+            psels = <NRF_PSEL(I2S_SCK_S, 0, 12)>,    /* P0.12 BCLK input (3.072 MHz osc) */
+                    <NRF_PSEL(I2S_LRCK_S, 0, 11)>,   /* P0.11 LRCK input (CS42L42 master) */
                     <NRF_PSEL(I2S_SDOUT, 1, 9)>;     /* P1.09 data output */
         };
     };
     i2s0_sleep: i2s0_sleep {
         group1 {
-            psels = <NRF_PSEL(I2S_SCK_M, 0, 12)>,
-                    <NRF_PSEL(I2S_LRCK_M, 0, 11)>,
+            psels = <NRF_PSEL(I2S_SCK_S, 0, 12)>,
+                    <NRF_PSEL(I2S_LRCK_S, 0, 11)>,
                     <NRF_PSEL(I2S_SDOUT, 1, 9)>;
             low-power-enable;
         };

@@ -154,7 +154,7 @@ static const struct cs42l42_script_reg_write setup_script_pre_power[] = {
 
 static const struct cs42l42_script_reg_write setup_script_main[] = {
 	{CS42L42_REG_PLL_CTL3, CS42L42_PLL_DIV_OUT_3072},
-	{CS42L42_REG_PLL_DIV_FRAC2, CS42L42_PLL_DIV_FRAC2_3072},
+	{CS42L42_REG_PLL_DIV_FRAC2, CS42L42_PLL_DIV_FRAC0_3072},
 	{CS42L42_REG_PLL_DIV_INT, CS42L42_PLL_DIV_INT_3072},
 	{CS42L42_REG_PLL_CAL_RATIO, CS42L42_PLL_CAL_RATIO_3072},
 	{CS42L42_REG_MCLK_CTL, 0x00},
@@ -332,9 +332,12 @@ static bool cs42l42_probe_id(const struct device *dev, const char *tag)
 		return false;
 	}
 
-	if (ab != CS42L42_EXPECTED_DEVID_AB || cd != CS42L42_EXPECTED_DEVID_CD) {
+	if (ab != CS42L42_EXPECTED_DEVID_AB) {
 		LOG_ERR("Unexpected CS42L42 DEVID: 0x%02x 0x%02x 0x%02x", ab, cd, e);
 		return false;
+	}
+	if (cd != CS42L42_EXPECTED_DEVID_CD) {
+		LOG_WRN("CS42L42 non-default DEVID_CD=0x%02x (E=0x%02x), continuing", cd, e);
 	}
 
 	return true;

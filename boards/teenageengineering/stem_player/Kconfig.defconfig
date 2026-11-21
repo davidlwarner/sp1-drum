@@ -2,6 +2,8 @@
 
 if BOARD_STEM_PLAYER
 
-source "boards/common/usb/Kconfig.cdc_acm_serial.defconfig"
+# App owns the composite USB device (CDC ACM + MIDI) via app.overlay & prj.conf.
+# Do not source Kconfig.cdc_acm_serial.defconfig, which forces
+# CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT=y and a 4000 ms log startup delay.
 
 endif # BOARD_STEM_PLAYER
