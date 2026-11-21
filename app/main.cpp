@@ -94,12 +94,18 @@ static midi::MidiController g_midi;
 static leds::Leds g_leds;
 static power::PowerManager g_power;
 
-/* Static RAM: 768 B sequencer + 80 B UI mapper + 292 B 4-voice synth + 73,872 B master FX */
+/* Static RAM: 768 B sequencer + 80 B UI mapper + 296 B 4-voice synth + 73,892 B master FX */
 static sp1_sequencer_t g_sequencer;
 static sp1_ui_mapper_t g_ui_mapper;
 static sp1_drum_synth_t g_drum_synth;
 static sp1_master_fx_t g_master_fx;
 static uint64_t g_audio_frame_counter = 0ULL;
+static uint32_t g_audio_ctrl_decim = 0U;
+static uint32_t g_led_track_packed = 0U;
+static uint32_t g_led_play_packed = 0U;
+
+static constexpr uint32_t kAudioCtrlDecimBlocks = 10U; /* 10 * 2.0 ms = 20 ms (50 Hz) */
+static constexpr uint32_t kAudioCtrlCadenceMs = 20U;
 
 /* Static RAM: 4 * 96 * 4 B = 1536 B audio callback float block buffers */
 static float g_dsp_main_l[SP1_AUDIO_BLOCK_FRAMES];
@@ -120,6 +126,33 @@ static void sp1_audio_render_cb(int16_t *interleaved_stereo,
     const uint32_t block_frames =
         (num_frames > SP1_AUDIO_BLOCK_FRAMES) ? SP1_AUDIO_BLOCK_FRAMES : num_frames;
 
+    const bool run_ctrl_tick = (g_audio_ctrl_decim == 0U);
+    g_audio_ctrl_decim++;
+    if (g_audio_ctrl_decim >= kAudioCtrlDecimBlocks) {
+        g_audio_ctrl_decim = 0U;
+    }
+
+    if (run_ctrl_tick) {
+        sp1_controls_snapshot_t snap{};
+        sp1_hal_controls_poll(&snap);
+        sp1_ui_mapper_update(&g_ui_mapper, &g_sequencer, &snap);
+
+        const sp1_ui_dsp_params_t *dsp = sp1_ui_mapper_get_dsp_params(&g_ui_mapper);
+        if (dsp != nullptr) {
+            sp1_drum_voices_set_kick_params(&g_drum_synth, dsp->kick_decay, dsp->kick_drive);
+            sp1_drum_voices_set_snare_morph(&g_drum_synth, dsp->snare_morph);
+            sp1_drum_voices_set_hat_decay(&g_drum_synth, dsp->hat_decay);
+            sp1_drum_voices_set_perc_timbre(&g_drum_synth, dsp->perc_timbre);
+
+            sp1_master_fx_set_dj_filter(&g_master_fx, dsp->dj_filter_pos, dsp->dj_resonance_q);
+            sp1_master_fx_set_stutter(
+                &g_master_fx, static_cast<sp1_stutter_div_t>(dsp->stutter_div));
+            sp1_master_fx_set_bitcrusher(&g_master_fx, dsp->crush_amount);
+            sp1_master_fx_set_dub_delay(
+                &g_master_fx, dsp->dub_delay_wet, dsp->dub_delay_feedback);
+        }
+    }
+
     sp1_seq_trigger_event_t triggers[SP1_SEQ_MAX_BLOCK_TRIGGERS];
     const uint32_t trig_count = sp1_seq_process_block(&g_sequencer,
                                                       g_audio_frame_counter,
@@ -127,6 +160,23 @@ static void sp1_audio_render_cb(int16_t *interleaved_stereo,
                                                       triggers,
                                                       SP1_SEQ_MAX_BLOCK_TRIGGERS);
     sp1_ui_mapper_on_triggers(&g_ui_mapper, triggers, trig_count);
+
+    if (run_ctrl_tick) {
+        sp1_led_frame_t led_frame{};
+        sp1_ui_mapper_render_leds(&g_ui_mapper, &g_sequencer, kAudioCtrlCadenceMs, &led_frame);
+        const uint32_t track_w =
+            static_cast<uint32_t>(led_frame.track[0]) |
+            (static_cast<uint32_t>(led_frame.track[1]) << 8U) |
+            (static_cast<uint32_t>(led_frame.track[2]) << 16U) |
+            (static_cast<uint32_t>(led_frame.track[3]) << 24U);
+        const uint32_t play_w =
+            static_cast<uint32_t>(led_frame.play[0]) |
+            (static_cast<uint32_t>(led_frame.play[1]) << 8U) |
+            (static_cast<uint32_t>(led_frame.play[2]) << 16U) |
+            (static_cast<uint32_t>(led_frame.play[3]) << 24U);
+        __atomic_store_n(&g_led_track_packed, track_w, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_led_play_packed, play_w, __ATOMIC_RELEASE);
+    }
 
     sp1_drum_voices_render_block(&g_drum_synth,
                                  triggers,
@@ -276,6 +326,9 @@ int main(void) {
     sp1_drum_voices_init(&g_drum_synth);
     sp1_master_fx_init(&g_master_fx);
     g_audio_frame_counter = 0ULL;
+    g_audio_ctrl_decim = 0U;
+    __atomic_store_n(&g_led_track_packed, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_led_play_packed, 0U, __ATOMIC_RELEASE);
     sp1_seq_start(&g_sequencer);
     core::watchdog::feed(main_wdt);
 
@@ -300,6 +353,8 @@ int main(void) {
     machine.ui = &g_ui_mapper;
     machine.synth = &g_drum_synth;
     machine.fx = &g_master_fx;
+    machine.led_track_packed = &g_led_track_packed;
+    machine.led_play_packed = &g_led_play_packed;
     machine.main_watchdog_channel = main_wdt;
 
     LOG_INF("Boot complete, entering standalone HSM");

@@ -221,6 +221,12 @@ static inline float render_kick_sample(sp1_kick_voice_t *v) {
     v->amp_env *= v->amp_decay_coeff;
     v->pitch_env *= v->pitch_decay_coeff;
     v->click_env *= v->click_decay_coeff;
+    if (v->click_env < SP1_DSP_ENV_FLOOR) {
+        v->click_env = 0.0f;
+    }
+    if (v->pitch_env < SP1_DSP_ENV_FLOOR) {
+        v->pitch_env = 0.0f;
+    }
 
     if (v->amp_env < SP1_DSP_ENV_FLOOR) {
         v->amp_env = 0.0f;
@@ -275,6 +281,9 @@ static inline float render_snare_sample(sp1_snare_voice_t *v) {
     v->body_env *= v->body_decay_coeff;
     v->noise_env *= v->noise_decay_coeff;
     v->knock_env *= v->knock_decay_coeff;
+    if (v->knock_env < SP1_DSP_ENV_FLOOR) {
+        v->knock_env = 0.0f;
+    }
 
     if (v->body_env < SP1_DSP_ENV_FLOOR && v->noise_env < SP1_DSP_ENV_FLOOR) {
         v->body_env = 0.0f;

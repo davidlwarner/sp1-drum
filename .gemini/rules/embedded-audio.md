@@ -41,3 +41,9 @@ These rules govern all code written for the SP-1 4-track Euclidean drum machine 
   1. Target ARM cross-compiler (`arm-zephyr-eabi-gcc`, Cortex-M4F with hard-float FPU; also compatible with `arm-none-eabi-gcc`).
   2. Host `gcc` (x86_64 CTest harness).
   3. Host `clang` (x86_64 CTest harness).
+
+## 7. Open-Source Hygiene & Attribution
+- **Repository-Relative Paths Only:** All tracked source files, CMake files, documentation, rules, and skills must use repository-relative paths (`src/...`, `boards/...`, `build-host/...`). Never commit machine- or container-specific absolute paths to `main`.
+- **Zero Binary or Simulation Artifacts in Git:** Never commit compiled firmware binaries or host simulation outputs (`.bin`, `.elf`, `.hex`, `.uf2`, `.wav`, `.csv`, `build/`, `build-host/`, `reference/`, `graphify-out/`) to `main`.
+- **Clean-Room `src/` Implementation & MIT Attribution:** All modules under `src/core/`, `src/dsp/`, `src/hal/`, `sim/`, and `tests/` must remain clean-room C11/C++17 implementations. Upstream BSP attribution (`ericlewis/sp1-midi`, `timknapen/SP-1-dev`, `chattock/sp1-tape-looper`, `Worldwave/Wakes`, and the Zephyr Project) must be maintained in `LICENSE` and `ATTRIBUTION.md`, and any code snippet ever adapted from `reference/` must carry an explicit MIT copyright and attribution header.
+

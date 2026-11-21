@@ -89,31 +89,23 @@ static smf_state_result running_run(void* o) {
         m.midi->poll_faders();
     }
 
-    if (m.ui != nullptr && m.seq != nullptr) {
-        sp1_controls_snapshot_t snap{};
-        sp1_hal_controls_poll(&snap);
-        sp1_ui_mapper_update(m.ui, m.seq, &snap);
-
-        const sp1_ui_dsp_params_t* dsp = sp1_ui_mapper_get_dsp_params(m.ui);
-        if (dsp != nullptr) {
-            if (m.synth != nullptr) {
-                sp1_drum_voices_set_kick_params(m.synth, dsp->kick_decay, dsp->kick_drive);
-                sp1_drum_voices_set_snare_morph(m.synth, dsp->snare_morph);
-                sp1_drum_voices_set_hat_decay(m.synth, dsp->hat_decay);
-                sp1_drum_voices_set_perc_timbre(m.synth, dsp->perc_timbre);
-            }
-            if (m.fx != nullptr) {
-                sp1_master_fx_set_dj_filter(m.fx, dsp->dj_filter_pos, dsp->dj_resonance_q);
-                sp1_master_fx_set_stutter(
-                    m.fx, static_cast<sp1_stutter_div_t>(dsp->stutter_div));
-                sp1_master_fx_set_bitcrusher(m.fx, dsp->crush_amount);
-                sp1_master_fx_set_dub_delay(
-                    m.fx, dsp->dub_delay_wet, dsp->dub_delay_feedback);
-            }
-        }
-
-        sp1_led_frame_t led_frame{};
-        sp1_ui_mapper_render_leds(m.ui, m.seq, static_cast<uint32_t>(kPollCadenceMs), &led_frame);
+    if (m.led_track_packed != nullptr && m.led_play_packed != nullptr) {
+        const uint32_t track_w = __atomic_load_n(m.led_track_packed, __ATOMIC_ACQUIRE);
+        const uint32_t play_w = __atomic_load_n(m.led_play_packed, __ATOMIC_ACQUIRE);
+        const sp1_led_frame_t led_frame = {
+            {
+                static_cast<uint8_t>(track_w & 0xFFU),
+                static_cast<uint8_t>((track_w >> 8U) & 0xFFU),
+                static_cast<uint8_t>((track_w >> 16U) & 0xFFU),
+                static_cast<uint8_t>((track_w >> 24U) & 0xFFU),
+            },
+            {
+                static_cast<uint8_t>(play_w & 0xFFU),
+                static_cast<uint8_t>((play_w >> 8U) & 0xFFU),
+                static_cast<uint8_t>((play_w >> 16U) & 0xFFU),
+                static_cast<uint8_t>((play_w >> 24U) & 0xFFU),
+            },
+        };
         sp1_hal_leds_set_frame(&led_frame);
     }
 

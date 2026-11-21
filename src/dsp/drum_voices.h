@@ -181,7 +181,7 @@ static inline void sp1_svf_process(sp1_svf_t *f,
 
 /* ── 4 Drum Synthesis Voice Structures ───────────────────────────────────── */
 
-/* Track 1 — Kick / Sub Voice. Static RAM: 52 bytes. */
+/* Track 1 — Kick / Sub Voice. Static RAM: 56 bytes. */
 typedef struct {
     uint32_t phase;
     float amp_env;
@@ -256,7 +256,7 @@ typedef struct {
 } sp1_perc_voice_t;
 
 /* Complete 4-Voice Drum Synthesizer State.
- * Static RAM: 292 bytes total (zero dynamic allocation). */
+ * Static RAM: 296 bytes total (zero dynamic allocation). */
 typedef struct {
     sp1_kick_voice_t kick;
     sp1_snare_voice_t snare;

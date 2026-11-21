@@ -32,6 +32,8 @@ struct AppMachine {
     sp1_ui_mapper_t* ui = nullptr;
     sp1_drum_synth_t* synth = nullptr;
     sp1_master_fx_t* fx = nullptr;
+    const uint32_t* led_track_packed = nullptr;
+    const uint32_t* led_play_packed = nullptr;
     int main_watchdog_channel = -1;
 
     // Function-button hold detection (for shutdown)

@@ -51,7 +51,7 @@ static const struct pwm_dt_spec g_play_leds[SP1_NUM_PLAY_LEDS] = {
 #define SP1_I2S_DMA_BLOCK_BYTES     (SP1_AUDIO_BLOCK_SAMPLES * sizeof(int32_t))
 #define SP1_I2S_DMA_BLOCK_COUNT     8U
 #define SP1_AUDIO_THREAD_STACK_SIZE 4096U
-#define SP1_AUDIO_THREAD_PRIO       2
+#define SP1_AUDIO_THREAD_PRIO       K_PRIO_COOP(2)
 
 /* Static RAM: 8 * 768 B = 6144 B I2S EasyDMA TX slab */
 K_MEM_SLAB_DEFINE_STATIC(g_i2s_tx_slab, SP1_I2S_DMA_BLOCK_BYTES, SP1_I2S_DMA_BLOCK_COUNT, 4);
@@ -69,7 +69,8 @@ static sp1_midi_spsc_queue_t g_midi_rx_q;
 static sp1_midi_spsc_queue_t g_midi_tx_q;
 static uint32_t g_midi_ready_flag = 0U;
 
-/* Static RAM: 16 B fader filters + 40 B live controls + 84 B double-buffered bus + 2 B edge state = 142 B */
+/* Static RAM: 16 B fader filters + 40 B live controls + 84 B double-buffered bus + 2 B edge state + spinlock */
+static struct k_spinlock g_controls_lock;
 static sp1_fader_filter_t g_fader_filters[SP1_NUM_FADERS];
 static sp1_controls_snapshot_t g_live_controls;
 static sp1_controls_bus_t g_controls_bus;
@@ -129,12 +130,14 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
 /* ── HAL Controls & 8-Channel PWM LEDs ───────────────────────────────────── */
 
 int sp1_hal_controls_init(void) {
+    k_spinlock_key_t key = k_spin_lock(&g_controls_lock);
     for (uint32_t i = 0U; i < SP1_NUM_FADERS; ++i) {
         sp1_fader_filter_init(&g_fader_filters[i]);
     }
     sp1_controls_snapshot_init(&g_live_controls);
     sp1_controls_bus_init(&g_controls_bus);
     g_prev_polled_buttons_down = 0U;
+    k_spin_unlock(&g_controls_lock, key);
     return 0;
 }
 
@@ -144,6 +147,7 @@ void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
     }
 
     const uint16_t bit = SP1_BTN_BIT(btn);
+    k_spinlock_key_t key = k_spin_lock(&g_controls_lock);
     if (pressed) {
         g_live_controls.buttons_down |= bit;
     } else {
@@ -152,6 +156,7 @@ void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
 
     g_live_controls.seq++;
     sp1_controls_bus_publish(&g_controls_bus, &g_live_controls);
+    k_spin_unlock(&g_controls_lock, key);
 }
 
 void sp1_hal_controls_on_fader_raw(uint8_t fader_idx, int16_t raw_sample) {
@@ -161,6 +166,7 @@ void sp1_hal_controls_on_fader_raw(uint8_t fader_idx, int16_t raw_sample) {
 
     float norm = 0.0f;
     uint8_t cc7 = 0U;
+    k_spinlock_key_t key = k_spin_lock(&g_controls_lock);
     if (sp1_fader_filter_update(&g_fader_filters[fader_idx], raw_sample, &norm, &cc7)) {
         g_live_controls.fader_raw[fader_idx] = (uint16_t)g_fader_filters[fader_idx].raw_clamped;
         g_live_controls.fader_norm[fader_idx] = norm;
@@ -168,10 +174,12 @@ void sp1_hal_controls_on_fader_raw(uint8_t fader_idx, int16_t raw_sample) {
         g_live_controls.seq++;
         sp1_controls_bus_publish(&g_controls_bus, &g_live_controls);
     }
+    k_spin_unlock(&g_controls_lock, key);
 }
 
 void sp1_hal_controls_poll(sp1_controls_snapshot_t *out_snapshot) {
     sp1_controls_snapshot_t snap;
+    k_spinlock_key_t key = k_spin_lock(&g_controls_lock);
     sp1_controls_bus_read(&g_controls_bus, &snap);
 
     /* Derive one-shot rising/falling edge masks purely on the consumer side
@@ -181,6 +189,7 @@ void sp1_hal_controls_poll(sp1_controls_snapshot_t *out_snapshot) {
     snap.buttons_pressed = (uint16_t)(cur_down & (uint16_t)(~prev_down));
     snap.buttons_released = (uint16_t)((uint16_t)(~cur_down) & prev_down);
     g_prev_polled_buttons_down = cur_down;
+    k_spin_unlock(&g_controls_lock, key);
 
     if (out_snapshot != NULL) {
         *out_snapshot = snap;

@@ -51,7 +51,7 @@ typedef enum {
 } sp1_stutter_div_t;
 
 /* Complete Stereo Master Performance FX Bus State.
- * Static RAM: 65,536 B (stutter) + 8,192 B (dub delay) + 144 B (SVF/state) = 73,872 B (~72.14 KB). */
+ * Static RAM: 65,536 B (stutter) + 8,192 B (dub delay) + 164 B (SVF/state) = 73,892 B (~72.16 KB). */
 typedef struct {
     /* 1. Static 64 KB circular stereo stutter buffer (interleaved L, R int16_t) */
     int16_t stutter_buf[SP1_FX_STUTTER_FRAMES * 2U];
