@@ -95,6 +95,15 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
     (void)p2;
     (void)p3;
 
+#if defined(__ARM_FP) && (__ARM_FP != 0)
+    /* Enable Cortex-M4F FPU Flush-To-Zero (FZ, bit 24) and Default-NaN (DN, bit 25)
+     * on the real-time audio render thread to prevent subnormal trap stalls. */
+    uint32_t fpscr = 0U;
+    __asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
+    fpscr |= (1U << 24U) | (1U << 25U);
+    __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr));
+#endif
+
     while (__atomic_load_n(&g_audio_running_flag, __ATOMIC_ACQUIRE) != 0U) {
         void *dma_block = NULL;
         if (k_mem_slab_alloc(&g_i2s_tx_slab, &dma_block, K_MSEC(20)) != 0) {

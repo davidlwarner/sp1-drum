@@ -2,163 +2,16 @@
 #include "core/euclid.h"
 #include "core/sequencer.h"
 #include "core/ui_mapper.h"
+#include "dsp/drum_voices.h"
+#include "dsp/master_fx.h"
 #include "hal/sp1_hal.h"
 #include "hal/sp1_hal_host.h"
 
-#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* ── Flash-Style 256-Entry Sine LUT + Guard Sample (1028 B) ──────────────── */
-
-#define SP1_SIM_TWO_PI          6.28318530718f
-#define SP1_SIM_PHASE_SCALE     89478.485333f  /* 2^32 / 48000.0f */
-#define SP1_SIM_OUTPUT_GAIN     28000.0f       /* Headroom below int16_t full scale */
-
-static float g_sine_lut[257];
-
-static void init_sine_lut(void) {
-    for (uint32_t i = 0U; i < 256U; ++i) {
-        g_sine_lut[i] = sinf(SP1_SIM_TWO_PI * ((float)i * (1.0f / 256.0f)));
-    }
-    g_sine_lut[256] = g_sine_lut[0];
-}
-
-static inline float sine_lut_sample(uint32_t phase) {
-    const uint32_t idx = phase >> 24U;
-    const uint32_t frac = (phase >> 8U) & 0xFFFFU;
-    const float t = (float)frac * (1.0f / 65536.0f);
-    const float a = g_sine_lut[idx];
-    const float b = g_sine_lut[idx + 1U];
-    return a + (b - a) * t;
-}
-
-static inline uint32_t hz_to_phase_inc(float hz) {
-    return (uint32_t)(hz * SP1_SIM_PHASE_SCALE);
-}
-
-static inline float fast_soft_clip(float x) {
-    if (x > 3.0f) {
-        return 1.0f;
-    }
-    if (x < -3.0f) {
-        return -1.0f;
-    }
-    const float x2 = x * x;
-    return x * (27.0f + x2) / (27.0f + 9.0f * x2);
-}
-
-/* ── Lightweight 4-Voice Placeholder Drum Pulse Synth (Milestone 2 Sim) ──── */
-
-typedef struct {
-    uint32_t phase;
-    uint32_t phase2;
-    uint32_t rng;
-    float env;
-    float pitch_env;
-    float prev_noise;
-    float gain;
-} sp1_sim_voice_t;
-
-static inline float next_noise(uint32_t *state) {
-    uint32_t x = *state;
-    x ^= x << 13U;
-    x ^= x >> 17U;
-    x ^= x << 5U;
-    *state = x;
-    return (float)(int32_t)x * (1.0f / 2147483648.0f);
-}
-
-static void sim_voices_init(sp1_sim_voice_t voices[SP1_SEQ_NUM_TRACKS]) {
-    memset(voices, 0, sizeof(sp1_sim_voice_t) * SP1_SEQ_NUM_TRACKS);
-    voices[0].rng = 0x13579BDFU;
-    voices[1].rng = 0x2468ACE1U;
-    voices[2].rng = 0xA5A55A5AU;
-    voices[3].rng = 0xCAFEBABEU;
-}
-
-static void sim_voice_trigger(sp1_sim_voice_t voices[SP1_SEQ_NUM_TRACKS],
-                              const sp1_seq_trigger_event_t *trig) {
-    if (trig->track >= SP1_SEQ_NUM_TRACKS) {
-        return;
-    }
-    sp1_sim_voice_t *v = &voices[trig->track];
-    v->phase = 0U;
-    v->phase2 = 0U;
-    v->env = 1.0f;
-    v->pitch_env = 1.0f;
-    v->gain = (float)trig->velocity * (1.0f / 127.0f);
-}
-
-static void sim_voices_render_sample(sp1_sim_voice_t voices[SP1_SEQ_NUM_TRACKS],
-                                     float *out_l,
-                                     float *out_r) {
-    float mix_l = 0.0f;
-    float mix_r = 0.0f;
-
-    /* Track 0: Kick (pitch-swept sine thump, ~110 ms decay) */
-    if (voices[0].env > 1e-4f) {
-        const float freq = 48.0f + (105.0f * voices[0].pitch_env);
-        const float s = sine_lut_sample(voices[0].phase) * voices[0].env * voices[0].gain * 0.55f;
-        voices[0].phase += hz_to_phase_inc(freq);
-        voices[0].env *= 0.99935f;
-        voices[0].pitch_env *= 0.9970f;
-        mix_l += s;
-        mix_r += s;
-    } else {
-        voices[0].env = 0.0f;
-    }
-
-    /* Track 1: Snare (185 Hz body + high-passed noise snap, ~80 ms decay) */
-    if (voices[1].env > 1e-4f) {
-        const float body = sine_lut_sample(voices[1].phase) * 0.45f;
-        const float n = next_noise(&voices[1].rng);
-        const float hp = n - voices[1].prev_noise;
-        voices[1].prev_noise = n;
-        const float s = (body + hp * 0.45f) * voices[1].env * voices[1].gain * 0.42f;
-        voices[1].phase += hz_to_phase_inc(185.0f);
-        voices[1].env *= 0.99910f;
-        mix_l += s;
-        mix_r += s;
-    } else {
-        voices[1].env = 0.0f;
-    }
-
-    /* Track 2: Hi-Hat (high-passed noise + metallic pulse, ~28 ms decay, pan right) */
-    if (voices[2].env > 1e-4f) {
-        const float n = next_noise(&voices[2].rng);
-        const float hp = n - voices[2].prev_noise;
-        voices[2].prev_noise = n;
-        const float metal = sine_lut_sample(voices[2].phase) * sine_lut_sample(voices[2].phase2);
-        const float s = (hp * 0.45f + metal * 0.35f) * voices[2].env * voices[2].gain * 0.28f;
-        voices[2].phase += hz_to_phase_inc(6130.0f);
-        voices[2].phase2 += hz_to_phase_inc(8420.0f);
-        voices[2].env *= 0.99740f;
-        mix_l += s * 0.78f;
-        mix_r += s * 1.00f;
-    } else {
-        voices[2].env = 0.0f;
-    }
-
-    /* Track 3: Perc (tuned woodblock/tom ping, ~50 ms decay, pan left) */
-    if (voices[3].env > 1e-4f) {
-        const float freq = 460.0f + (180.0f * voices[3].pitch_env);
-        const float s = sine_lut_sample(voices[3].phase) * voices[3].env * voices[3].gain * 0.32f;
-        voices[3].phase += hz_to_phase_inc(freq);
-        voices[3].env *= 0.99850f;
-        voices[3].pitch_env *= 0.9960f;
-        mix_l += s * 1.00f;
-        mix_r += s * 0.78f;
-    } else {
-        voices[3].env = 0.0f;
-    }
-
-    *out_l = fast_soft_clip(mix_l);
-    *out_r = fast_soft_clip(mix_r);
-}
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
@@ -170,9 +23,62 @@ static void print_usage(const char *prog) {
             "  --swing <pct>             Global swing percent [50..66] (default: 58)\n"
             "  --dilla-snare-ms <ms>     Snare Dilla nudge in ms [-35..35] (default: 18)\n"
             "  --dilla-hat-ms <ms>       Hi-Hat Dilla nudge in ms [-35..35] (default: -12)\n"
+            "  --snare-morph <0.0..1.0>  Track 2 morph: 0.0=Rimshot .. 1.0=Snare (default: 0.65)\n"
+            "  --hat-decay <0.0..1.0>    Track 3 decay: 0.0=Closed .. 1.0=Open (default: 0.25)\n"
+            "  --dj-filter <0.0..1.0>    Master DJ SVF: <0.45=LP, 0.50=Bypass, >0.55=HP (default: 0.50)\n"
+            "  --stutter-div <0..5>      Beat-Repeat: 0=Off, 1=1/4, 2=1/8, 3=1/16, 4=1/32, 5=1/64\n"
+            "  --crush <0.0..1.0>        Bitcrusher / ZOH decimator amount (default: 0.0)\n"
+            "  --dub-delay <0.0..1.0>    Dub Ping-Pong Delay send level (default: 0.22)\n"
+            "  --fx-showcase             Automate Rimshot->Snare morph, DJ SVF, Stutter & Crush\n"
             "  --quiet                   Suppress MIDI CSV mirroring to stdout\n"
             "  --help                    Show this help text\n",
             prog);
+}
+
+static void apply_showcase_automation(sp1_drum_synth_t *synth,
+                                      sp1_master_fx_t *fx,
+                                      uint64_t frame,
+                                      uint64_t total_frames) {
+    if (total_frames == 0ULL) {
+        return;
+    }
+    const float progress = (float)frame / (float)total_frames;
+
+    /* Quarter 1 (0.00..0.25): Tight woody 808/909 Rimshot morphing toward snappy Snare */
+    if (progress < 0.25f) {
+        const float t = progress * 4.0f;
+        sp1_drum_voices_set_snare_morph(synth, 0.10f + (0.85f * t));
+        sp1_drum_voices_set_hat_decay(synth, 0.15f + (0.45f * t));
+        sp1_master_fx_set_dj_filter(fx, 0.50f, 1.85f);
+        sp1_master_fx_set_stutter(fx, SP1_STUTTER_OFF);
+        sp1_master_fx_set_bitcrusher(fx, 0.0f);
+    } else if (progress < 0.50f) {
+        /* Quarter 2 (0.25..0.50): DJ Resonant TPT SVF Low-Pass -> High-Pass sweep */
+        const float t = (progress - 0.25f) * 4.0f;
+        const float dj_pos = (t < 0.5f) ? (0.50f - (0.72f * t)) : (0.14f + (1.40f * (t - 0.5f)));
+        sp1_drum_voices_set_snare_morph(synth, 0.85f);
+        sp1_master_fx_set_dj_filter(fx, dj_pos, 2.60f);
+        sp1_master_fx_set_stutter(fx, SP1_STUTTER_OFF);
+        sp1_master_fx_set_bitcrusher(fx, 0.0f);
+    } else if (progress < 0.75f) {
+        /* Quarter 3 (0.50..0.75): Tempo-synced Beat-Repeat Stutter (1/16 -> 1/32 ratchet) */
+        const float t = (progress - 0.50f) * 4.0f;
+        sp1_master_fx_set_dj_filter(fx, 0.50f, 1.85f);
+        if (t < 0.45f) {
+            sp1_master_fx_set_stutter(fx, SP1_STUTTER_DIV_1_16);
+        } else if (t < 0.80f) {
+            sp1_master_fx_set_stutter(fx, SP1_STUTTER_DIV_1_32);
+        } else {
+            sp1_master_fx_set_stutter(fx, SP1_STUTTER_OFF);
+        }
+    } else {
+        /* Quarter 4 (0.75..1.00): Bitcrusher / ZOH Decimator + Dub Ping-Pong Delay */
+        const float t = (progress - 0.75f) * 4.0f;
+        sp1_master_fx_set_stutter(fx, SP1_STUTTER_OFF);
+        sp1_master_fx_set_dj_filter(fx, 0.50f, 1.85f);
+        sp1_master_fx_set_bitcrusher(fx, (t < 0.65f) ? (0.38f * t) : 0.0f);
+        sp1_master_fx_set_dub_delay(fx, 0.35f, 0.55f);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -183,6 +89,13 @@ int main(int argc, char **argv) {
     double swing_pct = 58.0;
     double dilla_snare_ms = 18.0;
     double dilla_hat_ms = -12.0;
+    double snare_morph = 0.65;
+    double hat_decay = 0.25;
+    double dj_filter = 0.50;
+    long stutter_div = 0L;
+    double crush = 0.0;
+    double dub_delay = 0.22;
+    bool fx_showcase = false;
     bool quiet = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -221,6 +134,44 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: --dilla-hat-ms must be between -35 and 35\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "--snare-morph") == 0 && (i + 1) < argc) {
+            snare_morph = strtod(argv[++i], NULL);
+            if (snare_morph < 0.0 || snare_morph > 1.0) {
+                fprintf(stderr, "Error: --snare-morph must be between 0.0 and 1.0\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--hat-decay") == 0 && (i + 1) < argc) {
+            hat_decay = strtod(argv[++i], NULL);
+            if (hat_decay < 0.0 || hat_decay > 1.0) {
+                fprintf(stderr, "Error: --hat-decay must be between 0.0 and 1.0\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--dj-filter") == 0 && (i + 1) < argc) {
+            dj_filter = strtod(argv[++i], NULL);
+            if (dj_filter < 0.0 || dj_filter > 1.0) {
+                fprintf(stderr, "Error: --dj-filter must be between 0.0 and 1.0\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--stutter-div") == 0 && (i + 1) < argc) {
+            stutter_div = strtol(argv[++i], NULL, 10);
+            if (stutter_div < 0L || stutter_div > 5L) {
+                fprintf(stderr, "Error: --stutter-div must be between 0 and 5\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--crush") == 0 && (i + 1) < argc) {
+            crush = strtod(argv[++i], NULL);
+            if (crush < 0.0 || crush > 1.0) {
+                fprintf(stderr, "Error: --crush must be between 0.0 and 1.0\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--dub-delay") == 0 && (i + 1) < argc) {
+            dub_delay = strtod(argv[++i], NULL);
+            if (dub_delay < 0.0 || dub_delay > 1.0) {
+                fprintf(stderr, "Error: --dub-delay must be between 0.0 and 1.0\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--fx-showcase") == 0) {
+            fx_showcase = true;
         } else if (strcmp(argv[i], "--quiet") == 0) {
             quiet = true;
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -232,8 +183,6 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-
-    init_sine_lut();
 
     const sp1_hal_host_config_t host_cfg = {
         .wav_path = wav_path,
@@ -247,31 +196,40 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Configure 4-track Euclidean polymetric groove with global swing + Dilla pocket. */
+    /* Static allocation of full core + 4-voice drum synth + stereo master FX bus */
     static sp1_sequencer_t seq;
     static sp1_ui_mapper_t ui;
-    static sp1_sim_voice_t voices[SP1_SEQ_NUM_TRACKS];
+    static sp1_drum_synth_t synth;
+    static sp1_master_fx_t fx;
 
     sp1_seq_init(&seq);
     sp1_ui_mapper_init(&ui);
-    sim_voices_init(voices);
+    sp1_drum_voices_init(&synth);
+    sp1_master_fx_init(&fx);
 
     sp1_seq_set_bpm(&seq, (float)bpm);
     sp1_seq_set_swing(&seq, (float)(swing_pct * 0.01));
+
+    sp1_drum_voices_set_snare_morph(&synth, (float)snare_morph);
+    sp1_drum_voices_set_hat_decay(&synth, (float)hat_decay);
+    sp1_master_fx_set_dj_filter(&fx, (float)dj_filter, 1.85f);
+    sp1_master_fx_set_stutter(&fx, (sp1_stutter_div_t)stutter_div);
+    sp1_master_fx_set_bitcrusher(&fx, (float)crush);
+    sp1_master_fx_set_dub_delay(&fx, (float)dub_delay, 0.48f);
 
     /* Track 0 (Kick, GM 36): E(5,16, rot=0), 0 ms straight anchor */
     sp1_seq_set_track_pattern(&seq, 0U, 5U, 16U, 0U);
     sp1_seq_set_track_nudge_ms(&seq, 0U, 0.0f);
 
-    /* Track 1 (Snare, GM 38): E(3,16, rot=4) hits steps 4 (straight beat 2), 9 (swung), 14 */
+    /* Track 1 (Snare / Rimshot, GM 38): E(3,16, rot=4) + Dilla micro-timing */
     sp1_seq_set_track_pattern(&seq, 1U, 3U, 16U, 4U);
     sp1_seq_set_track_nudge_ms(&seq, 1U, (float)dilla_snare_ms);
 
-    /* Track 2 (Hi-Hat, GM 42): E(11,16, rot=0), rushed Dilla pocket */
+    /* Track 2 (Hi-Hat, GM 42): E(11,16, rot=0) + rushed Dilla pocket */
     sp1_seq_set_track_pattern(&seq, 2U, 11U, 16U, 0U);
     sp1_seq_set_track_nudge_ms(&seq, 2U, (float)dilla_hat_ms);
 
-    /* Track 3 (Perc, GM 45): E(5,12, rot=1) polymeter, +8 ms pocket */
+    /* Track 3 (2-Op FM / Wavefold Perc, GM 45): E(5,12, rot=1) polymeter, +8 ms pocket */
     sp1_seq_set_track_pattern(&seq, 3U, 5U, 12U, 1U);
     sp1_seq_set_track_nudge_ms(&seq, 3U, 8.0f);
 
@@ -280,8 +238,11 @@ int main(int argc, char **argv) {
     const uint64_t total_frames =
         ((uint64_t)duration_ms * (uint64_t)SP1_AUDIO_SAMPLE_RATE_HZ) / 1000ULL;
 
-    /* Static block scratch buffer: 96 stereo frames = 384 B */
     int16_t block_pcm[SP1_AUDIO_BLOCK_SAMPLES];
+    float main_l[SP1_AUDIO_BLOCK_FRAMES];
+    float main_r[SP1_AUDIO_BLOCK_FRAMES];
+    float send_l[SP1_AUDIO_BLOCK_FRAMES];
+    float send_r[SP1_AUDIO_BLOCK_FRAMES];
     sp1_seq_trigger_event_t triggers[SP1_SEQ_MAX_BLOCK_TRIGGERS];
     sp1_controls_snapshot_t snap;
     sp1_led_frame_t leds;
@@ -295,24 +256,33 @@ int main(int argc, char **argv) {
         sp1_hal_controls_poll(&snap);
         sp1_ui_mapper_update(&ui, &seq, &snap);
 
+        if (fx_showcase) {
+            apply_showcase_automation(&synth, &fx, frame, total_frames);
+        }
+
         const uint32_t trig_count = sp1_seq_process_block(
             &seq, frame, block_frames, triggers, SP1_SEQ_MAX_BLOCK_TRIGGERS);
         sp1_ui_mapper_on_triggers(&ui, triggers, trig_count);
 
-        uint32_t next_trig = 0U;
-        for (uint32_t i = 0U; i < block_frames; ++i) {
-            while (next_trig < trig_count && triggers[next_trig].block_offset <= i) {
-                sim_voice_trigger(voices, &triggers[next_trig]);
-                next_trig++;
-            }
+        sp1_drum_voices_render_block(&synth,
+                                     triggers,
+                                     trig_count,
+                                     main_l,
+                                     main_r,
+                                     send_l,
+                                     send_r,
+                                     block_frames);
 
-            float l = 0.0f;
-            float r = 0.0f;
-            sim_voices_render_sample(voices, &l, &r);
-
-            block_pcm[i * 2U] = (int16_t)(l * SP1_SIM_OUTPUT_GAIN);
-            block_pcm[(i * 2U) + 1U] = (int16_t)(r * SP1_SIM_OUTPUT_GAIN);
-        }
+        const uint32_t step_16th_frames =
+            sp1_clock_get_step_frames(sp1_seq_clock_const(&seq));
+        sp1_master_fx_process_block(&fx,
+                                    step_16th_frames,
+                                    main_l,
+                                    main_r,
+                                    send_l,
+                                    send_r,
+                                    block_pcm,
+                                    block_frames);
 
         sp1_ui_mapper_render_leds(&ui, &seq, 2U, &leds);
         sp1_hal_leds_set_frame(&leds);

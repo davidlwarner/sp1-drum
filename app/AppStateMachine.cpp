@@ -49,10 +49,10 @@ bool check_fn_hold_shutdown(AppMachine& m) {
 
 }  // namespace
 
-// ── Idle: waiting for USB MIDI to become ready ──────────────────
+// ── Idle: transition immediately to standalone Running mode ─────
 
 static void idle_entry(void*) {
-    LOG_INF("MIDI Controller: Idle (waiting for USB)");
+    LOG_INF("SP-1 Drum Machine: Idle -> Entering standalone Running state");
 }
 
 static smf_state_result idle_run(void* o) {
@@ -64,24 +64,16 @@ static smf_state_result idle_run(void* o) {
         return SMF_EVENT_HANDLED;
     }
 
-    if (m.midi != nullptr && m.midi->ready.load(std::memory_order_relaxed)) {
-        smf::set_state(m.ctx, app_states[STATE_RUNNING]);
-        return SMF_EVENT_HANDLED;
-    }
-
-    // Tick LED fades (e.g. boot animation)
-    if (m.leds != nullptr) {
-        m.leds->tick_fade();
-    }
-
-    k_sleep(K_MSEC(100));
+    // Standalone battery / USB-C operation: enter STATE_RUNNING immediately
+    // without waiting for a USB host computer.
+    smf::set_state(m.ctx, app_states[STATE_RUNNING]);
     return SMF_EVENT_HANDLED;
 }
 
-// ── Running: poll faders + send MIDI ────────────────────────────
+// ── Running: 50 Hz SAADC faders + UI mapper + DSP sync + PWM LEDs ─
 
 static void running_entry(void*) {
-    LOG_INF("MIDI Controller: Running");
+    LOG_INF("SP-1 Drum Machine: Running (48 kHz I2S0 audio + 50 Hz control loop)");
 }
 
 static smf_state_result running_run(void* o) {
@@ -96,27 +88,51 @@ static smf_state_result running_run(void* o) {
     if (m.midi != nullptr) {
         m.midi->poll_faders();
     }
+
+    if (m.ui != nullptr && m.seq != nullptr) {
+        sp1_controls_snapshot_t snap{};
+        sp1_hal_controls_poll(&snap);
+        sp1_ui_mapper_update(m.ui, m.seq, &snap);
+
+        const sp1_ui_dsp_params_t* dsp = sp1_ui_mapper_get_dsp_params(m.ui);
+        if (dsp != nullptr) {
+            if (m.synth != nullptr) {
+                sp1_drum_voices_set_kick_params(m.synth, dsp->kick_decay, dsp->kick_drive);
+                sp1_drum_voices_set_snare_morph(m.synth, dsp->snare_morph);
+                sp1_drum_voices_set_hat_decay(m.synth, dsp->hat_decay);
+                sp1_drum_voices_set_perc_timbre(m.synth, dsp->perc_timbre);
+            }
+            if (m.fx != nullptr) {
+                sp1_master_fx_set_dj_filter(m.fx, dsp->dj_filter_pos, dsp->dj_resonance_q);
+                sp1_master_fx_set_stutter(
+                    m.fx, static_cast<sp1_stutter_div_t>(dsp->stutter_div));
+                sp1_master_fx_set_bitcrusher(m.fx, dsp->crush_amount);
+                sp1_master_fx_set_dub_delay(
+                    m.fx, dsp->dub_delay_wet, dsp->dub_delay_feedback);
+            }
+        }
+
+        sp1_led_frame_t led_frame{};
+        sp1_ui_mapper_render_leds(m.ui, m.seq, static_cast<uint32_t>(kPollCadenceMs), &led_frame);
+        sp1_hal_leds_set_frame(&led_frame);
+    }
+
+    if (m.power != nullptr) {
+        m.power->service_tick();
+    }
     sp1_hal_service_background();
-
-    if (m.leds != nullptr) {
-        m.leds->tick_fade();
-    }
-
-    // USB disconnected → back to idle
-    if (m.midi != nullptr && !m.midi->ready.load(std::memory_order_relaxed)) {
-        smf::set_state(m.ctx, app_states[STATE_IDLE]);
-        return SMF_EVENT_HANDLED;
-    }
 
     k_sleep(K_MSEC(kPollCadenceMs));
     return SMF_EVENT_HANDLED;
 }
 
-// ── ShuttingDown: LED fade, then deep sleep ─────────────────────
+// ── ShuttingDown: stop audio cleanly, fade LEDs, then deep sleep ─
 
 static void shutting_down_entry(void* o) {
     auto& m = smf::ctx<AppMachine>(o);
-    LOG_INF("MIDI Controller: Shutting down");
+    LOG_INF("SP-1 Drum Machine: Shutting down");
+
+    (void)sp1_hal_audio_stop();
 
     if (m.leds != nullptr) {
         m.leds->start_shutdown_fade();

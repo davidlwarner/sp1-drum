@@ -293,10 +293,81 @@ static void test_8ch_pwm_led_renderer_pulse_mute_beat_and_nudge_polarity(void) {
     sp1_hal_shutdown();
 }
 
+static void test_performance_fx_mode_and_voice_morph_gestures(void) {
+    init_silent_hal();
+
+    sp1_sequencer_t seq;
+    sp1_ui_mapper_t ui;
+    sp1_seq_init(&seq);
+    sp1_ui_mapper_init(&ui);
+    poll_and_update(&ui, &seq);
+
+    /* Set Track 0 pulses to 6 in Normal Mode */
+    sp1_hal_controls_on_fader_raw(0U, 1530);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(6, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
+    TEST_ASSERT(!sp1_ui_mapper_is_fx_mode(&ui));
+
+    /* Hold Vol+ (AIN1) + move Fader 2 -> morphs Track 2 Rimshot <-> Snare without clobbering pulses */
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, true);
+    poll_and_update(&ui, &seq);
+    sp1_hal_controls_on_fader_raw(1U, SP1_FADER_RAW_MAX); /* 1.0f = full Snare */
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_FLOAT_NEAR(1.0f, sp1_ui_mapper_get_dsp_params(&ui)->snare_morph, 1e-4f);
+    sp1_hal_controls_on_fader_raw(1U, 0); /* 0.0f = pure Rimshot */
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_FLOAT_NEAR(0.0f, sp1_ui_mapper_get_dsp_params(&ui)->snare_morph, 1e-4f);
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(2, sp1_seq_get_track_pattern(&seq, 1U)->pulses);
+
+    /* Hardware-safe chord: Vol- (AIN1) + T1 (AIN0) toggles latched Performance FX Mode */
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_DOWN, true);
+    poll_and_update(&ui, &seq);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(sp1_ui_mapper_is_fx_mode(&ui));
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, false);
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_DOWN, false);
+    poll_and_update(&ui, &seq);
+
+    /* In Performance FX Mode, Faders 1..4 drive DJ SVF, Stutter, Bitcrusher, and Dub Delay
+     * while preserving Track 0 pulses == 6! */
+    sp1_hal_controls_on_fader_raw(0U, SP1_FADER_RAW_MAX);
+    sp1_hal_controls_on_fader_raw(2U, 2040);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_FLOAT_NEAR(1.0f, sp1_ui_mapper_get_dsp_params(&ui)->dj_filter_pos, 1e-4f);
+    TEST_ASSERT_FLOAT_NEAR(0.5f, sp1_ui_mapper_get_dsp_params(&ui)->crush_amount, 1e-3f);
+    TEST_ASSERT_EQ_INT(6, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
+
+    /* Momentary T3 punch-in engages 1/32 Stutter ratchet (div = 4) and releases cleanly */
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_3, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(4, sp1_ui_mapper_get_dsp_params(&ui)->stutter_div);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_3, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(0, sp1_ui_mapper_get_dsp_params(&ui)->stutter_div);
+
+    /* Function (GPIO P0.27) + T1 + T4 (AIN0) exits Performance FX Mode with fader anti-clobber */
+    sp1_hal_controls_on_button_event(SP1_BTN_FN, true);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, true);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_4, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(!sp1_ui_mapper_is_fx_mode(&ui));
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_4, false);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, false);
+    sp1_hal_controls_on_button_event(SP1_BTN_FN, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(6, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
+
+    sp1_hal_shutdown();
+}
+
 int main(void) {
     RUN_TEST(test_normal_mode_faders_mutes_transport_and_bpm);
     RUN_TEST(test_shift_combos_dilla_detent_coarse_bpm_swing_and_anti_clobber);
     RUN_TEST(test_play_shift_chord_hardware_safety);
     RUN_TEST(test_8ch_pwm_led_renderer_pulse_mute_beat_and_nudge_polarity);
+    RUN_TEST(test_performance_fx_mode_and_voice_morph_gestures);
     return sp1_test_summary();
 }

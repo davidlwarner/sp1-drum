@@ -1,4 +1,5 @@
 #include "MidiController.hpp"
+#include "hal/sp1_hal.h"
 
 #include <zephyr/logging/log.h>
 #include <algorithm>
@@ -66,6 +67,7 @@ void MidiController::poll_faders() {
         }
 
         sample = static_cast<int16_t>(std::clamp<int>(sample, 0, 0x0FF0));
+        sp1_hal_controls_on_fader_raw(static_cast<uint8_t>(i), sample);
 
         if (poll_count_ < 3) {
             LOG_INF("Fader %d: raw=%d cc=%d", i, sample, sample >> 5);

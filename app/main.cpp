@@ -94,6 +94,63 @@ static midi::MidiController g_midi;
 static leds::Leds g_leds;
 static power::PowerManager g_power;
 
+/* Static RAM: 768 B sequencer + 80 B UI mapper + 292 B 4-voice synth + 73,872 B master FX */
+static sp1_sequencer_t g_sequencer;
+static sp1_ui_mapper_t g_ui_mapper;
+static sp1_drum_synth_t g_drum_synth;
+static sp1_master_fx_t g_master_fx;
+static uint64_t g_audio_frame_counter = 0ULL;
+
+/* Static RAM: 4 * 96 * 4 B = 1536 B audio callback float block buffers */
+static float g_dsp_main_l[SP1_AUDIO_BLOCK_FRAMES];
+static float g_dsp_main_r[SP1_AUDIO_BLOCK_FRAMES];
+static float g_dsp_send_l[SP1_AUDIO_BLOCK_FRAMES];
+static float g_dsp_send_r[SP1_AUDIO_BLOCK_FRAMES];
+
+// ── 48 kHz Hard-RT Audio Render Callback (96 frames / 2.0 ms) ───
+
+static void sp1_audio_render_cb(int16_t *interleaved_stereo,
+                                uint32_t num_frames,
+                                void *user_ctx) {
+    (void)user_ctx;
+    if (interleaved_stereo == nullptr || num_frames == 0U) {
+        return;
+    }
+
+    const uint32_t block_frames =
+        (num_frames > SP1_AUDIO_BLOCK_FRAMES) ? SP1_AUDIO_BLOCK_FRAMES : num_frames;
+
+    sp1_seq_trigger_event_t triggers[SP1_SEQ_MAX_BLOCK_TRIGGERS];
+    const uint32_t trig_count = sp1_seq_process_block(&g_sequencer,
+                                                      g_audio_frame_counter,
+                                                      block_frames,
+                                                      triggers,
+                                                      SP1_SEQ_MAX_BLOCK_TRIGGERS);
+    sp1_ui_mapper_on_triggers(&g_ui_mapper, triggers, trig_count);
+
+    sp1_drum_voices_render_block(&g_drum_synth,
+                                 triggers,
+                                 trig_count,
+                                 g_dsp_main_l,
+                                 g_dsp_main_r,
+                                 g_dsp_send_l,
+                                 g_dsp_send_r,
+                                 block_frames);
+
+    const uint32_t step_16th_frames =
+        sp1_clock_get_step_frames(sp1_seq_clock_const(&g_sequencer));
+    sp1_master_fx_process_block(&g_master_fx,
+                                step_16th_frames,
+                                g_dsp_main_l,
+                                g_dsp_main_r,
+                                g_dsp_send_l,
+                                g_dsp_send_r,
+                                interleaved_stereo,
+                                block_frames);
+
+    g_audio_frame_counter += static_cast<uint64_t>(block_frames);
+}
+
 // ── UMP Stream Responder ────────────────────────────────────────
 
 static const struct ump_endpoint_dt_spec ump_ep_dt =
@@ -117,9 +174,6 @@ static void on_midi_ready(const struct device*, const bool ready) {
     LOG_INF("USB MIDI %s", ready ? "ready" : "disconnected");
     g_midi.ready.store(ready, std::memory_order_relaxed);
     sp1_hal_midi_set_ready(ready);
-
-    // Status LED: play LED 1
-    g_leds.set_play(0, ready ? 128 : 0);
 }
 
 static const struct usbd_midi_ops midi_ops = {
@@ -127,7 +181,7 @@ static const struct usbd_midi_ops midi_ops = {
     .ready_cb = on_midi_ready,
 };
 
-// ── Input subsystem callback (buttons → MIDI) ───────────────────
+// ── Input subsystem callback (buttons → HAL controls & MIDI) ────
 
 static bool map_input_key_to_sp1_btn(uint16_t code, sp1_button_id_t *out) {
     switch (code) {
@@ -150,85 +204,11 @@ static void on_input_event(struct input_event *evt, void*) {
         return;
     }
 
-    // Only act on press edges (not release) for toggle controls
     const bool pressed = (evt->value != 0);
 
     sp1_button_id_t hal_btn = SP1_BTN_TRACK_1;
     if (map_input_key_to_sp1_btn(evt->code, &hal_btn)) {
         sp1_hal_controls_on_button_event(hal_btn, pressed);
-    }
-
-    switch (evt->code) {
-    // ── Track buttons → MIDI notes (offset by current octave) ────
-    case INPUT_KEY_1:
-    case INPUT_KEY_2:
-    case INPUT_KEY_3:
-    case INPUT_KEY_4: {
-        const int base = midi::kNoteTrack1 + (evt->code - INPUT_KEY_1);
-        const int note = base + (g_midi.octave_offset * 12);
-        if (note >= 0 && note <= 127) {
-            g_midi.send_note(static_cast<uint8_t>(note), pressed);
-        }
-        const int led_idx = evt->code - INPUT_KEY_1;
-        if (led_idx < leds::kNumTrack) {
-            g_leds.set_track(led_idx, pressed ? 200 : 0);
-        }
-        break;
-    }
-
-    // ── Play → MMC Play/Stop toggle ─────────────────────────────
-    case INPUT_KEY_PLAY:
-        if (pressed) {
-            g_midi.playing = !g_midi.playing;
-            g_midi.send_mmc(g_midi.playing ? midi::kMmcPlay : midi::kMmcStop);
-        }
-        break;
-
-    // ── Rockers → octave shift ──────────────────────────────────
-    case INPUT_KEY_FASTFORWARD:
-        if (pressed && g_midi.octave_offset < 5) {
-            g_midi.octave_offset++;
-            LOG_INF("Octave: %+d (base C%d)",
-                    g_midi.octave_offset,
-                    (midi::kNoteTrack1 / 12) + g_midi.octave_offset - 1);
-        }
-        break;
-    case INPUT_KEY_BACK:
-        if (pressed && g_midi.octave_offset > -5) {
-            g_midi.octave_offset--;
-            LOG_INF("Octave: %+d (base C%d)",
-                    g_midi.octave_offset,
-                    (midi::kNoteTrack1 / 12) + g_midi.octave_offset - 1);
-        }
-        break;
-
-    // ── Volume up/down → CC 7 step ──────────────────────────────
-    case INPUT_KEY_VOLUMEUP:
-        if (pressed && g_midi.volume_level < 127) {
-            g_midi.volume_level = static_cast<uint8_t>(
-                std::min<int>(g_midi.volume_level + 10, 127));
-            g_midi.send_cc(midi::kCcVolume, g_midi.volume_level);
-        }
-        break;
-    case INPUT_KEY_VOLUMEDOWN:
-        if (pressed && g_midi.volume_level > 0) {
-            g_midi.volume_level = static_cast<uint8_t>(
-                std::max<int>(g_midi.volume_level - 10, 0));
-            g_midi.send_cc(midi::kCcVolume, g_midi.volume_level);
-        }
-        break;
-
-    // ── Function → MMC Record on/off toggle ─────────────────────
-    case INPUT_KEY_MENU:
-        if (pressed) {
-            g_midi.recording = !g_midi.recording;
-            g_midi.send_mmc(g_midi.recording
-                ? midi::kMmcRecordOn : midi::kMmcRecordOff);
-        }
-        break;
-
-    default:
-        break;
     }
 }
 INPUT_CALLBACK_DEFINE(NULL, on_input_event, NULL);
@@ -240,7 +220,7 @@ int main(void) {
     const int main_wdt = core::watchdog::register_channel("main", 5000);
     core::watchdog::feed(main_wdt);
 
-    LOG_INF("Stem Player MIDI Controller Booting...");
+    LOG_INF("SP-1 Euclidean Drum Machine Booting...");
 
     // ── USB composite device (CDC ACM console + MIDI) ───────────
     if (init_usb() == nullptr) {
@@ -276,7 +256,7 @@ int main(void) {
 
     // ── MIDI controller ─────────────────────────────────────────
     g_midi.midi_dev = midi_dev;
-    g_midi.track_led_pwm = g_leds.track.data();
+    g_midi.track_led_pwm = nullptr;
     g_midi.fader_adc = {fader1_adc, fader2_adc, fader3_adc, fader4_adc};
 
     if (device_is_ready(midi_dev)) {
@@ -287,9 +267,27 @@ int main(void) {
     }
     core::watchdog::feed(main_wdt);
 
-    // ── Portable SP-1 HAL ───────────────────────────────────────
+    // ── Portable SP-1 Core, 4-Voice Drum Synth, Master FX & HAL ─
     if (sp1_hal_init() < 0) {
         LOG_WRN("SP-1 HAL init returned error");
+    }
+    sp1_seq_init(&g_sequencer);
+    sp1_ui_mapper_init(&g_ui_mapper);
+    sp1_drum_voices_init(&g_drum_synth);
+    sp1_master_fx_init(&g_master_fx);
+    g_audio_frame_counter = 0ULL;
+    sp1_seq_start(&g_sequencer);
+    core::watchdog::feed(main_wdt);
+
+    if (sp1_hal_audio_init(sp1_audio_render_cb, nullptr) < 0) {
+        LOG_WRN("SP-1 Audio HAL init failed");
+    } else {
+        sp1_hal_audio_set_volume(108U);
+        if (sp1_hal_audio_start() < 0) {
+            LOG_WRN("SP-1 Audio HAL start failed");
+        } else {
+            LOG_INF("48 kHz I2S0 EasyDMA audio streaming active");
+        }
     }
     core::watchdog::feed(main_wdt);
 
@@ -298,9 +296,13 @@ int main(void) {
     machine.midi = &g_midi;
     machine.leds = &g_leds;
     machine.power = &g_power;
+    machine.seq = &g_sequencer;
+    machine.ui = &g_ui_mapper;
+    machine.synth = &g_drum_synth;
+    machine.fx = &g_master_fx;
     machine.main_watchdog_channel = main_wdt;
 
-    LOG_INF("Boot complete, entering HSM");
+    LOG_INF("Boot complete, entering standalone HSM");
     app::run(machine);
 
     return 0;

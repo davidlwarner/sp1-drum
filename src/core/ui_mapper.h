@@ -53,8 +53,25 @@ typedef enum {
     SP1_UI_MOD_FWD  = 3     /* FWD (AIN1): polymeter step length (1..32) & length reset */
 } sp1_ui_modifier_t;
 
+/* Normalized Master Performance FX & 4-Voice Timbre/Morph target snapshot.
+ * Static RAM: 40 bytes. */
+typedef struct {
+    float dj_filter_pos;        /* [0.0f..1.0f], 0.50f = center bypass deadzone */
+    float dj_resonance_q;       /* [0.707f..12.0f], default 1.85f */
+    float crush_amount;         /* [0.0f..1.0f], 0.0f = clean 48 kHz 16-bit */
+    float dub_delay_wet;        /* [0.0f..1.0f], default 0.22f */
+    float dub_delay_feedback;   /* [0.0f..0.85f], default 0.45f */
+    float kick_decay;           /* [0.0f..1.0f], default 0.45f */
+    float kick_drive;           /* [0.0f..1.0f], default 0.35f */
+    float snare_morph;          /* [0.0f = Rimshot .. 1.0f = Snare], default 0.65f */
+    float hat_decay;            /* [0.0f = Closed .. 1.0f = Open], default 0.20f */
+    float perc_timbre;          /* [0.0f..1.0f], default 0.45f */
+    uint8_t stutter_div;        /* Effective stutter division (0=OFF, 1=1/4 .. 5=1/64) */
+    uint8_t pad[3];
+} sp1_ui_dsp_params_t;
+
 /* Screenless UI gesture & LED state.
- * Static RAM: 36 bytes (zero dynamic allocation). */
+ * Static RAM: 80 bytes (zero dynamic allocation). */
 typedef struct {
     sp1_ui_modifier_t active_mod;
     uint8_t focused_track;                      /* Last adjusted track for shift LED readout [0..3] */
@@ -63,7 +80,10 @@ typedef struct {
     uint16_t last_applied_raw[SP1_NUM_FADERS];  /* Last raw fader value applied to sequencer */
     bool fader_engaged[SP1_NUM_FADERS];         /* Anti-clobber engage flags per fader */
     bool initialized;
-    uint8_t reserved[3];
+    bool fx_mode_active;                        /* Latched Performance FX Mode page */
+    uint8_t fader_stutter_div;                  /* Fader-2 latched stutter division [0..5] */
+    uint8_t reserved;
+    sp1_ui_dsp_params_t dsp;
 } sp1_ui_mapper_t;
 
 /**
@@ -79,11 +99,21 @@ float sp1_ui_fader_norm_to_nudge_ms(float norm);
 
 /**
  * Process one control snapshot (buttons + faders) and apply hardware-safe gestures
- * to the sequencer. Never accepts SP1_BTN_PLAY as a shift modifier.
+ * to the sequencer and Performance FX / Voice Timbre targets.
+ * Never accepts SP1_BTN_PLAY as a shift modifier.
  */
 void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
                           sp1_sequencer_t *seq,
                           const sp1_controls_snapshot_t *snap);
+
+/**
+ * Explicitly toggle or set latched Performance FX Mode and re-latch faders.
+ */
+void sp1_ui_mapper_set_fx_mode(sp1_ui_mapper_t *ui,
+                               const sp1_controls_snapshot_t *snap,
+                               bool enabled);
+bool sp1_ui_mapper_is_fx_mode(const sp1_ui_mapper_t *ui);
+const sp1_ui_dsp_params_t *sp1_ui_mapper_get_dsp_params(const sp1_ui_mapper_t *ui);
 
 /**
  * Notify LED state machine of newly fired sequencer triggers so Track 1..4 LEDs pulse.

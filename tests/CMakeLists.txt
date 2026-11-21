@@ -45,11 +45,21 @@ target_include_directories(sp1_core PUBLIC
 )
 target_link_libraries(sp1_core PUBLIC sp1_hal_host PRIVATE sp1_strict_warnings)
 
+# Pure C11 4-Voice Drum Synth & Stereo Master Performance FX Bus static library
+add_library(sp1_dsp STATIC
+    "${SP1_REPO_ROOT}/src/dsp/drum_voices.c"
+    "${SP1_REPO_ROOT}/src/dsp/master_fx.c"
+)
+target_include_directories(sp1_dsp PUBLIC
+    "${SP1_REPO_ROOT}/src"
+)
+target_link_libraries(sp1_dsp PUBLIC sp1_core PRIVATE sp1_strict_warnings)
+
 # Offline WAV + MIDI host simulator CLI
 add_executable(sp1_sim
     "${SP1_REPO_ROOT}/sim/sp1_sim.c"
 )
-target_link_libraries(sp1_sim PRIVATE sp1_core sp1_strict_warnings m)
+target_link_libraries(sp1_sim PRIVATE sp1_dsp sp1_core sp1_strict_warnings m)
 
 function(sp1_add_host_test target_name)
     add_executable(${target_name} ${ARGN})
@@ -57,7 +67,7 @@ function(sp1_add_host_test target_name)
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${SP1_REPO_ROOT}/src"
     )
-    target_link_libraries(${target_name} PRIVATE sp1_core sp1_strict_warnings m)
+    target_link_libraries(${target_name} PRIVATE sp1_dsp sp1_core sp1_strict_warnings m)
     add_test(NAME ${target_name} COMMAND ${target_name})
 endfunction()
 
@@ -71,6 +81,9 @@ sp1_add_host_test(test_clock_sync test_clock_sync.c)
 sp1_add_host_test(test_sequencer test_sequencer.c)
 sp1_add_host_test(test_ui_mapper test_ui_mapper.c)
 sp1_add_host_test(test_core_cpp_compat test_core_cpp_compat.cpp)
+sp1_add_host_test(test_drum_voices test_drum_voices.c)
+sp1_add_host_test(test_master_fx test_master_fx.c)
+sp1_add_host_test(test_dsp_cpp_compat test_dsp_cpp_compat.cpp)
 
 add_test(
     NAME test_sim_cli

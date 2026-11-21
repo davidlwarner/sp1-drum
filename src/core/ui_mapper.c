@@ -72,6 +72,25 @@ static void render_bar_4led(uint32_t scaled_0_to_1020, uint8_t out_play[SP1_NUM_
     }
 }
 
+static uint8_t map_fader_norm_to_stutter_div(float norm) {
+    if (norm < 0.15f) {
+        return 0U; /* SP1_STUTTER_OFF */
+    }
+    if (norm < 0.32f) {
+        return 1U; /* SP1_STUTTER_DIV_1_4 */
+    }
+    if (norm < 0.50f) {
+        return 2U; /* SP1_STUTTER_DIV_1_8 */
+    }
+    if (norm < 0.68f) {
+        return 3U; /* SP1_STUTTER_DIV_1_16 */
+    }
+    if (norm < 0.84f) {
+        return 4U; /* SP1_STUTTER_DIV_1_32 */
+    }
+    return 5U;     /* SP1_STUTTER_DIV_1_64 */
+}
+
 void sp1_ui_mapper_init(sp1_ui_mapper_t *ui) {
     if (ui == NULL) {
         return;
@@ -80,6 +99,51 @@ void sp1_ui_mapper_init(sp1_ui_mapper_t *ui) {
     ui->active_mod = SP1_UI_MOD_NONE;
     ui->focused_track = 0U;
     ui->initialized = false;
+    ui->fx_mode_active = false;
+    ui->fader_stutter_div = 0U;
+
+    /* Default DSP voice & performance FX targets */
+    ui->dsp.dj_filter_pos = 0.50f;
+    ui->dsp.dj_resonance_q = 1.85f;
+    ui->dsp.crush_amount = 0.0f;
+    ui->dsp.dub_delay_wet = 0.22f;
+    ui->dsp.dub_delay_feedback = 0.45f;
+    ui->dsp.kick_decay = 0.45f;
+    ui->dsp.kick_drive = 0.35f;
+    ui->dsp.snare_morph = 0.65f;
+    ui->dsp.hat_decay = 0.20f;
+    ui->dsp.perc_timbre = 0.45f;
+    ui->dsp.stutter_div = 0U;
+}
+
+void sp1_ui_mapper_set_fx_mode(sp1_ui_mapper_t *ui,
+                               const sp1_controls_snapshot_t *snap,
+                               bool enabled) {
+    if (ui == NULL) {
+        return;
+    }
+    if (ui->fx_mode_active != enabled) {
+        ui->fx_mode_active = enabled;
+        if (!enabled) {
+            ui->fader_stutter_div = 0U;
+            ui->dsp.stutter_div = 0U;
+        }
+        if (snap != NULL) {
+            latch_faders_for_mode(ui, snap);
+        } else {
+            for (uint8_t i = 0U; i < SP1_NUM_FADERS; ++i) {
+                ui->fader_engaged[i] = false;
+            }
+        }
+    }
+}
+
+bool sp1_ui_mapper_is_fx_mode(const sp1_ui_mapper_t *ui) {
+    return (ui != NULL) ? ui->fx_mode_active : false;
+}
+
+const sp1_ui_dsp_params_t *sp1_ui_mapper_get_dsp_params(const sp1_ui_mapper_t *ui) {
+    return (ui != NULL) ? &ui->dsp : NULL;
 }
 
 float sp1_ui_fader_norm_to_nudge_ms(float norm) {
@@ -111,19 +175,43 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
 
     const uint16_t down = snap->buttons_down;
     const uint16_t pressed = snap->buttons_pressed;
+    const uint16_t released = snap->buttons_released;
     const bool play_held = (down & SP1_BTN_BIT(SP1_BTN_PLAY)) != 0U;
     const bool any_valid_shift = (down & SP1_BTN_VALID_SHIFT_MASK) != 0U;
+    const bool vol_up_held = !play_held && ((down & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U);
 
-    const sp1_ui_modifier_t next_mod = resolve_hardware_safe_modifier(down);
+    const sp1_ui_modifier_t next_mod =
+        play_held ? SP1_UI_MOD_NONE : resolve_hardware_safe_modifier(down);
 
     if (!ui->initialized) {
         ui->initialized = true;
         ui->active_mod = next_mod;
         /* Keep initial mode_entry_raw at 0 so untouched faders preserve default preset,
          * while any fader already moved prior to the first poll engages immediately. */
-    } else if (next_mod != ui->active_mod) {
+    } else if (next_mod != ui->active_mod ||
+               ((pressed | released) & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U) {
         ui->active_mod = next_mod;
         latch_faders_for_mode(ui, snap);
+    }
+
+    /* 0. Hardware-Safe Performance FX Mode Toggle (never uses Play on AIN0):
+     *    - Function (GPIO P0.27) + T1 + T4 (AIN0), OR
+     *    - Vol- (AIN1) + T1 (AIN0) */
+    if (!play_held) {
+        const uint16_t t1_t4_mask =
+            (uint16_t)(SP1_BTN_BIT(SP1_BTN_TRACK_1) | SP1_BTN_BIT(SP1_BTN_TRACK_4));
+        const bool fn_t1_t4_chord =
+            ((down & SP1_BTN_BIT(SP1_BTN_FN)) != 0U) &&
+            ((down & t1_t4_mask) == t1_t4_mask) &&
+            ((pressed & t1_t4_mask) != 0U);
+        const bool vol_down_t1_chord =
+            sp1_controls_is_valid_shift_chord(down, SP1_BTN_VOL_DOWN, SP1_BTN_TRACK_1) &&
+            ((pressed & SP1_BTN_BIT(SP1_BTN_TRACK_1)) != 0U);
+
+        if (fn_t1_t4_chord || vol_down_t1_chord) {
+            sp1_ui_mapper_set_fx_mode(ui, snap, !ui->fx_mode_active);
+            return;
+        }
     }
 
     /* 1. Play button: transport toggle ONLY (never a modifier; ignored if shift held). */
@@ -166,7 +254,9 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
      *    - Valid shift chords (FN/RWD/FWD + T1..T4) validated via
      *      sp1_controls_is_valid_shift_chord() perform per-track quick resets and
      *      re-latch that track's fader so its parked position cannot overwrite the reset.
-     *    - Unshifted T1..T4 toggles track mute. */
+     *    - In Performance FX Mode (unshifted), holding T1..T4 punches in momentary
+     *      tempo-synced Stutter divisions (1/8, 1/16, 1/32, 1/64).
+     *    - In Pattern Mode (unshifted), T1..T4 toggles track mute. */
     if (!play_held) {
         for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
             const sp1_button_id_t trk_btn = k_track_buttons[t];
@@ -189,10 +279,25 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
                 ui->focused_track = t;
                 ui->mode_entry_raw[t] = snap->fader_raw[t];
                 ui->fader_engaged[t] = false;
-            } else if (!any_valid_shift) {
+            } else if (!any_valid_shift && !ui->fx_mode_active) {
                 sp1_seq_toggle_track_mute(seq, t);
             }
         }
+    }
+
+    /* Update momentary vs. fader-latched Stutter division in Performance FX Mode */
+    if (ui->fx_mode_active && !play_held && !any_valid_shift) {
+        uint8_t mom_div = 0U;
+        if ((down & SP1_BTN_BIT(SP1_BTN_TRACK_4)) != 0U) {
+            mom_div = 5U; /* 1/64 ratchet */
+        } else if ((down & SP1_BTN_BIT(SP1_BTN_TRACK_3)) != 0U) {
+            mom_div = 4U; /* 1/32 ratchet */
+        } else if ((down & SP1_BTN_BIT(SP1_BTN_TRACK_2)) != 0U) {
+            mom_div = 3U; /* 1/16 repeat */
+        } else if ((down & SP1_BTN_BIT(SP1_BTN_TRACK_1)) != 0U) {
+            mom_div = 2U; /* 1/8 repeat */
+        }
+        ui->dsp.stutter_div = (mom_div != 0U) ? mom_div : ui->fader_stutter_div;
     }
 
     /* 4. Faders 1..4 (SAADC AIN3/6/2/7):
@@ -227,8 +332,53 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
 
             switch (ui->active_mod) {
             case SP1_UI_MOD_NONE: {
-                const uint8_t pulses = (uint8_t)(norm * (float)cur_steps + 0.5f);
-                sp1_seq_set_track_pulses(seq, f, pulses);
+                if (vol_up_held) {
+                    /* Hardware-safe Vol+ (AIN1) + Fader 1..4: Voice Timbre & Morph */
+                    switch (f) {
+                    case 0U:
+                        ui->dsp.kick_decay = norm;
+                        ui->dsp.kick_drive = 0.20f + (0.75f * norm);
+                        break;
+                    case 1U:
+                        /* Track 2 continuous Rimshot (0.0) <-> Snare (1.0) morph */
+                        ui->dsp.snare_morph = norm;
+                        break;
+                    case 2U:
+                        /* Track 3 continuous Closed (0.0) <-> Open (1.0) Hi-Hat morph */
+                        ui->dsp.hat_decay = norm;
+                        break;
+                    case 3U:
+                        /* Track 4 2-Op FM index & West-Coast wavefold morph */
+                        ui->dsp.perc_timbre = norm;
+                        break;
+                    default:
+                        break;
+                    }
+                    ui->focused_track = f;
+                } else if (ui->fx_mode_active) {
+                    /* Latched Performance FX Mode: Faders 1..4 drive Master FX Bus */
+                    switch (f) {
+                    case 0U:
+                        ui->dsp.dj_filter_pos = norm;
+                        break;
+                    case 1U:
+                        ui->fader_stutter_div = map_fader_norm_to_stutter_div(norm);
+                        ui->dsp.stutter_div = ui->fader_stutter_div;
+                        break;
+                    case 2U:
+                        ui->dsp.crush_amount = norm;
+                        break;
+                    case 3U:
+                        ui->dsp.dub_delay_wet = norm;
+                        ui->dsp.dub_delay_feedback = 0.25f + (0.55f * norm);
+                        break;
+                    default:
+                        break;
+                    }
+                } else {
+                    const uint8_t pulses = (uint8_t)(norm * (float)cur_steps + 0.5f);
+                    sp1_seq_set_track_pulses(seq, f, pulses);
+                }
                 break;
             }
             case SP1_UI_MOD_FN: {
