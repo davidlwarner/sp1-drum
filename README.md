@@ -1,5 +1,8 @@
 # `sp1-drum` — SP-1 Standalone 4-Track Euclidean Drum Machine & C11 DSP Synth
 
+> [!WARNING]
+> **Work in Progress — Does Not Work Yet:** This project is an active work in progress and is **not** functional yet. Expect broken builds, incomplete features, and non-working hardware behavior.
+
 `sp1-drum` is an open-source standalone firmware that transforms the **Teenage Engineering Stem Player (SP-1)** (Nordic nRF52840 @ 64 MHz ARM Cortex-M4F, 1 MB Flash, 256 KB SRAM) into a **4-track Bjorklund Euclidean drum machine**, **4-voice C11 real-time drum synthesizer**, **24 PPQN USB-C MIDI clock master/follower**, and **stereo performance FX unit** running at 48 kHz.
 
 > **Full Musician's Guide & MIDI Chart:** See [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) for in-depth performance workflows, J Dilla micro-timing tutorials, and hardware troubleshooting, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the real-time system architecture.
