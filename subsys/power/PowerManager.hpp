@@ -37,8 +37,12 @@ public:
         return die_temperature_milli_c_.load(std::memory_order_relaxed);
     }
 
-    // ── Shutdown hardware ops (called by HSM) ───────────────────
-    /// Release GPIOs, arm function-button wake source for sys_poweroff.
+    // ── Shutdown / Wake hardware ops (called by HSM) ────────────
+    /// True if boot NRF_POWER->RESETREAS indicated a GPIO wake from SYSTEM_OFF.
+    bool woke_from_system_off() const;
+    /// Read/clear any remaining NRF_POWER->RESETREAS flags and consume the wake flag.
+    bool consume_system_off_gpio_wake();
+    /// Release GPIOs, clear RESETREAS, arm function-button wake source for sys_poweroff.
     void prepare_for_system_off();
     /// True if the physical function button is currently pressed.
     bool function_button_pressed() const;
@@ -53,6 +57,7 @@ private:
     std::atomic<bool> charger_enabled_state_{false};
     std::atomic<int32_t> die_temperature_milli_c_{0};
     std::atomic<uint32_t> last_poll_ms_{0};
+    std::atomic<bool> woke_from_system_off_{false};
 
     const struct gpio_dt_spec function_button_ =
         GPIO_DT_SPEC_GET(DT_NODELABEL(button_fnc), gpios);

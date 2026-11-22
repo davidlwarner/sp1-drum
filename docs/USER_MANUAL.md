@@ -16,15 +16,15 @@ The SP-1 has **no screen**. Every parameter is controlled through the 4 analog f
   - `T4` = **Track 4 (2-Op FM / West-Coast Wavefold Perc)**
   - `Play` = **Master Transport Start / Stop**
 - **4x Transport & Volume Buttons (`AIN1` Resistor Ladder):**
-  - `RWD (<<)` = **Euclidean Rotation Shift Modifier**
-  - `FWD (>>)` = **Polymeter Step Length Shift Modifier**
-  - `Vol- (-)` = **Tempo Down / Performance FX Chord Modifier**
-  - `Vol+ (+)` = **Tempo Up / Voice Timbre & Rimshot-Snare Morph Shift Modifier**
+  - `RWD (<<)` = **Fine Tempo Down (`-2 BPM` tap) / Euclidean Rotation Shift Modifier**
+  - `FWD (>>)` = **Fine Tempo Up (`+2 BPM` tap) / Polymeter Step Length Shift Modifier**
+  - `Vol- (-)` = **Master Volume Down (`-8` tap) / Performance FX Chord Modifier (`Vol- + T1`)**
+  - `Vol+ (+)` = **Master Volume Up (`+8` tap)**
 - **1x `Function (••)` Button (`GPIO P0.27`):**
-  - Primary shift modifier for **J Dilla Micro-Timing Nudge (`±35 ms`)**, **Coarse Tempo (`±10 BPM`)**, **Global Swing (`50%..66%`)**, and **Graceful Power-Off (`3-second hold`)**.
+  - Primary shift modifier for **J Dilla Micro-Timing Nudge (`±35 ms`)**, **Coarse Tempo (`Function + RWD/FWD`, `±10 BPM`)**, **Global Swing (`Function + Vol-/Vol+`, `50%..66%`)**, **Pocket-Safe Power-On (`1.5-second hold` on battery)**, and **Graceful Power-Off (`3-second hold`)**.
 
 ### Anti-Clobber Fader Latching
-Because the 4 faders serve multiple pages (Euclidean Pulse Density, Dilla Micro-Timing, Rotation, Polymeter Step Length, Voice Timbre/Morph, and Master Performance FX), `sp1-drum` latches every fader's raw 12-bit SAADC position whenever you press or release a modifier key or toggle Performance FX Mode. A fader remains disengaged on the new page until you physically move it past the **`16-LSB` engagement threshold (`SP1_UI_FADER_ENGAGE_DELTA`)**, preventing parked faders from overwriting your rhythms when you release a shift button.
+Because the 4 faders serve multiple pages (Euclidean Pulse Density, Dilla Micro-Timing, Rotation, Polymeter Step Length, Voice Timbre/Morph, and Master Performance FX), `sp1-drum` latches every fader's raw 12-bit SAADC position whenever you press or release a modifier key, hold/release `T1..T4` in Normal Mode, or toggle Performance FX Mode. A fader remains disengaged on the new page until you physically move it past the **`16-LSB` engagement threshold (`SP1_UI_FADER_ENGAGE_DELTA`)**, preventing parked faders from overwriting your rhythms when you release a shift or track button.
 
 ---
 
@@ -36,8 +36,9 @@ Because the 4 faders serve multiple pages (Euclidean Pulse Density, Dilla Micro-
 |---|---|---|
 | **`Play`** | Toggle Sequencer Transport | Starts or stops playback (`0xFA` Start / `0xFC` Stop emitted on USB-C MIDI) |
 | **`Fader 1..4`** | Track 1..4 Euclidean Pulses (`k`) | `0..n` active hits distributed evenly across track step length `n` via Bjorklund's algorithm `E(k, n)` |
-| **`T1..T4`** | Toggle Track 1..4 Mute | Mutes/unmutes internal synthesis and outbound MIDI notes for that track |
-| **`Vol-` / `Vol+`** | Fine Master Tempo | `-2 BPM` / `+2 BPM` per press (clamped to `60.00..180.00 BPM`, default `120.00 BPM`) |
+| **`Tap T1..T4`** | Toggle Track 1..4 Mute | Toggles mute on release when no fader moved while held (mutes internal synthesis & outbound MIDI notes) |
+| **`Tap RWD / FWD`** | Fine Master Tempo | `-2 BPM` / `+2 BPM` per unshifted tap (clamped to `60.00..180.00 BPM`, default `120.00 BPM`; suppressed if a fader or track reset is used while held) |
+| **`Vol-` / `Vol+`** | Master Output Volume | `-8` / `+8` per unshifted tap (clamped to `0..127`, default `108`) across `CS42L42` headphone DAC & `TAS2505` speaker amp |
 
 ### 2.2 `Function (••)` Shift Mode — J Dilla Micro-Timing, Coarse Tempo, Swing & Power
 
@@ -45,34 +46,35 @@ Because the 4 faders serve multiple pages (Euclidean Pulse Density, Dilla Micro-
 |---|---|---|
 | **`Function + Fader 1..4`** | Per-Track Dilla Micro-Timing Nudge | `-35.0 ms` (early/rushed) .. `0.0 ms` (`[0.42..0.58]` center grid-lock deadzone) .. `+35.0 ms` (late/dragged) |
 | **`Function + T1..T4`** | Reset Track 1..4 Dilla Nudge | Instantly snaps that track's micro-timing back to `0.0 ms` and re-latches its fader |
-| **`Function + Vol- / Vol+`** | Coarse Master Tempo | `-10 BPM` / `+10 BPM` per press (`60.00..180.00 BPM`) |
-| **`Function + RWD / FWD`** | Global 16th-Note Swing | `-2%` / `+2%` per press (`50%` straight 16ths .. `66%` triplet swing) |
-| **`Hold Function (••) 3 s`** | Graceful Hardware Shutdown | Fades LEDs, stops I2S0, mutes/resets `TAS2505` & `CS42L42`, disables `3.072 MHz` oscillator, enters `SYSTEM_OFF` |
+| **`Function + RWD / FWD`** | Coarse Master Tempo | `-10 BPM` / `+10 BPM` per press (`60.00..180.00 BPM`) |
+| **`Function + Vol- / Vol+`** | Global 16th-Note Swing | `-2%` / `+2%` per press (`50%` straight 16ths .. `66%` triplet swing) |
+| **`Hold Function (••) 1.5 s` (from Off)** | Pocket-Safe Battery Power-On | Animates a progressive 4-LED fill across `Play 1..4`; releasing before `1,500 ms` blanks LEDs and returns immediately to `SYSTEM_OFF` |
+| **`Hold Function (••) 3 s` (while On)** | Graceful Hardware Shutdown | Fades LEDs, stops I2S0, mutes/resets `TAS2505` & `CS42L42`, disables `3.072 MHz` oscillator, enters `SYSTEM_OFF` |
 
 ### 2.3 `RWD (<<)` Shift Mode — Euclidean Pattern Rotation
 
 | Gesture | Action | Range / Behavior |
 |---|---|---|
-| **`RWD + Fader 1..4`** | Track 1..4 Euclidean Rotation (`rot`) | Rotates pattern offset across `0 .. n-1` steps |
-| **`RWD + T1..T4`** | Reset Track 1..4 Rotation | Snaps track rotation back to `0` (downbeat aligned) and re-latches fader |
+| **`RWD + Fader 1..4`** | Track 1..4 Euclidean Rotation (`rot`) | Rotates pattern offset across `0 .. n-1` steps (suppresses the `-2 BPM` tap on release) |
+| **`RWD + T1..T4`** | Reset Track 1..4 Rotation | Snaps track rotation back to `0` (downbeat aligned), re-latches fader, and suppresses `-2 BPM` tap |
 
 ### 2.4 `FWD (>>)` Shift Mode — Polymeter Step Length
 
 | Gesture | Action | Range / Behavior |
 |---|---|---|
-| **`FWD + Fader 1..4`** | Track 1..4 Step Length (`n`) | Sets independent loop length `1..32` steps per track for polymetric phasing |
-| **`FWD + T1..T4`** | Reset Track 1..4 Step Length | Resets track loop length to `16` steps and re-latches fader |
+| **`FWD + Fader 1..4`** | Track 1..4 Step Length (`n`) | Sets independent loop length `1..32` steps per track for polymetric phasing (suppresses the `+2 BPM` tap on release) |
+| **`FWD + T1..T4`** | Reset Track 1..4 Step Length | Resets track loop length to `16` steps, re-latches fader, and suppresses `+2 BPM` tap |
 
-### 2.5 `Vol+ (+)` Shift Mode — Voice Timbre & Rimshot-Snare Morph
+### 2.5 `Hold T1..T4 + Fader 1..4` — Voice Timbre & Rimshot-Snare Morph
 
-Hold **`Vol+`** (without `Function` or `Play`) and move **`Fader 1..4`** to sculpt each drum synthesis voice in real time:
+In Normal Pattern Mode (when `Play` is not held and Performance FX Mode is off), hold **`T1..T4`** and move its corresponding **`Fader 1..4`** to sculpt each drum synthesis voice in real time. Moving a fader while holding a track button automatically suppresses the release mute toggle and re-latches the fader on release so Euclidean pulse counts never jump:
 
 | Gesture | Voice Target | Sound Design Range |
 |---|---|---|
-| **`Vol+ + Fader 1`** | **Track 1: Kick / Sub** | **Decay & Drive (`0.0..1.0`):** `0.0` = tight punchy sub kick (`0.20` drive) → `1.0` = long booming saturated 808 sub (`0.95` cubic/wavefold drive) |
-| **`Vol+ + Fader 2`** | **Track 2: Snare / Rimshot** | **Continuous Rimshot ↔ Snare Morph (`0.0..1.0`):** `0.0` = tight, woody 808/909 **Rimshot** (`~185 Hz` + `~335–465 Hz` dual body/rim knock, minimal wires) → `1.0` = crisp **Snare** with bright TPT SVF snare wires (`default 0.65`) |
-| **`Vol+ + Fader 3`** | **Track 3: Metallic Hi-Hat** | **Closed ↔ Open Decay Morph (`0.0..1.0`):** `0.0` = tight **Closed Hat** tick → `1.0` = shimmering **Open Hat** decay (`default 0.20`) |
-| **`Vol+ + Fader 4`** | **Track 4: 2-Op FM Perc** | **FM Index & Wavefold Timbre (`0.0..1.0`):** `0.0` = hollow woody 2-Op FM conga/clave → `1.0` = aggressive West-Coast wavefolded metallic perc (`default 0.45`) |
+| **`Hold T1 + Fader 1`** | **Track 1: Kick / Sub** | **Decay & Drive (`0.0..1.0`):** `0.0` = tight punchy sub kick (`0.20` drive) → `1.0` = long booming saturated 808 sub (`0.95` cubic/wavefold drive) |
+| **`Hold T2 + Fader 2`** | **Track 2: Snare / Rimshot** | **Continuous Rimshot ↔ Snare Morph (`0.0..1.0`):** `0.0` = tight, woody 808/909 **Rimshot** (`~185 Hz` + `~335–465 Hz` dual body/rim knock, minimal wires) → `1.0` = crisp **Snare** with bright TPT SVF snare wires (`default 0.65`) |
+| **`Hold T3 + Fader 3`** | **Track 3: Metallic Hi-Hat** | **Closed ↔ Open Decay Morph (`0.0..1.0`):** `0.0` = tight **Closed Hat** tick → `1.0` = shimmering **Open Hat** decay (`default 0.20`) |
+| **`Hold T4 + Fader 4`** | **Track 4: 2-Op FM Perc** | **FM Index & Wavefold Timbre (`0.0..1.0`):** `0.0` = hollow woody 2-Op FM conga/clave → `1.0` = aggressive West-Coast wavefolded metallic perc (`default 0.45`) |
 
 ### 2.6 Performance FX Mode (Latched Master FX Bus + Momentary Ratchets)
 
@@ -125,14 +127,14 @@ Whenever you hold `Function`, `RWD`, or `FWD`, the **Track LEDs** highlight the 
 4. Hold **`FWD (>>)`** and move **`Fader 4` (FM Perc)** to ~38% (`12` steps instead of `16`), then release `FWD` and raise **`Fader 4`** to ~40% (`E(5, 12)`). Track 4 now cycles every 12 sixteenth-notes against the 16-step main groove, creating an evolving 3-bar polymeter.
 
 ### Workflow 2: Dialing in a J Dilla "Drunk" Micro-Timing Pocket
-1. Hold **`Function (••)`** and tap **`FWD (>>)`** four times to set Global Swing to **`58%`**.
+1. Hold **`Function (••)`** and tap **`Vol+ (+)`** four times to set Global Swing to **`58%`**.
 2. Still holding **`Function (••)`**, pull **`Fader 3` (Hi-Hat)** slightly below the center deadzone until **`Play 2`** glows on the left (`~ -12 ms` rushed hi-hats).
 3. Move **`Fader 2` (Snare/Rimshot)** slightly above the center deadzone until **`Play 3`** and a hint of **`Play 4`** glow on the right (`~ +18 ms` laid-back snare pocket).
 4. Keep **`Fader 1` (Kick)** inside the center deadzone (`Play 2 + Play 3` lit symmetrically) to anchor the downbeat. To snap any track back to the grid instantly during a live set, tap **`Function + T1..T4`**.
 
 ### Workflow 3: Live Rimshot-to-Snare & Voice Morphing
-1. Hold **`Vol+ (+)`** and pull **`Fader 2`** all the way down (`0.0`): Track 2 becomes a dry, woody 808/909 **Rimshot** ideal for minimal intros and verses.
-2. As the arrangement builds, hold **`Vol+ (+)`** and sweep **`Fader 2`** upward toward `0.85..1.0` while opening **`Fader 3` (Hi-Hat decay)** from `0.15` (tight closed hat) to `0.70` (open hat) and pushing **`Fader 4` (FM Perc)** into West-Coast wavefold territory.
+1. Hold **`T2`** and pull **`Fader 2`** all the way down (`0.0`): Track 2 becomes a dry, woody 808/909 **Rimshot** ideal for minimal intros and verses. Releasing `T2` keeps Track 2 unmuted and preserves its Euclidean pulse count.
+2. As the arrangement builds, hold **`T2`** and sweep **`Fader 2`** upward toward `0.85..1.0`, hold **`T3`** to open **`Fader 3` (Hi-Hat decay)** from `0.15` (tight closed hat) to `0.70` (open hat), and hold **`T4`** while pushing **`Fader 4` (FM Perc)** into West-Coast wavefold territory.
 
 ### Workflow 4: Performance FX Transitions & Momentary Ratchet Fills
 1. Press **`Vol- + T1`** (or **`Function + T1 + T4`**) to latch **Performance FX Mode**.
@@ -173,9 +175,10 @@ The SP-1 enumerates as a class-compliant USB-C Full-Speed Composite Device (`VID
 
 ## 6. Hardware Troubleshooting & Safety Notes
 
-### 6.1 Standalone Battery vs. USB-C Operation
-- Unlike MIDI-only controller firmwares that wait in an idle state for a USB host computer, `sp1-drum` transitions immediately from `STATE_IDLE` to `STATE_RUNNING` on boot and starts its 48 kHz I2S0 EasyDMA audio engine so you can play standalone on battery power via headphones (`CS42L42`) or the internal speaker (`TAS2505`).
-- To power down cleanly on battery, **hold `Function (••)` for 3 seconds**. The firmware fades out the LEDs, stops I2S0, mutes and asserts hardware reset on both `TAS2505` (`P0.09`) and `CS42L42` (`P0.15`), disables the external `3.072 MHz` audio oscillator (`P0.13`), blanks all 8 PWM LEDs, waits for button release, and enters nRF52840 `SYSTEM_OFF` deep sleep (`< 5 µA`).
+### 6.1 Standalone Battery vs. USB-C Operation & 1.5 s Power-On Delay
+- **USB-C Power:** When USB-C VBUS is present, `sp1-drum` transitions immediately from `STATE_IDLE` to `STATE_RUNNING` and starts its 48 kHz I2S0 EasyDMA audio engine (playing via `CS42L42` headphones or `TAS2505` internal speaker).
+- **Battery Power-On (`1.5 s` Pocket-Safe Hold):** When waking from `SYSTEM_OFF` on battery via `Function (••)` (`P0.27`), `STATE_IDLE` inspects and clears `NRF_POWER->RESETREAS` and requires `Function` to remain held continuously for **`1,500 ms`** while animating a progressive 4-LED fill across `Play 1..4`. If `Function` is released early, all LEDs blank and the unit immediately re-enters `SYSTEM_OFF` so accidental pocket presses never drain the battery or trigger audio.
+- **Graceful Power-Off (`3 s` Hold):** To power down cleanly on battery, **hold `Function (••)` for 3 seconds**. The firmware fades out the LEDs, stops I2S0, mutes and asserts hardware reset on both `TAS2505` (`P0.09`) and `CS42L42` (`P0.15`), disables the external `3.072 MHz` audio oscillator (`P0.13`), blanks all 8 PWM LEDs, waits for button release, and enters nRF52840 `SYSTEM_OFF` deep sleep (`< 5 µA`).
 
 ### 6.2 Why `Play` Is Never Used as a Shift Modifier (`AIN0` Ladder Physics)
 On the SP-1 PCB, `T1`, `T2`, `T3`, `T4`, and `Play` share a single analog resistor ladder connected to `AIN0` (`P0.02`). Pressing `Play` pulls the ladder to `1587–1592 mV` (nearly identical to `T1+T2+T3+T4 = 1584 mV`), physically masking individual `T1..T4` button presses. For 100% reliable hardware decoding, `sp1-drum` enforces `SP1_BTN_VALID_SHIFT_MASK` in [`src/hal/hal_controls.h`](../src/hal/hal_controls.h): `Play` only toggles transport when no shift key is held, and all track/fader chords use `Function` (`GPIO P0.27`) or Transport/Volume buttons (`AIN1` / `P0.03`).

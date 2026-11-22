@@ -40,8 +40,9 @@
 |---|---|---|
 | **`Play`** | Master Transport Start / Stop | Starts or stops sequencer playback (`0xFA` Start / `0xFC` Stop) |
 | **`Fader 1..4`** | Track 1..4 Euclidean Pulses (`k`) | Distributes `0..n` hits evenly across track step length `n` (`E(k, n)`) |
-| **`T1..T4`** | Track 1..4 Mute Toggle | Mutes or unmutes internal synth voice and outbound MIDI notes |
-| **`Vol-` / `Vol+`** | Fine Master Tempo | `-2 BPM` / `+2 BPM` per tap (`60..180 BPM`, default `120 BPM`) |
+| **`Tap T1..T4`** | Track 1..4 Mute Toggle | Toggles mute on release when no fader moved while held (mutes internal synth voice & outbound MIDI notes) |
+| **`Tap RWD / FWD`** | Fine Master Tempo | `-2 BPM` / `+2 BPM` per unshifted tap (`60..180 BPM`, default `120 BPM`; suppressed if a fader or track reset is used while held) |
+| **`Vol-` / `Vol+`** | Master Output Volume | `-8` / `+8` per unshifted tap (`0..127`, default `108`) across `CS42L42` headphone DAC & `TAS2505` speaker amp |
 
 ### 2. `Function (••)` Shift Mode — J Dilla Micro-Timing, Coarse Tempo, Swing & Power
 
@@ -49,27 +50,30 @@
 |---|---|---|
 | **`Function + Fader 1..4`** | Per-Track Dilla Micro-Timing Nudge | `-35 ms` (rushed/early) .. `0 ms` (`[0.42..0.58]` center grid-lock deadzone) .. `+35 ms` (dragged/late) |
 | **`Function + T1..T4`** | Reset Track 1..4 Dilla Nudge | Snaps track micro-timing to exact `0.0 ms` and re-latches fader |
-| **`Function + Vol- / Vol+`** | Coarse Master Tempo | `-10 BPM` / `+10 BPM` per tap (`60..180 BPM`) |
-| **`Function + RWD / FWD`** | Global 16th-Note Swing | `-2%` / `+2%` per tap (`50%` straight .. `66%` triplet swing) |
-| **`Hold Function (••) 3 s`** | Graceful Hardware Power-Off | Fades LEDs, stops I2S0, mutes/resets `TAS2505` & `CS42L42`, disables `3.072 MHz` osc, enters `SYSTEM_OFF` |
+| **`Function + RWD / FWD`** | Coarse Master Tempo | `-10 BPM` / `+10 BPM` per tap (`60..180 BPM`) |
+| **`Function + Vol- / Vol+`** | Global 16th-Note Swing | `-2%` / `+2%` per tap (`50%` straight .. `66%` triplet swing) |
+| **`Hold Function (••) 1.5 s` (from Off)** | Pocket-Safe Power-On | On battery wakeup from `SYSTEM_OFF`, animates a progressive `Play 1..4` 4-LED fill; releasing early returns immediately to `SYSTEM_OFF` |
+| **`Hold Function (••) 3 s` (while On)** | Graceful Hardware Power-Off | Fades LEDs, stops I2S0, mutes/resets `TAS2505` & `CS42L42`, disables `3.072 MHz` osc, enters `SYSTEM_OFF` |
 
 ### 3. `RWD (<<)` & `FWD (>>)` Shift Modes — Euclidean Rotation & Polymeter Length
 
 | Chord / Gesture | Function | Range / Behavior |
 |---|---|---|
-| **`RWD + Fader 1..4`** | Track 1..4 Euclidean Rotation (`rot`) | Rotates pattern offset across `0 .. n-1` steps |
+| **`RWD + Fader 1..4`** | Track 1..4 Euclidean Rotation (`rot`) | Rotates pattern offset across `0 .. n-1` steps (suppresses `-2 BPM` tap on release) |
 | **`RWD + T1..T4`** | Reset Track 1..4 Rotation | Resets track rotation to `0` (downbeat aligned) and re-latches fader |
-| **`FWD + Fader 1..4`** | Track 1..4 Polymeter Step Length (`n`) | Sets independent track loop length from `1..32` steps |
+| **`FWD + Fader 1..4`** | Track 1..4 Polymeter Step Length (`n`) | Sets independent track loop length from `1..32` steps (suppresses `+2 BPM` tap on release) |
 | **`FWD + T1..T4`** | Reset Track 1..4 Step Length | Resets track loop length to `16` steps and re-latches fader |
 
-### 4. `Vol+ (+)` Shift Mode — Voice Timbre & Rimshot-Snare Morph
+### 4. `Hold T1..T4 + Fader 1..4` — Voice Timbre & Rimshot-Snare Morph (Normal Mode)
 
 | Chord / Gesture | Target Voice | Sound Design Parameter |
 |---|---|---|
-| **`Vol+ + Fader 1`** | **Track 1 (Kick / Sub)** | Sub Decay & Saturation Drive (`0.0` tight punch → `1.0` booming saturated 808 sub) |
-| **`Vol+ + Fader 2`** | **Track 2 (Snare / Rimshot)** | Continuous **Rimshot (`0.0`) ↔ Snare (`1.0`)** morph (`default 0.65`) |
-| **`Vol+ + Fader 3`** | **Track 3 (Metallic Hi-Hat)** | Continuous **Closed Hat (`0.0`) ↔ Open Hat (`1.0`)** decay morph (`default 0.20`) |
-| **`Vol+ + Fader 4`** | **Track 4 (2-Op FM Perc)** | 2-Op FM Index & West-Coast Wavefold Timbre (`0.0` woody FM → `1.0` metallic wavefold) |
+| **`Hold T1 + Fader 1`** | **Track 1 (Kick / Sub)** | Sub Decay & Saturation Drive (`0.0` tight punch → `1.0` booming saturated 808 sub) |
+| **`Hold T2 + Fader 2`** | **Track 2 (Snare / Rimshot)** | Continuous **Rimshot (`0.0`) ↔ Snare (`1.0`)** morph (`default 0.65`) |
+| **`Hold T3 + Fader 3`** | **Track 3 (Metallic Hi-Hat)** | Continuous **Closed Hat (`0.0`) ↔ Open Hat (`1.0`)** decay morph (`default 0.20`) |
+| **`Hold T4 + Fader 4`** | **Track 4 (2-Op FM Perc)** | 2-Op FM Index & West-Coast Wavefold Timbre (`0.0` woody FM → `1.0` metallic wavefold) |
+
+> Moving a fader while holding `T1..T4` automatically suppresses that track's release mute toggle and re-latches the fader on release so Euclidean pulse counts never jump.
 
 ### 5. Performance FX Mode — Toggle via `Function + T1 + T4` or `Vol- + T1`
 
@@ -85,6 +89,7 @@
 
 | Mode | Corner Track LEDs (`Track 1..4`) | Center Cross LEDs (`Play 1..4`) |
 |---|---|---|
+| **Battery Power-On Hold (`1.5 s`)** | Off (`0`) | Progressive 4-LED fill across **`Play 1 → Play 4`** over `1,500 ms`; releasing early blanks LEDs and returns immediately to `SYSTEM_OFF` |
 | **Normal Pattern Mode** | Dim (`8`) when muted · Idle (`32`) when active · Flashes `255` (accent) / `200` (normal) on trigger with `~85 ms` decay | Quarter-note beat chaser (`255` on Beat 1, `180` on Beats 2–4); background floor rises to `16` when locked to external USB-C 24 PPQN MIDI clock |
 | **`Function` Held (Dilla Nudge Meter)** | Focused track at `255` (others at `40`) | **Bipolar Polarity Meter:** Center pair **`Play 2 + Play 3`** (`160`) = exact `0.0 ms` grid lock · Left **`Play 2 → Play 1`** = rushed (`-0.1..-35 ms`) · Right **`Play 3 → Play 4`** = dragged (`+0.1..+35 ms`) |
 | **`RWD` / `FWD` Held (Bar Meter)** | Focused track at `255` (others at `40`) | **4-Segment Bar Meter (`Play 1 → 4`):** Continuous `0..1020` scale displaying Euclidean rotation (`0..n-1`) or polymeter step count (`1..32`) |
@@ -102,7 +107,7 @@ The SP-1 includes a factory hardware bootloader in protected flash (`0x00000..0x
    - Download `zephyr.bin` from the [`preview-firmware`](https://github.com/davidlwarner/sp1-drum/raw/preview-firmware/zephyr.bin) branch (or build `build/zephyr/zephyr.bin` locally).
    - Open the Solderless Engineering Web Serial utility ([`https://solderless.engineering`](https://solderless.engineering)) in Google Chrome or Microsoft Edge.
    - Connect to the Stem Player bootloader over Web Serial, select `zephyr.bin`, and wait for the flash progress bar to complete.
-5. **Reboot & Play:** Unplug and reconnect USB-C (or press `Function ••` to wake on battery). `sp1-drum` immediately boots into standalone 48 kHz drum machine mode.
+5. **Reboot & Play:** Unplug and reconnect USB-C (or hold `Function ••` for `1.5 s` to wake on battery). `sp1-drum` immediately boots into standalone 48 kHz drum machine mode.
 
 ---
 
@@ -156,9 +161,9 @@ Built with **Zephyr `v4.3.1`** + **Zephyr SDK `0.17.4`** (`arm-zephyr-eabi-gcc 1
 
 | Metric | Measured Value | Hardware Capacity / Budget | Utilization | Headroom Remaining |
 |---|---:|---:|---:|---:|
-| **`FLASH` (`slot0_partition` @ `0x20000`)** | **`172,100 B`** (`168.07 KB`) | `892 KB` (`913,408 B`) | **`18.84%`** | `741,308 B` (`81.16%`) |
+| **`FLASH` (`slot0_partition` @ `0x20000`)** | **`173,352 B`** (`169.29 KB`) | `892 KB` (`913,408 B`) | **`18.98%`** | `740,056 B` (`81.02%`) |
 | **`SRAM` (`sram0`, `data + bss`)** | **`105,740 B`** (`103.26 KB`) | `256 KB` (`262,144 B`, gate `<= 128 KB`) | **`40.34%`** | `156,404 B` (`59.66%`) |
-| **ELF Sections (`arm-zephyr-eabi-size`)** | `text=169,076` · `data=3,020` · `bss=102,647` | `slot0` load addr `0x00020000` | Bootloader `0x0..0x1FFFF` protected | Zero dynamic allocation |
+| **ELF Sections (`arm-zephyr-eabi-size`)** | `text=170,316` · `data=3,032` · `bss=102,647` | `slot0` load addr `0x00020000` | Bootloader `0x0..0x1FFFF` protected | Zero dynamic allocation |
 | **Audio Block Cycle Load (96 frames / `2.0 ms`)** | **`60,604` avg / `62,380` peak cyc/block** | `128,000` cyc/block @ 64 MHz (`<= 55%` / `70,400` target) | **`47.3%` avg / `48.7%` peak** | `> 51%` CPU headroom |
 
 ---

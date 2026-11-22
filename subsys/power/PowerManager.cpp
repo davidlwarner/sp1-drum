@@ -66,12 +66,14 @@ namespace power {
 void PowerManager::init() {
     LOG_INF("Initializing Power Monitor (BQ24232)");
 
-    uint32_t reset_cause = 0U;
-    if (hwinfo_get_reset_cause(&reset_cause) == 0) {
-        if (reset_cause & RESET_LOW_POWER_WAKE) {
-            LOG_INF("Wakeup from System OFF by GPIO");
-        }
-        (void)hwinfo_clear_reset_cause();
+    const uint32_t resetreas = NRF_POWER->RESETREAS;
+    const bool woke_gpio = (resetreas & POWER_RESETREAS_OFF_Msk) != 0U;
+    if (resetreas != 0U) {
+        NRF_POWER->RESETREAS = resetreas;
+    }
+    woke_from_system_off_.store(woke_gpio, std::memory_order_relaxed);
+    if (woke_gpio) {
+        LOG_INF("Wakeup from System OFF by GPIO (RESETREAS=0x%08x)", resetreas);
     }
 
     if (gpio_is_ready_dt(&function_button_)) {
@@ -89,6 +91,21 @@ void PowerManager::init() {
     charging_state_.store(charger_sample_charge_active(), std::memory_order_relaxed);
     die_temperature_milli_c_.store(sample_die_temperature_milli_c(), std::memory_order_relaxed);
     last_poll_ms_.store(0U, std::memory_order_relaxed);
+}
+
+bool PowerManager::woke_from_system_off() const {
+    return woke_from_system_off_.load(std::memory_order_relaxed);
+}
+
+bool PowerManager::consume_system_off_gpio_wake() {
+    const uint32_t resetreas = NRF_POWER->RESETREAS;
+    if (resetreas != 0U) {
+        NRF_POWER->RESETREAS = resetreas;
+        if ((resetreas & POWER_RESETREAS_OFF_Msk) != 0U) {
+            woke_from_system_off_.store(true, std::memory_order_relaxed);
+        }
+    }
+    return woke_from_system_off_.exchange(false, std::memory_order_relaxed);
 }
 
 float PowerManager::get_battery_level() const {
@@ -152,6 +169,12 @@ bool PowerManager::function_button_pressed() const {
 
 void PowerManager::prepare_for_system_off() {
     k_sleep(K_MSEC(2));
+
+    // Clear RESETREAS immediately before entering SYSTEM_OFF so stale flags never accumulate.
+    const uint32_t resetreas = NRF_POWER->RESETREAS;
+    if (resetreas != 0U) {
+        NRF_POWER->RESETREAS = resetreas;
+    }
 
     // Release all GPIO to minimize leakage current
     NRF_P0->DIR = 0;

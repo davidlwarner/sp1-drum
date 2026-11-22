@@ -54,6 +54,16 @@ static void adjust_swing_clamped(sp1_sequencer_t *seq, float delta) {
     sp1_seq_set_swing(seq, sp1_seq_get_swing(seq) + delta);
 }
 
+static void adjust_volume_clamped(sp1_ui_mapper_t *ui, int32_t delta) {
+    int32_t next = (int32_t)ui->dsp.master_volume + delta;
+    if (next < (int32_t)SP1_UI_VOLUME_MIN) {
+        next = (int32_t)SP1_UI_VOLUME_MIN;
+    } else if (next > (int32_t)SP1_UI_VOLUME_MAX) {
+        next = (int32_t)SP1_UI_VOLUME_MAX;
+    }
+    ui->dsp.master_volume = (uint8_t)next;
+}
+
 static uint32_t div_by_24_u32(uint32_t v) {
     /* Exact floor(v / 24) without hardware division: 2^36 / 24 = 0xAAAAAAAB. */
     return (uint32_t)(((uint64_t)v * 0xAAAAAAABULL) >> 36U);
@@ -101,8 +111,9 @@ void sp1_ui_mapper_init(sp1_ui_mapper_t *ui) {
     ui->initialized = false;
     ui->fx_mode_active = false;
     ui->fader_stutter_div = 0U;
+    ui->btn_consumed_mask = 0U;
 
-    /* Default DSP voice & performance FX targets */
+    /* Default DSP voice, master volume & performance FX targets */
     ui->dsp.dj_filter_pos = 0.50f;
     ui->dsp.dj_resonance_q = 1.85f;
     ui->dsp.crush_amount = 0.0f;
@@ -114,6 +125,7 @@ void sp1_ui_mapper_init(sp1_ui_mapper_t *ui) {
     ui->dsp.hat_decay = 0.20f;
     ui->dsp.perc_timbre = 0.45f;
     ui->dsp.stutter_div = 0U;
+    ui->dsp.master_volume = SP1_UI_VOLUME_DEFAULT;
 }
 
 void sp1_ui_mapper_set_fx_mode(sp1_ui_mapper_t *ui,
@@ -144,6 +156,10 @@ bool sp1_ui_mapper_is_fx_mode(const sp1_ui_mapper_t *ui) {
 
 const sp1_ui_dsp_params_t *sp1_ui_mapper_get_dsp_params(const sp1_ui_mapper_t *ui) {
     return (ui != NULL) ? &ui->dsp : NULL;
+}
+
+uint8_t sp1_ui_mapper_get_master_volume(const sp1_ui_mapper_t *ui) {
+    return (ui != NULL) ? ui->dsp.master_volume : SP1_UI_VOLUME_DEFAULT;
 }
 
 float sp1_ui_fader_norm_to_nudge_ms(float norm) {
@@ -177,21 +193,45 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
     const uint16_t pressed = snap->buttons_pressed;
     const uint16_t released = snap->buttons_released;
     const bool play_held = (down & SP1_BTN_BIT(SP1_BTN_PLAY)) != 0U;
+    const bool fn_held = (down & SP1_BTN_BIT(SP1_BTN_FN)) != 0U;
     const bool any_valid_shift = (down & SP1_BTN_VALID_SHIFT_MASK) != 0U;
-    const bool vol_up_held = !play_held && ((down & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U);
 
     const sp1_ui_modifier_t next_mod =
         play_held ? SP1_UI_MOD_NONE : resolve_hardware_safe_modifier(down);
+
+    /* Freshly pressed buttons start unconsumed. If Play, Function, FX mode, or any shift
+     * is active, mark participating held buttons consumed so release never fires a stray tap. */
+    ui->btn_consumed_mask &= (uint16_t)(~pressed);
+    if (play_held) {
+        ui->btn_consumed_mask |= down;
+    }
+    if (fn_held) {
+        ui->btn_consumed_mask |= (uint16_t)(down & (uint16_t)(~SP1_BTN_BIT(SP1_BTN_FN)));
+    }
+    if (any_valid_shift || ui->fx_mode_active) {
+        ui->btn_consumed_mask |= (uint16_t)(down & SP1_BTN_TRACK_MASK);
+    }
 
     if (!ui->initialized) {
         ui->initialized = true;
         ui->active_mod = next_mod;
         /* Keep initial mode_entry_raw at 0 so untouched faders preserve default preset,
          * while any fader already moved prior to the first poll engages immediately. */
-    } else if (next_mod != ui->active_mod ||
-               ((pressed | released) & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U) {
+    } else if (next_mod != ui->active_mod) {
         ui->active_mod = next_mod;
         latch_faders_for_mode(ui, snap);
+    }
+
+    /* Per-track anti-clobber fader latching when pressing or releasing T1..T4 in Normal
+     * Pattern Mode so Hold T1..T4 + Fader 1..4 morphs voice timbre without jumping pulses. */
+    if (!play_held && ui->active_mod == SP1_UI_MOD_NONE && !ui->fx_mode_active) {
+        for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
+            const uint16_t t_bit = SP1_BTN_BIT(k_track_buttons[t]);
+            if (((pressed | released) & t_bit) != 0U) {
+                ui->mode_entry_raw[t] = snap->fader_raw[t];
+                ui->fader_engaged[t] = false;
+            }
+        }
     }
 
     /* 0. Hardware-Safe Performance FX Mode Toggle (never uses Play on AIN0):
@@ -201,7 +241,7 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
         const uint16_t t1_t4_mask =
             (uint16_t)(SP1_BTN_BIT(SP1_BTN_TRACK_1) | SP1_BTN_BIT(SP1_BTN_TRACK_4));
         const bool fn_t1_t4_chord =
-            ((down & SP1_BTN_BIT(SP1_BTN_FN)) != 0U) &&
+            fn_held &&
             ((down & t1_t4_mask) == t1_t4_mask) &&
             ((pressed & t1_t4_mask) != 0U);
         const bool vol_down_t1_chord =
@@ -209,6 +249,9 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
             ((pressed & SP1_BTN_BIT(SP1_BTN_TRACK_1)) != 0U);
 
         if (fn_t1_t4_chord || vol_down_t1_chord) {
+            /* Suppress release taps (track mutes / volume step) for every button in the chord. */
+            ui->btn_consumed_mask |= down;
+            ui->btn_consumed_mask &= (uint16_t)(~released);
             sp1_ui_mapper_set_fx_mode(ui, snap, !ui->fx_mode_active);
             return;
         }
@@ -224,28 +267,45 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
     }
 
     /* 2. Transport / Volume rockers (AIN1) + Function (P0.27) chords:
-     *    - Vol- / Vol+ (unshifted): Fine Master BPM (-2 / +2 BPM, 60..180 BPM)
-     *    - Function + Vol- / Vol+:  Coarse Master BPM (-10 / +10 BPM, 60..180 BPM)
-     *    - Function + RWD / FWD:    Global Swing (-2% / +2%, 50%..66%) */
+     *    - RWD / FWD (unshifted tap, no fader/chord used): Fine Master BPM (-2 / +2 BPM, 60..180)
+     *    - Function + RWD / FWD:                           Coarse Master BPM (-10 / +10 BPM, 60..180)
+     *    - Function + Vol- / Vol+:                         Global Swing (-2% / +2%, 50%..66%)
+     *    - Vol- / Vol+ (unshifted tap):                    Master Output Volume (0..127, step +/-8) */
     if (ui->active_mod == SP1_UI_MOD_FN) {
-        if ((pressed & SP1_BTN_BIT(SP1_BTN_VOL_DOWN)) != 0U) {
-            adjust_bpm_clamped(seq, -(int32_t)SP1_UI_BPM_COARSE_STEP_X100);
-        }
-        if ((pressed & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U) {
-            adjust_bpm_clamped(seq, (int32_t)SP1_UI_BPM_COARSE_STEP_X100);
-        }
         if ((pressed & SP1_BTN_BIT(SP1_BTN_RWD)) != 0U) {
-            adjust_swing_clamped(seq, -SP1_UI_SWING_STEP);
+            adjust_bpm_clamped(seq, -(int32_t)SP1_UI_BPM_COARSE_STEP_X100);
+            ui->btn_consumed_mask |= SP1_BTN_BIT(SP1_BTN_RWD);
         }
         if ((pressed & SP1_BTN_BIT(SP1_BTN_FWD)) != 0U) {
-            adjust_swing_clamped(seq, SP1_UI_SWING_STEP);
+            adjust_bpm_clamped(seq, (int32_t)SP1_UI_BPM_COARSE_STEP_X100);
+            ui->btn_consumed_mask |= SP1_BTN_BIT(SP1_BTN_FWD);
         }
-    } else if (ui->active_mod == SP1_UI_MOD_NONE && !play_held) {
         if ((pressed & SP1_BTN_BIT(SP1_BTN_VOL_DOWN)) != 0U) {
-            adjust_bpm_clamped(seq, -(int32_t)SP1_UI_BPM_FINE_STEP_X100);
+            adjust_swing_clamped(seq, -SP1_UI_SWING_STEP);
+            ui->btn_consumed_mask |= SP1_BTN_BIT(SP1_BTN_VOL_DOWN);
         }
         if ((pressed & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U) {
+            adjust_swing_clamped(seq, SP1_UI_SWING_STEP);
+            ui->btn_consumed_mask |= SP1_BTN_BIT(SP1_BTN_VOL_UP);
+        }
+    } else if (!play_held && !fn_held) {
+        if ((released & SP1_BTN_BIT(SP1_BTN_RWD)) != 0U &&
+            (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_RWD)) == 0U) {
+            adjust_bpm_clamped(seq, -(int32_t)SP1_UI_BPM_FINE_STEP_X100);
+        }
+        if ((released & SP1_BTN_BIT(SP1_BTN_FWD)) != 0U &&
+            (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_FWD)) == 0U) {
             adjust_bpm_clamped(seq, (int32_t)SP1_UI_BPM_FINE_STEP_X100);
+        }
+        if (ui->active_mod == SP1_UI_MOD_NONE) {
+            if ((released & SP1_BTN_BIT(SP1_BTN_VOL_DOWN)) != 0U &&
+                (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_VOL_DOWN)) == 0U) {
+                adjust_volume_clamped(ui, -(int32_t)SP1_UI_VOLUME_STEP);
+            }
+            if ((released & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U &&
+                (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_VOL_UP)) == 0U) {
+                adjust_volume_clamped(ui, (int32_t)SP1_UI_VOLUME_STEP);
+            }
         }
     }
 
@@ -256,30 +316,39 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
      *      re-latch that track's fader so its parked position cannot overwrite the reset.
      *    - In Performance FX Mode (unshifted), holding T1..T4 punches in momentary
      *      tempo-synced Stutter divisions (1/8, 1/16, 1/32, 1/64).
-     *    - In Pattern Mode (unshifted), T1..T4 toggles track mute. */
+     *    - In Normal Pattern Mode (unshifted), holding T1..T4 + moving Fader 1..4 morphs
+     *      voice timbre; tapping T1..T4 without moving a fader toggles track mute on release. */
     if (!play_held) {
         for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
             const sp1_button_id_t trk_btn = k_track_buttons[t];
-            if ((pressed & SP1_BTN_BIT(trk_btn)) == 0U) {
-                continue;
+            const uint16_t t_bit = SP1_BTN_BIT(trk_btn);
+
+            if ((pressed & t_bit) != 0U) {
+                if (sp1_controls_is_valid_shift_chord(down, SP1_BTN_FN, trk_btn)) {
+                    sp1_seq_set_track_nudge_ms(seq, t, 0.0f);
+                    ui->focused_track = t;
+                    ui->mode_entry_raw[t] = snap->fader_raw[t];
+                    ui->fader_engaged[t] = false;
+                    ui->btn_consumed_mask |= t_bit;
+                } else if (sp1_controls_is_valid_shift_chord(down, SP1_BTN_RWD, trk_btn)) {
+                    sp1_seq_set_track_rotation(seq, t, 0U);
+                    ui->focused_track = t;
+                    ui->mode_entry_raw[t] = snap->fader_raw[t];
+                    ui->fader_engaged[t] = false;
+                    ui->btn_consumed_mask |= (uint16_t)(t_bit | SP1_BTN_BIT(SP1_BTN_RWD));
+                } else if (sp1_controls_is_valid_shift_chord(down, SP1_BTN_FWD, trk_btn)) {
+                    sp1_seq_set_track_steps(seq, t, 16U);
+                    ui->focused_track = t;
+                    ui->mode_entry_raw[t] = snap->fader_raw[t];
+                    ui->fader_engaged[t] = false;
+                    ui->btn_consumed_mask |= (uint16_t)(t_bit | SP1_BTN_BIT(SP1_BTN_FWD));
+                }
             }
 
-            if (sp1_controls_is_valid_shift_chord(down, SP1_BTN_FN, trk_btn)) {
-                sp1_seq_set_track_nudge_ms(seq, t, 0.0f);
-                ui->focused_track = t;
-                ui->mode_entry_raw[t] = snap->fader_raw[t];
-                ui->fader_engaged[t] = false;
-            } else if (sp1_controls_is_valid_shift_chord(down, SP1_BTN_RWD, trk_btn)) {
-                sp1_seq_set_track_rotation(seq, t, 0U);
-                ui->focused_track = t;
-                ui->mode_entry_raw[t] = snap->fader_raw[t];
-                ui->fader_engaged[t] = false;
-            } else if (sp1_controls_is_valid_shift_chord(down, SP1_BTN_FWD, trk_btn)) {
-                sp1_seq_set_track_steps(seq, t, 16U);
-                ui->focused_track = t;
-                ui->mode_entry_raw[t] = snap->fader_raw[t];
-                ui->fader_engaged[t] = false;
-            } else if (!any_valid_shift && !ui->fx_mode_active) {
+            if ((released & t_bit) != 0U &&
+                !any_valid_shift &&
+                !ui->fx_mode_active &&
+                (ui->btn_consumed_mask & t_bit) == 0U) {
                 sp1_seq_toggle_track_mute(seq, t);
             }
         }
@@ -332,8 +401,12 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
 
             switch (ui->active_mod) {
             case SP1_UI_MOD_NONE: {
-                if (vol_up_held) {
-                    /* Hardware-safe Vol+ (AIN1) + Fader 1..4: Voice Timbre & Morph */
+                const uint16_t trk_bit = SP1_BTN_BIT(k_track_buttons[f]);
+                const bool track_morph_held =
+                    !any_valid_shift && !ui->fx_mode_active && ((down & trk_bit) != 0U);
+
+                if (track_morph_held) {
+                    /* Hold T1..T4 + Fader 1..4: Per-Voice Timbre & Morph */
                     switch (f) {
                     case 0U:
                         ui->dsp.kick_decay = norm;
@@ -355,6 +428,7 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
                         break;
                     }
                     ui->focused_track = f;
+                    ui->btn_consumed_mask |= (uint16_t)(down & SP1_BTN_TRACK_MASK);
                 } else if (ui->fx_mode_active) {
                     /* Latched Performance FX Mode: Faders 1..4 drive Master FX Bus */
                     switch (f) {
@@ -378,6 +452,9 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
                 } else {
                     const uint8_t pulses = (uint8_t)(norm * (float)cur_steps + 0.5f);
                     sp1_seq_set_track_pulses(seq, f, pulses);
+                    if ((down & SP1_BTN_TRACK_MASK) != 0U) {
+                        ui->btn_consumed_mask |= (uint16_t)(down & SP1_BTN_TRACK_MASK);
+                    }
                 }
                 break;
             }
@@ -392,6 +469,7 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
                 const uint8_t rot = (uint8_t)(norm * (float)max_rot + 0.5f);
                 sp1_seq_set_track_rotation(seq, f, rot);
                 ui->focused_track = f;
+                ui->btn_consumed_mask |= SP1_BTN_BIT(SP1_BTN_RWD);
                 break;
             }
             case SP1_UI_MOD_FWD: {
@@ -401,6 +479,7 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
                                         0.5f));
                 sp1_seq_set_track_steps(seq, f, steps);
                 ui->focused_track = f;
+                ui->btn_consumed_mask |= SP1_BTN_BIT(SP1_BTN_FWD);
                 break;
             }
             default:
@@ -408,6 +487,9 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
             }
         }
     }
+
+    /* Clear consumed flags for buttons that just finished releasing. */
+    ui->btn_consumed_mask &= (uint16_t)(~released);
 }
 
 void sp1_ui_mapper_on_triggers(sp1_ui_mapper_t *ui,

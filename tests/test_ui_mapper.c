@@ -28,7 +28,7 @@ static void press_and_release(sp1_ui_mapper_t *ui, sp1_sequencer_t *seq, sp1_but
     poll_and_update(ui, seq);
 }
 
-static void test_normal_mode_faders_mutes_transport_and_bpm(void) {
+static void test_normal_mode_faders_mutes_transport_bpm_and_volume(void) {
     init_silent_hal();
 
     sp1_sequencer_t seq;
@@ -40,15 +40,20 @@ static void test_normal_mode_faders_mutes_transport_and_bpm(void) {
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(4, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
     TEST_ASSERT(!sp1_seq_is_running(&seq));
+    TEST_ASSERT_EQ_INT(SP1_UI_VOLUME_DEFAULT, sp1_ui_mapper_get_master_volume(&ui));
 
     /* Fader 1 -> Track 0 pulse density (50% of 16 steps = 8 pulses) */
     sp1_hal_controls_on_fader_raw(0U, 2040);
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(8, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
 
-    /* Track buttons T1..T4 toggle mute */
+    /* Track buttons T1..T4 toggle mute on release (when no fader moved while held) */
     TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 1U));
-    press_and_release(&ui, &seq, SP1_BTN_TRACK_2);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_2, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 1U)); /* Mute toggles on release, not press */
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_2, false);
+    poll_and_update(&ui, &seq);
     TEST_ASSERT(sp1_seq_is_track_muted(&seq, 1U));
     press_and_release(&ui, &seq, SP1_BTN_TRACK_2);
     TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 1U));
@@ -59,13 +64,26 @@ static void test_normal_mode_faders_mutes_transport_and_bpm(void) {
     press_and_release(&ui, &seq, SP1_BTN_PLAY);
     TEST_ASSERT(!sp1_seq_is_running(&seq));
 
-    /* Vol- / Vol+ adjust Fine Master BPM (-2 / +2 BPM, clamped to 60..180 BPM) */
+    /* RWD / FWD (unshifted tap without fader movement) -> Fine Master BPM (-2 / +2 BPM) */
     TEST_ASSERT_EQ_U32(12000U, sp1_seq_get_bpm_x100(&seq));
-    press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
+    press_and_release(&ui, &seq, SP1_BTN_FWD);
     TEST_ASSERT_EQ_U32(12200U, sp1_seq_get_bpm_x100(&seq));
-    press_and_release(&ui, &seq, SP1_BTN_VOL_DOWN);
-    press_and_release(&ui, &seq, SP1_BTN_VOL_DOWN);
+    press_and_release(&ui, &seq, SP1_BTN_RWD);
+    press_and_release(&ui, &seq, SP1_BTN_RWD);
     TEST_ASSERT_EQ_U32(11800U, sp1_seq_get_bpm_x100(&seq));
+
+    /* Vol- / Vol+ (unshifted tap) -> Master Output Volume (0..127, step +/-8) */
+    press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
+    TEST_ASSERT_EQ_INT(116, sp1_ui_mapper_get_master_volume(&ui));
+    press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
+    TEST_ASSERT_EQ_INT(124, sp1_ui_mapper_get_master_volume(&ui));
+    press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
+    TEST_ASSERT_EQ_INT(127, sp1_ui_mapper_get_master_volume(&ui)); /* Clamped at 127 */
+    for (int i = 0; i < 20; ++i) {
+        press_and_release(&ui, &seq, SP1_BTN_VOL_DOWN);
+    }
+    TEST_ASSERT_EQ_INT(0, sp1_ui_mapper_get_master_volume(&ui)); /* Clamped at 0 */
+    TEST_ASSERT_EQ_U32(11800U, sp1_seq_get_bpm_x100(&seq)); /* Vol-/Vol+ never alter BPM */
 
     sp1_hal_shutdown();
 }
@@ -82,6 +100,7 @@ static void test_shift_combos_dilla_detent_coarse_bpm_swing_and_anti_clobber(voi
     sp1_hal_controls_on_fader_raw(0U, 1275); /* ~5/16 */
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(5, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
+    const uint8_t init_vol = sp1_ui_mapper_get_master_volume(&ui);
 
     /* Center detent mapping unit check: [0.42..0.58] snaps cleanly to 0.0f ms */
     TEST_ASSERT_FLOAT_NEAR(-35.0f, sp1_ui_fader_norm_to_nudge_ms(0.0f), 1e-4f);
@@ -110,32 +129,34 @@ static void test_shift_combos_dilla_detent_coarse_bpm_swing_and_anti_clobber(voi
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(-SP1_SEQ_NUDGE_MAX_FRAMES, sp1_seq_get_track_nudge_frames(&seq, 0U));
 
-    /* Function + Vol+ / Vol- -> Coarse Master BPM (+10 / -10 BPM, clamped to 60..180) */
-    press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
+    /* Function + FWD / RWD -> Coarse Master BPM (+10 / -10 BPM, clamped to 60..180) */
+    press_and_release(&ui, &seq, SP1_BTN_FWD);
     TEST_ASSERT_EQ_U32(13000U, sp1_seq_get_bpm_x100(&seq));
     for (int i = 0; i < 8; ++i) {
-        press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
+        press_and_release(&ui, &seq, SP1_BTN_FWD);
     }
     TEST_ASSERT_EQ_U32(18000U, sp1_seq_get_bpm_x100(&seq));
     for (int i = 0; i < 15; ++i) {
-        press_and_release(&ui, &seq, SP1_BTN_VOL_DOWN);
+        press_and_release(&ui, &seq, SP1_BTN_RWD);
     }
     TEST_ASSERT_EQ_U32(6000U, sp1_seq_get_bpm_x100(&seq));
 
-    /* Function + FWD / RWD -> Global Swing (+2% / -2%, clamped to 50%..66%) */
+    /* Function + Vol+ / Vol- -> Global Swing (+2% / -2%, clamped to 50%..66%) without altering volume */
     TEST_ASSERT_FLOAT_NEAR(0.50f, sp1_seq_get_swing(&seq), 1e-5f);
-    press_and_release(&ui, &seq, SP1_BTN_FWD);
+    press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
     TEST_ASSERT_FLOAT_NEAR(0.52f, sp1_seq_get_swing(&seq), 1e-5f);
     for (int i = 0; i < 10; ++i) {
-        press_and_release(&ui, &seq, SP1_BTN_FWD);
+        press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
     }
     TEST_ASSERT_FLOAT_NEAR(0.66f, sp1_seq_get_swing(&seq), 1e-5f);
-    press_and_release(&ui, &seq, SP1_BTN_RWD);
+    press_and_release(&ui, &seq, SP1_BTN_VOL_DOWN);
     TEST_ASSERT_FLOAT_NEAR(0.64f, sp1_seq_get_swing(&seq), 1e-5f);
+    TEST_ASSERT_EQ_INT(init_vol, sp1_ui_mapper_get_master_volume(&ui));
 
-    /* Function + T1 -> quick-reset Track 0 Dilla nudge to exact 0 ms */
+    /* Function + T1 -> quick-reset Track 0 Dilla nudge to exact 0 ms (no mute toggle!) */
     press_and_release(&ui, &seq, SP1_BTN_TRACK_1);
     TEST_ASSERT_EQ_INT(0, sp1_seq_get_track_nudge_frames(&seq, 0U));
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 0U));
 
     /* Release Function while Fader 0 sits at 0 -> anti-clobber preserves Track 0 pulses == 5! */
     sp1_hal_controls_on_button_event(SP1_BTN_FN, false);
@@ -144,29 +165,50 @@ static void test_shift_combos_dilla_detent_coarse_bpm_swing_and_anti_clobber(voi
     TEST_ASSERT_EQ_INT(SP1_UI_MOD_NONE, sp1_ui_mapper_active_modifier(&ui));
     TEST_ASSERT_EQ_INT(5, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
 
-    /* RWD + Fader 2 -> Track 1 rotation; RWD + T2 resets rotation to 0 */
+    /* Reset BPM to 120 to verify RWD/FWD + Fader suppresses fine BPM tap on release */
+    sp1_seq_set_bpm_x100(&seq, 12000U);
+
+    /* RWD + Fader 2 -> Track 1 rotation; releasing RWD MUST NOT decrement BPM! */
     sp1_hal_controls_on_button_event(SP1_BTN_RWD, true);
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(SP1_UI_MOD_RWD, sp1_ui_mapper_active_modifier(&ui));
     sp1_hal_controls_on_fader_raw(1U, SP1_FADER_RAW_MAX);
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(15, sp1_seq_get_track_pattern(&seq, 1U)->rotation);
+    sp1_hal_controls_on_button_event(SP1_BTN_RWD, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_U32(12000U, sp1_seq_get_bpm_x100(&seq));
+
+    /* RWD + T2 resets rotation to 0 and also suppresses BPM tap & Track 1 mute! */
+    sp1_hal_controls_on_button_event(SP1_BTN_RWD, true);
+    poll_and_update(&ui, &seq);
     press_and_release(&ui, &seq, SP1_BTN_TRACK_2);
     TEST_ASSERT_EQ_INT(0, sp1_seq_get_track_pattern(&seq, 1U)->rotation);
     sp1_hal_controls_on_button_event(SP1_BTN_RWD, false);
     poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_U32(12000U, sp1_seq_get_bpm_x100(&seq));
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 1U));
 
-    /* FWD + Fader 3 -> Track 2 polymeter step length (1..32); FWD + T3 resets to 16 */
+    /* FWD + Fader 3 -> Track 2 polymeter step length (1..32); releasing FWD MUST NOT increment BPM! */
     sp1_hal_controls_on_button_event(SP1_BTN_FWD, true);
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(SP1_UI_MOD_FWD, sp1_ui_mapper_active_modifier(&ui));
     sp1_hal_controls_on_fader_raw(2U, SP1_FADER_RAW_MAX);
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(32, sp1_seq_get_track_pattern(&seq, 2U)->steps);
+    sp1_hal_controls_on_button_event(SP1_BTN_FWD, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_U32(12000U, sp1_seq_get_bpm_x100(&seq));
+
+    /* FWD + T3 resets to 16 steps and suppresses BPM tap & Track 2 mute! */
+    sp1_hal_controls_on_button_event(SP1_BTN_FWD, true);
+    poll_and_update(&ui, &seq);
     press_and_release(&ui, &seq, SP1_BTN_TRACK_3);
     TEST_ASSERT_EQ_INT(16, sp1_seq_get_track_pattern(&seq, 2U)->steps);
     sp1_hal_controls_on_button_event(SP1_BTN_FWD, false);
     poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_U32(12000U, sp1_seq_get_bpm_x100(&seq));
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 2U));
 
     sp1_hal_shutdown();
 }
@@ -191,8 +233,10 @@ static void test_play_shift_chord_hardware_safety(void) {
     sp1_seq_set_swing(&seq, 0.58f);
 
     poll_and_update(&ui, &seq);
+    const uint8_t init_vol = sp1_ui_mapper_get_master_volume(&ui);
+    const float init_kick_decay = sp1_ui_mapper_get_dsp_params(&ui)->kick_decay;
 
-    /* Hold Play and synthetically press every Track button T1..T4 + Vol-/Vol+ + move Fader 0 */
+    /* Hold Play and synthetically press every Track button T1..T4 + RWD/FWD/Vol-/Vol+ + move Fader 0 */
     sp1_hal_controls_on_button_event(SP1_BTN_PLAY, true);
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(SP1_UI_MOD_NONE, sp1_ui_mapper_active_modifier(&ui));
@@ -202,6 +246,7 @@ static void test_play_shift_chord_hardware_safety(void) {
     };
     for (uint8_t t = 0U; t < 4U; ++t) {
         sp1_hal_controls_on_button_event(tracks[t], true);
+        sp1_hal_controls_on_fader_raw(t, SP1_FADER_RAW_MAX);
         poll_and_update(&ui, &seq);
         TEST_ASSERT_EQ_INT(SP1_UI_MOD_NONE, sp1_ui_mapper_active_modifier(&ui));
         sp1_hal_controls_on_button_event(tracks[t], false);
@@ -209,17 +254,21 @@ static void test_play_shift_chord_hardware_safety(void) {
     }
 
     sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, true);
-    sp1_hal_controls_on_fader_raw(0U, SP1_FADER_RAW_MAX);
+    sp1_hal_controls_on_button_event(SP1_BTN_FWD, true);
+    sp1_hal_controls_on_fader_raw(0U, 0);
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(SP1_UI_MOD_NONE, sp1_ui_mapper_active_modifier(&ui));
 
+    sp1_hal_controls_on_button_event(SP1_BTN_FWD, false);
     sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, false);
     sp1_hal_controls_on_button_event(SP1_BTN_PLAY, false);
     poll_and_update(&ui, &seq);
 
-    /* Confirm ZERO parameters or mute states were altered by Play + T1..T4 / Fader */
+    /* Confirm ZERO parameters, volume, morph, or mute states were altered by Play + buttons/faders */
     TEST_ASSERT_EQ_U32(12400U, sp1_seq_get_bpm_x100(&seq));
     TEST_ASSERT_FLOAT_NEAR(0.58f, sp1_seq_get_swing(&seq), 1e-5f);
+    TEST_ASSERT_EQ_INT(init_vol, sp1_ui_mapper_get_master_volume(&ui));
+    TEST_ASSERT_FLOAT_NEAR(init_kick_decay, sp1_ui_mapper_get_dsp_params(&ui)->kick_decay, 1e-5f);
     for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
         const sp1_euclid_pattern_t *pat = sp1_seq_get_track_pattern(&seq, t);
         TEST_ASSERT_EQ_INT(5, pat->pulses);
@@ -302,14 +351,33 @@ static void test_performance_fx_mode_and_voice_morph_gestures(void) {
     sp1_ui_mapper_init(&ui);
     poll_and_update(&ui, &seq);
 
-    /* Set Track 0 pulses to 6 in Normal Mode */
-    sp1_hal_controls_on_fader_raw(0U, 1530);
+    /* Set distinct Euclidean pulse counts on Tracks 0..3 in Normal Mode */
+    sp1_hal_controls_on_fader_raw(0U, 1530); /* 6 pulses */
+    sp1_hal_controls_on_fader_raw(1U, 510);  /* 2 pulses */
+    sp1_hal_controls_on_fader_raw(2U, 2040); /* 8 pulses */
+    sp1_hal_controls_on_fader_raw(3U, 765);  /* 3 pulses */
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(6, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
+    TEST_ASSERT_EQ_INT(2, sp1_seq_get_track_pattern(&seq, 1U)->pulses);
+    TEST_ASSERT_EQ_INT(8, sp1_seq_get_track_pattern(&seq, 2U)->pulses);
+    TEST_ASSERT_EQ_INT(3, sp1_seq_get_track_pattern(&seq, 3U)->pulses);
     TEST_ASSERT(!sp1_ui_mapper_is_fx_mode(&ui));
 
-    /* Hold Vol+ (AIN1) + move Fader 2 -> morphs Track 2 Rimshot <-> Snare without clobbering pulses */
-    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, true);
+    /* Hold T1 + move Fader 1 -> Kick decay & drive punch (suppresses mute & preserves pulses) */
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, true);
+    poll_and_update(&ui, &seq);
+    sp1_hal_controls_on_fader_raw(0U, SP1_FADER_RAW_MAX);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_FLOAT_NEAR(1.0f, sp1_ui_mapper_get_dsp_params(&ui)->kick_decay, 1e-4f);
+    TEST_ASSERT_FLOAT_NEAR(0.95f, sp1_ui_mapper_get_dsp_params(&ui)->kick_drive, 1e-4f);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, false);
+    poll_and_update(&ui, &seq);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 0U));
+    TEST_ASSERT_EQ_INT(6, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
+
+    /* Hold T2 + move Fader 2 -> Track 2 Rimshot (0.0) <-> Snare (1.0) morph */
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_2, true);
     poll_and_update(&ui, &seq);
     sp1_hal_controls_on_fader_raw(1U, SP1_FADER_RAW_MAX); /* 1.0f = full Snare */
     poll_and_update(&ui, &seq);
@@ -317,11 +385,36 @@ static void test_performance_fx_mode_and_voice_morph_gestures(void) {
     sp1_hal_controls_on_fader_raw(1U, 0); /* 0.0f = pure Rimshot */
     poll_and_update(&ui, &seq);
     TEST_ASSERT_FLOAT_NEAR(0.0f, sp1_ui_mapper_get_dsp_params(&ui)->snare_morph, 1e-4f);
-    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, false);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_2, false);
     poll_and_update(&ui, &seq);
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 1U));
     TEST_ASSERT_EQ_INT(2, sp1_seq_get_track_pattern(&seq, 1U)->pulses);
 
-    /* Hardware-safe chord: Vol- (AIN1) + T1 (AIN0) toggles latched Performance FX Mode */
+    /* Hold T3 + move Fader 3 -> Track 3 Closed (0.0) <-> Open (1.0) Hi-Hat decay morph */
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_3, true);
+    poll_and_update(&ui, &seq);
+    sp1_hal_controls_on_fader_raw(2U, SP1_FADER_RAW_MAX);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_FLOAT_NEAR(1.0f, sp1_ui_mapper_get_dsp_params(&ui)->hat_decay, 1e-4f);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_3, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 2U));
+    TEST_ASSERT_EQ_INT(8, sp1_seq_get_track_pattern(&seq, 2U)->pulses);
+
+    /* Hold T4 + move Fader 4 -> Track 4 2-Op FM / Wavefold timbre morph */
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_4, true);
+    poll_and_update(&ui, &seq);
+    sp1_hal_controls_on_fader_raw(3U, 0);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_FLOAT_NEAR(0.0f, sp1_ui_mapper_get_dsp_params(&ui)->perc_timbre, 1e-4f);
+    sp1_hal_controls_on_button_event(SP1_BTN_TRACK_4, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 3U));
+    TEST_ASSERT_EQ_INT(3, sp1_seq_get_track_pattern(&seq, 3U)->pulses);
+
+    /* Hardware-safe chord: Vol- (AIN1) + T1 (AIN0) toggles latched Performance FX Mode
+     * without changing Master Output Volume or muting Track 0! */
+    const uint8_t vol_before_fx = sp1_ui_mapper_get_master_volume(&ui);
     sp1_hal_controls_on_button_event(SP1_BTN_VOL_DOWN, true);
     poll_and_update(&ui, &seq);
     sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, true);
@@ -330,13 +423,15 @@ static void test_performance_fx_mode_and_voice_morph_gestures(void) {
     sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, false);
     sp1_hal_controls_on_button_event(SP1_BTN_VOL_DOWN, false);
     poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(vol_before_fx, sp1_ui_mapper_get_master_volume(&ui));
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 0U));
 
     /* In Performance FX Mode, Faders 1..4 drive DJ SVF, Stutter, Bitcrusher, and Dub Delay
      * while preserving Track 0 pulses == 6! */
-    sp1_hal_controls_on_fader_raw(0U, SP1_FADER_RAW_MAX);
+    sp1_hal_controls_on_fader_raw(0U, 0);
     sp1_hal_controls_on_fader_raw(2U, 2040);
     poll_and_update(&ui, &seq);
-    TEST_ASSERT_FLOAT_NEAR(1.0f, sp1_ui_mapper_get_dsp_params(&ui)->dj_filter_pos, 1e-4f);
+    TEST_ASSERT_FLOAT_NEAR(0.0f, sp1_ui_mapper_get_dsp_params(&ui)->dj_filter_pos, 1e-4f);
     TEST_ASSERT_FLOAT_NEAR(0.5f, sp1_ui_mapper_get_dsp_params(&ui)->crush_amount, 1e-3f);
     TEST_ASSERT_EQ_INT(6, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
 
@@ -347,8 +442,10 @@ static void test_performance_fx_mode_and_voice_morph_gestures(void) {
     sp1_hal_controls_on_button_event(SP1_BTN_TRACK_3, false);
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(0, sp1_ui_mapper_get_dsp_params(&ui)->stutter_div);
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 2U));
 
-    /* Function (GPIO P0.27) + T1 + T4 (AIN0) exits Performance FX Mode with fader anti-clobber */
+    /* Function (GPIO P0.27) + T1 + T4 (AIN0) exits Performance FX Mode with fader anti-clobber
+     * and zero accidental Track 1 / Track 4 mute toggles! */
     sp1_hal_controls_on_button_event(SP1_BTN_FN, true);
     sp1_hal_controls_on_button_event(SP1_BTN_TRACK_1, true);
     sp1_hal_controls_on_button_event(SP1_BTN_TRACK_4, true);
@@ -359,12 +456,14 @@ static void test_performance_fx_mode_and_voice_morph_gestures(void) {
     sp1_hal_controls_on_button_event(SP1_BTN_FN, false);
     poll_and_update(&ui, &seq);
     TEST_ASSERT_EQ_INT(6, sp1_seq_get_track_pattern(&seq, 0U)->pulses);
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 0U));
+    TEST_ASSERT(!sp1_seq_is_track_muted(&seq, 3U));
 
     sp1_hal_shutdown();
 }
 
 int main(void) {
-    RUN_TEST(test_normal_mode_faders_mutes_transport_and_bpm);
+    RUN_TEST(test_normal_mode_faders_mutes_transport_bpm_and_volume);
     RUN_TEST(test_shift_combos_dilla_detent_coarse_bpm_swing_and_anti_clobber);
     RUN_TEST(test_play_shift_chord_hardware_safety);
     RUN_TEST(test_8ch_pwm_led_renderer_pulse_mute_beat_and_nudge_polarity);

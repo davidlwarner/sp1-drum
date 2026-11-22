@@ -12,11 +12,47 @@ namespace app {
 namespace {
 
 constexpr int kPollCadenceMs = 20;
+constexpr int64_t kFnHoldPowerOnMs = 1500;   // 1.5 second hold to power on from SYSTEM_OFF
 constexpr int64_t kFnHoldShutdownMs = 3000;  // 3 second hold to shut down
 constexpr int64_t kFnReleaseStableMs = 30;   // debounce before sys_poweroff
 
 void feed(AppMachine& m) {
     core::watchdog::feed(m.main_watchdog_channel);
+}
+
+void render_wake_hold_progress(leds::Leds* leds, int64_t elapsed_ms) {
+    if (leds == nullptr) {
+        return;
+    }
+    const int64_t clamped =
+        (elapsed_ms < 0) ? 0 : ((elapsed_ms > kFnHoldPowerOnMs) ? kFnHoldPowerOnMs : elapsed_ms);
+    uint32_t scaled = static_cast<uint32_t>((clamped * 1020) / kFnHoldPowerOnMs);
+    if (scaled < 24U) {
+        scaled = 24U;  // Instant dim spark on Play 1 to acknowledge press
+    }
+    for (int i = 0; i < leds::kNumTrack; ++i) {
+        leds->set_track(i, 0U);
+    }
+    uint32_t rem = (scaled > 1020U) ? 1020U : scaled;
+    for (int i = 0; i < leds::kNumPlay; ++i) {
+        const uint8_t level = (rem >= 255U) ? 255U : static_cast<uint8_t>(rem);
+        rem -= level;
+        leds->set_play(i, level);
+    }
+}
+
+void abort_wake_to_system_off(AppMachine& m) {
+    LOG_INF("SP-1 Drum Machine: Function released early (< 1.5 s) — returning to SYSTEM_OFF");
+    if (m.leds != nullptr) {
+        m.leds->all_off();
+    }
+    sp1_hal_shutdown();
+    if (m.power != nullptr) {
+        m.power->prepare_for_system_off();
+    }
+    sys_poweroff();
+    LOG_ERR("sys_poweroff() returned during early wake abort");
+    k_sleep(K_FOREVER);
 }
 
 /// Returns true if function button has been held long enough for shutdown.
@@ -49,9 +85,29 @@ bool check_fn_hold_shutdown(AppMachine& m) {
 
 }  // namespace
 
-// ── Idle: transition immediately to standalone Running mode ─────
+// ── Idle: 1.5 s hold-to-power-on gate on battery SYSTEM_OFF GPIO wake ──
 
-static void idle_entry(void*) {
+static void idle_entry(void* o) {
+    auto& m = smf::ctx<AppMachine>(o);
+    m.wake_hold_required = false;
+    m.wake_hold_start_ms = 0;
+
+    if (m.power != nullptr) {
+        m.power->refresh_usb_power_state();
+        const bool woke_from_off = m.power->consume_system_off_gpio_wake();
+        const bool vbus_present = m.power->is_external_power_present();
+
+        if (woke_from_off && !vbus_present) {
+            m.wake_hold_required = true;
+            m.wake_hold_start_ms = k_uptime_get();
+            if (m.leds != nullptr) {
+                m.leds->all_off();
+            }
+            LOG_INF("SP-1 Drum Machine: SYSTEM_OFF GPIO wake — hold Function 1.5 s to power on");
+            return;
+        }
+    }
+
     LOG_INF("SP-1 Drum Machine: Idle -> Entering standalone Running state");
 }
 
@@ -59,21 +115,57 @@ static smf_state_result idle_run(void* o) {
     auto& m = smf::ctx<AppMachine>(o);
     feed(m);
 
-    if (check_fn_hold_shutdown(m)) {
-        smf::set_state(m.ctx, app_states[STATE_SHUTTING_DOWN]);
+    if (m.wake_hold_required) {
+        if (m.power != nullptr) {
+            m.power->refresh_usb_power_state();
+            if (m.power->is_external_power_present()) {
+                // USB-C VBUS connected during hold: power on immediately.
+                m.wake_hold_required = false;
+                m.fn_was_pressed = m.power->function_button_pressed();
+                m.fn_hold_start_ms = 0;
+                smf::set_state(m.ctx, app_states[STATE_RUNNING]);
+                return SMF_EVENT_HANDLED;
+            }
+
+            if (!m.power->function_button_pressed()) {
+                abort_wake_to_system_off(m);
+                return SMF_EVENT_HANDLED;
+            }
+        }
+
+        const int64_t elapsed_ms = k_uptime_get() - m.wake_hold_start_ms;
+        render_wake_hold_progress(m.leds, elapsed_ms);
+
+        if (elapsed_ms >= kFnHoldPowerOnMs) {
+            m.wake_hold_required = false;
+            // Require a fresh release + press before the 3 s shutdown timer can arm.
+            m.fn_was_pressed = true;
+            m.fn_hold_start_ms = 0;
+            smf::set_state(m.ctx, app_states[STATE_RUNNING]);
+            return SMF_EVENT_HANDLED;
+        }
+
+        k_sleep(K_MSEC(kPollCadenceMs));
         return SMF_EVENT_HANDLED;
     }
 
-    // Standalone battery / USB-C operation: enter STATE_RUNNING immediately
-    // without waiting for a USB host computer.
+    // Cold boot / reset / USB-C VBUS present: enter STATE_RUNNING immediately.
     smf::set_state(m.ctx, app_states[STATE_RUNNING]);
     return SMF_EVENT_HANDLED;
 }
 
 // ── Running: 50 Hz SAADC faders + UI mapper + DSP sync + PWM LEDs ─
 
-static void running_entry(void*) {
-    LOG_INF("SP-1 Drum Machine: Running (48 kHz I2S0 audio + 50 Hz control loop)");
+static void running_entry(void* o) {
+    auto& m = smf::ctx<AppMachine>(o);
+    if (!m.runtime_started && m.start_runtime != nullptr) {
+        m.audio_active = m.start_runtime();
+        m.runtime_started = true;
+        m.applied_volume = SP1_UI_VOLUME_DEFAULT;
+        feed(m);
+    }
+    LOG_INF("SP-1 Drum Machine: Running (48 kHz I2S0 audio=%s + 50 Hz control loop)",
+            m.audio_active ? "active" : "fallback");
 }
 
 static smf_state_result running_run(void* o) {
@@ -109,6 +201,15 @@ static smf_state_result running_run(void* o) {
             };
             sp1_hal_leds_set_frame(&led_frame);
         }
+
+        if (m.target_volume != nullptr) {
+            const uint8_t target_vol =
+                static_cast<uint8_t>(__atomic_load_n(m.target_volume, __ATOMIC_ACQUIRE) & 0x7FU);
+            if (target_vol != m.applied_volume) {
+                sp1_hal_audio_set_volume(target_vol);
+                m.applied_volume = target_vol;
+            }
+        }
     } else if (m.seq != nullptr && m.ui != nullptr) {
         /* Fallback 50 Hz visual/control tick when I2S/codec init failed:
          * keeps all 8 PWM LEDs, Euclidean step playback, buttons, faders,
@@ -118,6 +219,12 @@ static smf_state_result running_run(void* o) {
         sp1_controls_snapshot_t snap{};
         sp1_hal_controls_poll(&snap);
         sp1_ui_mapper_update(m.ui, m.seq, &snap);
+
+        const uint8_t target_vol = sp1_ui_mapper_get_master_volume(m.ui);
+        if (target_vol != m.applied_volume) {
+            sp1_hal_audio_set_volume(target_vol);
+            m.applied_volume = target_vol;
+        }
 
         sp1_seq_trigger_event_t triggers[SP1_SEQ_MAX_BLOCK_TRIGGERS];
         const uint32_t trig_count = sp1_seq_process_block(m.seq,

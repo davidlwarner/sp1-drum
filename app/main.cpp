@@ -103,6 +103,8 @@ static uint64_t g_audio_frame_counter = 0ULL;
 static uint32_t g_audio_ctrl_decim = 0U;
 static uint32_t g_led_track_packed = 0U;
 static uint32_t g_led_play_packed = 0U;
+static uint32_t g_target_volume = SP1_UI_VOLUME_DEFAULT;
+static int g_main_wdt_channel = -1;
 
 static constexpr uint32_t kAudioCtrlDecimBlocks = 10U; /* 10 * 2.0 ms = 20 ms (50 Hz) */
 static constexpr uint32_t kAudioCtrlCadenceMs = 20U;
@@ -150,6 +152,10 @@ static void sp1_audio_render_cb(int16_t *interleaved_stereo,
             sp1_master_fx_set_bitcrusher(&g_master_fx, dsp->crush_amount);
             sp1_master_fx_set_dub_delay(
                 &g_master_fx, dsp->dub_delay_wet, dsp->dub_delay_feedback);
+
+            __atomic_store_n(&g_target_volume,
+                             static_cast<uint32_t>(dsp->master_volume),
+                             __ATOMIC_RELEASE);
         }
     }
 
@@ -295,12 +301,56 @@ static void run_boot_led_sweep(int wdt_channel) {
     core::watchdog::feed(wdt_channel);
 }
 
+static bool start_sp1_runtime(void) {
+    sp1_seq_start(&g_sequencer);
+
+    // Seed initial LED frame immediately so hardware shows live sequencer state.
+    {
+        sp1_led_frame_t init_leds{};
+        sp1_ui_mapper_render_leds(&g_ui_mapper, &g_sequencer, 0U, &init_leds);
+        const uint32_t track_w =
+            static_cast<uint32_t>(init_leds.track[0]) |
+            (static_cast<uint32_t>(init_leds.track[1]) << 8U) |
+            (static_cast<uint32_t>(init_leds.track[2]) << 16U) |
+            (static_cast<uint32_t>(init_leds.track[3]) << 24U);
+        const uint32_t play_w =
+            static_cast<uint32_t>(init_leds.play[0]) |
+            (static_cast<uint32_t>(init_leds.play[1]) << 8U) |
+            (static_cast<uint32_t>(init_leds.play[2]) << 16U) |
+            (static_cast<uint32_t>(init_leds.play[3]) << 24U);
+        __atomic_store_n(&g_led_track_packed, track_w, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_led_play_packed, play_w, __ATOMIC_RELEASE);
+        sp1_hal_leds_set_frame(&init_leds);
+    }
+    if (g_main_wdt_channel >= 0) {
+        core::watchdog::feed(g_main_wdt_channel);
+    }
+
+    bool audio_active = false;
+    if (sp1_hal_audio_init(sp1_audio_render_cb, nullptr) < 0) {
+        LOG_WRN("SP-1 Audio HAL init failed; continuing with live UI/LEDs");
+    } else {
+        sp1_hal_audio_set_volume(SP1_UI_VOLUME_DEFAULT);
+        if (sp1_hal_audio_start() < 0) {
+            LOG_WRN("SP-1 Audio HAL start failed; continuing with live UI/LEDs");
+        } else {
+            audio_active = true;
+            LOG_INF("48 kHz I2S0 EasyDMA audio streaming active");
+        }
+    }
+    if (g_main_wdt_channel >= 0) {
+        core::watchdog::feed(g_main_wdt_channel);
+    }
+    return audio_active;
+}
+
 int main(void) {
     core::watchdog::start();
     const int main_wdt = core::watchdog::register_channel("main", 5000);
+    g_main_wdt_channel = main_wdt;
     core::watchdog::feed(main_wdt);
 
-    // ── LEDs FIRST (immediate visual boot confirmation) ─────────
+    // ── LEDs & Power Monitor FIRST ──────────────────────────────
     g_leds.track[0] = PWM_DT_SPEC_GET(DT_NODELABEL(led_track_1));
     g_leds.track[1] = PWM_DT_SPEC_GET(DT_NODELABEL(led_track_2));
     g_leds.track[2] = PWM_DT_SPEC_GET(DT_NODELABEL(led_track_3));
@@ -309,13 +359,18 @@ int main(void) {
     g_leds.play[1] = PWM_DT_SPEC_GET(DT_NODELABEL(led_play_2));
     g_leds.play[2] = PWM_DT_SPEC_GET(DT_NODELABEL(led_play_3));
     g_leds.play[3] = PWM_DT_SPEC_GET(DT_NODELABEL(led_play_4));
-    run_boot_led_sweep(main_wdt);
+    g_leds.all_off();
 
-    LOG_INF("SP-1 Euclidean Drum Machine Booting...");
-
-    // ── Power monitor ───────────────────────────────────────────
     g_power.init();
     core::watchdog::feed(main_wdt);
+
+    // Skip the boot LED sweep when waking on battery from SYSTEM_OFF via Function;
+    // STATE_IDLE will animate the 1.5 s hold-to-power-on Play 1..4 LED fill instead.
+    if (!(g_power.woke_from_system_off() && !g_power.is_external_power_present())) {
+        run_boot_led_sweep(main_wdt);
+    }
+
+    LOG_INF("SP-1 Euclidean Drum Machine Booting...");
 
     // ── Fader ADC ───────────────────────────────────────────────
     for (const auto* spec : {&fader1_adc, &fader2_adc, &fader3_adc, &fader4_adc}) {
@@ -356,43 +411,10 @@ int main(void) {
     sp1_master_fx_init(&g_master_fx);
     g_audio_frame_counter = 0ULL;
     g_audio_ctrl_decim = 0U;
-    sp1_seq_start(&g_sequencer);
-
-    // Seed initial LED frame immediately so hardware shows live sequencer state.
-    {
-        sp1_led_frame_t init_leds{};
-        sp1_ui_mapper_render_leds(&g_ui_mapper, &g_sequencer, 0U, &init_leds);
-        const uint32_t track_w =
-            static_cast<uint32_t>(init_leds.track[0]) |
-            (static_cast<uint32_t>(init_leds.track[1]) << 8U) |
-            (static_cast<uint32_t>(init_leds.track[2]) << 16U) |
-            (static_cast<uint32_t>(init_leds.track[3]) << 24U);
-        const uint32_t play_w =
-            static_cast<uint32_t>(init_leds.play[0]) |
-            (static_cast<uint32_t>(init_leds.play[1]) << 8U) |
-            (static_cast<uint32_t>(init_leds.play[2]) << 16U) |
-            (static_cast<uint32_t>(init_leds.play[3]) << 24U);
-        __atomic_store_n(&g_led_track_packed, track_w, __ATOMIC_RELEASE);
-        __atomic_store_n(&g_led_play_packed, play_w, __ATOMIC_RELEASE);
-        sp1_hal_leds_set_frame(&init_leds);
-    }
+    __atomic_store_n(&g_target_volume, SP1_UI_VOLUME_DEFAULT, __ATOMIC_RELEASE);
     core::watchdog::feed(main_wdt);
 
-    bool audio_active = false;
-    if (sp1_hal_audio_init(sp1_audio_render_cb, nullptr) < 0) {
-        LOG_WRN("SP-1 Audio HAL init failed; continuing with live UI/LEDs");
-    } else {
-        sp1_hal_audio_set_volume(108U);
-        if (sp1_hal_audio_start() < 0) {
-            LOG_WRN("SP-1 Audio HAL start failed; continuing with live UI/LEDs");
-        } else {
-            audio_active = true;
-            LOG_INF("48 kHz I2S0 EasyDMA audio streaming active");
-        }
-    }
-    core::watchdog::feed(main_wdt);
-
-    // ── Start HSM (always reached even if USB or audio init failed) ─
+    // ── Start HSM (always reached; STATE_IDLE gates battery SYSTEM_OFF wake) ─
     app::AppMachine machine{};
     machine.midi = &g_midi;
     machine.leds = &g_leds;
@@ -403,11 +425,14 @@ int main(void) {
     machine.fx = &g_master_fx;
     machine.led_track_packed = &g_led_track_packed;
     machine.led_play_packed = &g_led_play_packed;
+    machine.target_volume = &g_target_volume;
+    machine.start_runtime = start_sp1_runtime;
     machine.main_watchdog_channel = main_wdt;
-    machine.audio_active = audio_active;
+    machine.audio_active = false;
+    machine.runtime_started = false;
+    machine.applied_volume = SP1_UI_VOLUME_DEFAULT;
 
-    LOG_INF("Boot complete, entering standalone HSM (audio=%s)",
-            audio_active ? "active" : "fallback");
+    LOG_INF("Boot init complete, entering standalone HSM");
     app::run(machine);
 
     return 0;

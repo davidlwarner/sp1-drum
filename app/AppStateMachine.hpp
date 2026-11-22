@@ -34,9 +34,17 @@ struct AppMachine {
     sp1_master_fx_t* fx = nullptr;
     const uint32_t* led_track_packed = nullptr;
     const uint32_t* led_play_packed = nullptr;
+    const uint32_t* target_volume = nullptr;
+    bool (*start_runtime)(void) = nullptr;
     int main_watchdog_channel = -1;
     bool audio_active = false;
+    bool runtime_started = false;
+    uint8_t applied_volume = SP1_UI_VOLUME_DEFAULT;
     uint64_t fallback_frame_counter = 0ULL;
+
+    // 1.5-second hold-to-power-on gate (SYSTEM_OFF GPIO wake without USB VBUS)
+    bool wake_hold_required = false;
+    int64_t wake_hold_start_ms = 0;
 
     // Function-button hold detection (for shutdown)
     int64_t fn_hold_start_ms = 0;

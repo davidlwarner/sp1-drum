@@ -26,9 +26,13 @@ extern "C" {
 
 #define SP1_UI_BPM_MIN_X100             6000U   /*  60.00 BPM UI floor */
 #define SP1_UI_BPM_MAX_X100             18000U  /* 180.00 BPM UI ceiling */
-#define SP1_UI_BPM_FINE_STEP_X100       200U    /* +/-  2 BPM (Vol- / Vol+) */
-#define SP1_UI_BPM_COARSE_STEP_X100     1000U   /* +/- 10 BPM (Function + Vol- / Vol+) */
-#define SP1_UI_SWING_STEP               0.02f   /* +/-  2% Global Swing (Function + RWD / FWD) */
+#define SP1_UI_BPM_FINE_STEP_X100       200U    /* +/-  2 BPM (RWD / FWD unshifted tap) */
+#define SP1_UI_BPM_COARSE_STEP_X100     1000U   /* +/- 10 BPM (Function + RWD / FWD) */
+#define SP1_UI_SWING_STEP               0.02f   /* +/-  2% Global Swing (Function + Vol- / Vol+) */
+#define SP1_UI_VOLUME_MIN               0U      /* Mute / min Master Output Volume */
+#define SP1_UI_VOLUME_MAX               127U    /* Full-scale Master Output Volume */
+#define SP1_UI_VOLUME_DEFAULT           108U    /* Boot default Master Output Volume */
+#define SP1_UI_VOLUME_STEP              8U      /* +/-  8 volume step (Vol- / Vol+ tap) */
 
 /* Generous 16% center detent [0.42..0.58] snapping Function + Fader to exact 0 ms grid lock. */
 #define SP1_UI_NUDGE_DEADZONE_LOW       0.42f
@@ -49,12 +53,12 @@ extern "C" {
 typedef enum {
     SP1_UI_MOD_NONE = 0,
     SP1_UI_MOD_FN   = 1,    /* Function (GPIO P0.27): Dilla nudge, coarse BPM, swing, nudge reset */
-    SP1_UI_MOD_RWD  = 2,    /* RWD (AIN1): pattern rotation & rotation reset */
-    SP1_UI_MOD_FWD  = 3     /* FWD (AIN1): polymeter step length (1..32) & length reset */
+    SP1_UI_MOD_RWD  = 2,    /* RWD (AIN1): pattern rotation, rotation reset, or unshifted -2 BPM tap */
+    SP1_UI_MOD_FWD  = 3     /* FWD (AIN1): polymeter step length (1..32), reset, or unshifted +2 BPM tap */
 } sp1_ui_modifier_t;
 
-/* Normalized Master Performance FX & 4-Voice Timbre/Morph target snapshot.
- * Static RAM: 40 bytes. */
+/* Normalized Master Performance FX, Master Volume & 4-Voice Timbre/Morph target snapshot.
+ * Static RAM: 44 bytes. */
 typedef struct {
     float dj_filter_pos;        /* [0.0f..1.0f], 0.50f = center bypass deadzone */
     float dj_resonance_q;       /* [0.707f..12.0f], default 1.85f */
@@ -67,11 +71,12 @@ typedef struct {
     float hat_decay;            /* [0.0f = Closed .. 1.0f = Open], default 0.20f */
     float perc_timbre;          /* [0.0f..1.0f], default 0.45f */
     uint8_t stutter_div;        /* Effective stutter division (0=OFF, 1=1/4 .. 5=1/64) */
-    uint8_t pad[3];
+    uint8_t master_volume;      /* Master output volume [0..127], default 108 */
+    uint8_t pad[2];
 } sp1_ui_dsp_params_t;
 
 /* Screenless UI gesture & LED state.
- * Static RAM: 80 bytes (zero dynamic allocation). */
+ * Static RAM: 84 bytes (zero dynamic allocation). */
 typedef struct {
     sp1_ui_modifier_t active_mod;
     uint8_t focused_track;                      /* Last adjusted track for shift LED readout [0..3] */
@@ -83,6 +88,7 @@ typedef struct {
     bool fx_mode_active;                        /* Latched Performance FX Mode page */
     uint8_t fader_stutter_div;                  /* Fader-2 latched stutter division [0..5] */
     uint8_t reserved;
+    uint16_t btn_consumed_mask;                 /* Buttons consumed by chord/fader (suppresses release tap) */
     sp1_ui_dsp_params_t dsp;
 } sp1_ui_mapper_t;
 
@@ -114,6 +120,7 @@ void sp1_ui_mapper_set_fx_mode(sp1_ui_mapper_t *ui,
                                bool enabled);
 bool sp1_ui_mapper_is_fx_mode(const sp1_ui_mapper_t *ui);
 const sp1_ui_dsp_params_t *sp1_ui_mapper_get_dsp_params(const sp1_ui_mapper_t *ui);
+uint8_t sp1_ui_mapper_get_master_volume(const sp1_ui_mapper_t *ui);
 
 /**
  * Notify LED state machine of newly fired sequencer triggers so Track 1..4 LEDs pulse.
