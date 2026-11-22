@@ -192,4 +192,5 @@ The Teenage Engineering factory bootloader resides in protected flash (`0x00000.
 2. **Hold `Track 1 (T1)` + `Track 4 (T4)`** simultaneously.
 3. While holding `T1+T4`, **plug in the USB-C cable** connected to your computer.
 4. All 4 corner Track LEDs will light solid, confirming the hardware bootloader is active.
-5. Open [`https://solderless.engineering`](https://solderless.engineering) in Chrome or Edge, connect via Web Serial, and flash `zephyr.bin` (or reinstall stock firmware).
+5. Download `zephyr.bin` (and optional `zephyr.bin.sha256`) from [**GitHub Releases**](https://github.com/davidlwarner/sp1-drum/releases) for versioned builds, or download the `sp1-drum-firmware` artifact from the latest passing [**GitHub Actions CI**](https://github.com/davidlwarner/sp1-drum/actions/workflows/ci.yml) run for commit-by-commit dev builds (optionally verifying with `sha256sum -c zephyr.bin.sha256`).
+6. Open [`https://solderless.engineering`](https://solderless.engineering) in Chrome or Edge, connect via Web Serial, select `zephyr.bin`, and flash (or reinstall stock firmware).

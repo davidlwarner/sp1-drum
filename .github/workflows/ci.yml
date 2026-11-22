@@ -1,0 +1,306 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  host-tests:
+    name: Host Tests (gcc / clang / ASan+UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify host toolchain
+        run: |
+          gcc --version
+          clang --version
+          cmake --version
+
+      - name: Build and test with GCC (-Wall -Wextra -Werror)
+        run: |
+          set -euo pipefail
+          CC=gcc CXX=g++ cmake -S tests -B build-host-gcc \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror" \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror"
+          cmake --build build-host-gcc --parallel
+          ctest --test-dir build-host-gcc --output-on-failure
+
+      - name: Build and test with Clang (-Wall -Wextra -Werror)
+        run: |
+          set -euo pipefail
+          CC=clang CXX=clang++ cmake -S tests -B build-host-clang \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror" \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror"
+          cmake --build build-host-clang --parallel
+          ctest --test-dir build-host-clang --output-on-failure
+
+      - name: Build and test with GCC ASan + UBSan (-Wall -Wextra -Werror)
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1:strict_string_checks=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+        run: |
+          set -euo pipefail
+          CC=gcc CXX=g++ cmake -S tests -B build-host-san \
+            -DCMAKE_C_FLAGS="-O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all" \
+            -DCMAKE_CXX_FLAGS="-O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build-host-san --parallel
+          ctest --test-dir build-host-san --output-on-failure
+
+  arm-firmware:
+    name: ARM Firmware (stem_player) & Anti-Brick Gate
+    runs-on: ubuntu-24.04
+    env:
+      ZEPHYR_VERSION: v4.3.1
+      ZEPHYR_SDK_VERSION: 0.17.4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Zephyr host build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build \
+            device-tree-compiler \
+            gperf \
+            xz-utils \
+            python3-venv
+
+      - name: Cache Zephyr SDK 0.17.4 (arm-zephyr-eabi)
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: ~/zephyr-sdk-0.17.4
+          key: zephyr-sdk-0.17.4-arm-zephyr-eabi-linux-x86_64-v1
+
+      - name: Setup minimal Zephyr SDK 0.17.4 (arm-zephyr-eabi)
+        run: |
+          set -euo pipefail
+          SDK_DIR="${HOME}/zephyr-sdk-${ZEPHYR_SDK_VERSION}"
+          if [ "${{ steps.cache-sdk.outputs.cache-hit }}" != "true" ]; then
+            TARBALL="zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-x86_64_minimal.tar.xz"
+            curl -fsSL --retry 3 -o "/tmp/${TARBALL}" \
+              "https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZEPHYR_SDK_VERSION}/${TARBALL}"
+            tar -xf "/tmp/${TARBALL}" -C "${HOME}"
+            rm -f "/tmp/${TARBALL}"
+            (cd "${SDK_DIR}" && ./setup.sh -t arm-zephyr-eabi -c)
+          else
+            (cd "${SDK_DIR}" && ./setup.sh -c)
+          fi
+          echo "ZEPHYR_SDK_INSTALL_DIR=${SDK_DIR}" >> "${GITHUB_ENV}"
+          echo "ZEPHYR_TOOLCHAIN_VARIANT=zephyr" >> "${GITHUB_ENV}"
+          echo "${SDK_DIR}/arm-zephyr-eabi/bin" >> "${GITHUB_PATH}"
+
+      - name: Cache Zephyr v4.3.1 workspace and Python venv
+        id: cache-zephyr
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/zephyrproject
+            ~/zephyr-venv
+          key: zephyr-v4.3.1-nordic-minimal-py3-v1
+
+      - name: Setup Zephyr v4.3.1 workspace
+        run: |
+          set -euo pipefail
+          ZEPHYR_WS="${HOME}/zephyrproject"
+          ZEPHYR_VENV="${HOME}/zephyr-venv"
+
+          if [ "${{ steps.cache-zephyr.outputs.cache-hit }}" != "true" ]; then
+            python3 -m venv "${ZEPHYR_VENV}"
+            "${ZEPHYR_VENV}/bin/pip" install --upgrade pip west
+            "${ZEPHYR_VENV}/bin/west" init \
+              -m https://github.com/zephyrproject-rtos/zephyr \
+              --mr "${ZEPHYR_VERSION}" \
+              "${ZEPHYR_WS}"
+            (
+              cd "${ZEPHYR_WS}"
+              "${ZEPHYR_VENV}/bin/west" config manifest.project-filter -- "-.*,+cmsis,+cmsis_6,+hal_nordic"
+              "${ZEPHYR_VENV}/bin/west" update --narrow -o=--depth=1
+            )
+            "${ZEPHYR_VENV}/bin/pip" install -r "${ZEPHYR_WS}/zephyr/scripts/requirements-base.txt"
+          fi
+
+          (
+            cd "${ZEPHYR_WS}"
+            "${ZEPHYR_VENV}/bin/west" zephyr-export
+          )
+
+          echo "ZEPHYR_BASE=${ZEPHYR_WS}/zephyr" >> "${GITHUB_ENV}"
+          echo "${ZEPHYR_VENV}/bin" >> "${GITHUB_PATH}"
+
+      - name: Build stem_player firmware and enforce zero project warnings
+        run: |
+          set -euo pipefail
+          LOG_FILE="${RUNNER_TEMP}/west-build.log"
+          CLEAN_LOG="${RUNNER_TEMP}/west-build-clean.log"
+
+          west build -b stem_player . --build-dir build -p auto 2>&1 | tee "${LOG_FILE}"
+
+          sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' "${LOG_FILE}" > "${CLEAN_LOG}"
+          if grep -En "(^| )(${GITHUB_WORKSPACE}/|(\./)?(app|src|drivers|subsys|include|boards)/)[^:]+:[0-9]+(:[0-9]+)?: warning:" "${CLEAN_LOG}"; then
+            echo "::error::Project compiler warnings detected during ARM firmware build."
+            exit 1
+          fi
+
+      - name: Anti-Brick & Memory Safety Gate
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import struct
+          import subprocess
+          import sys
+
+          ELF = "build/zephyr/zephyr.elf"
+          BIN = "build/zephyr/zephyr.bin"
+
+          SRAM_LIMIT = 131072        # 128 KB SRAM budget
+          FLASH_LIMIT = 913408       # 892 KB slot0_partition (0x20000..0xFEFFF)
+          SLOT0_START = 0x00020000
+          SLOT0_END = 0x000FF000
+          SRAM_START = 0x20000000
+          SRAM_END = 0x20040000      # 256 KB nRF52840 SRAM
+
+          def run(cmd):
+              return subprocess.check_output(cmd, text=True)
+
+          # 1. arm-zephyr-eabi-size: SRAM & Flash limits
+          size_out = run(["arm-zephyr-eabi-size", ELF])
+          print("=== arm-zephyr-eabi-size ===")
+          print(size_out.strip())
+          lines = [ln.strip() for ln in size_out.strip().splitlines() if ln.strip()]
+          if len(lines) < 2:
+              sys.exit("ERROR: unexpected arm-zephyr-eabi-size output")
+          parts = lines[1].split()
+          text_b, data_b, bss_b = int(parts[0]), int(parts[1]), int(parts[2])
+          sram_b = data_b + bss_b
+          flash_b = text_b + data_b
+          print(f"FLASH (text + data): {flash_b} / {FLASH_LIMIT} B ({flash_b * 100.0 / FLASH_LIMIT:.2f}%)")
+          print(f"SRAM  (data + bss) : {sram_b} / {SRAM_LIMIT} B ({sram_b * 100.0 / SRAM_LIMIT:.2f}%)")
+          if sram_b > SRAM_LIMIT:
+              sys.exit(f"FAIL: SRAM usage {sram_b} B exceeds {SRAM_LIMIT} B (128 KB) limit")
+          if flash_b > FLASH_LIMIT:
+              sys.exit(f"FAIL: FLASH usage {flash_b} B exceeds {FLASH_LIMIT} B (892 KB) slot0_partition limit")
+
+          # 2. arm-zephyr-eabi-readelf -lW: flash-backed LOAD segments strictly in [0x00020000, 0x000FF000],
+          #    pure-SRAM NOBITS LOAD segments (FileSiz == 0) strictly in [0x20000000, 0x20040000]
+          ph_out = run(["arm-zephyr-eabi-readelf", "-lW", ELF])
+          print("\n=== arm-zephyr-eabi-readelf -lW ===")
+          load_count = 0
+          flash_load_count = 0
+          for line in ph_out.splitlines():
+              cols = line.split()
+              if not cols or cols[0] != "LOAD":
+                  continue
+              load_count += 1
+              virt_addr = int(cols[2], 16)
+              phys_addr = int(cols[3], 16)
+              file_siz = int(cols[4], 16)
+              mem_siz = int(cols[5], 16)
+              phys_end = phys_addr + mem_siz
+              kind = "SRAM-NOBITS" if file_siz == 0 else "FLASH-LOAD"
+              print(
+                  f"LOAD #{load_count} ({kind}): VirtAddr=0x{virt_addr:08X} PhysAddr=0x{phys_addr:08X} "
+                  f"FileSiz=0x{file_siz:X} MemSiz=0x{mem_siz:X} PhysEnd=0x{phys_end:08X}"
+              )
+              if file_siz == 0:
+                  if phys_addr < SRAM_START or phys_end > SRAM_END:
+                      sys.exit(
+                          f"FAIL: NOBITS LOAD segment [0x{phys_addr:08X}, 0x{phys_end:08X}] outside SRAM [0x{SRAM_START:08X}, 0x{SRAM_END:08X}]"
+                      )
+              else:
+                  flash_load_count += 1
+                  if phys_addr < SLOT0_START:
+                      sys.exit(
+                          f"FAIL: LOAD segment PhysAddr 0x{phys_addr:08X} overlaps protected bootloader (< 0x{SLOT0_START:08X})"
+                      )
+                  if phys_end > SLOT0_END:
+                      sys.exit(
+                          f"FAIL: LOAD segment PhysEnd 0x{phys_end:08X} exceeds slot0_partition (> 0x{SLOT0_END:08X})"
+                      )
+          if flash_load_count == 0:
+              sys.exit("FAIL: no flash-backed LOAD program headers found in ELF")
+
+          # 3. Vector table check on zephyr.bin
+          print("\n=== Vector Table Check (zephyr.bin) ===")
+          if not os.path.isfile(BIN):
+              sys.exit(f"FAIL: missing binary {BIN}")
+          bin_size = os.path.getsize(BIN)
+          if bin_size < 8 or bin_size > FLASH_LIMIT:
+              sys.exit(f"FAIL: zephyr.bin size {bin_size} B out of valid range [8, {FLASH_LIMIT}]")
+          with open(BIN, "rb") as f:
+              msp, reset = struct.unpack("<II", f.read(8))
+          print(f"BinSize={bin_size} B | MSP=0x{msp:08X} | Reset_Handler=0x{reset:08X}")
+          if not (SRAM_START <= msp <= SRAM_END):
+              sys.exit(f"FAIL: MSP 0x{msp:08X} outside nRF52840 SRAM [0x{SRAM_START:08X}, 0x{SRAM_END:08X}]")
+          if (reset & 1) != 1:
+              sys.exit(f"FAIL: Reset_Handler 0x{reset:08X} is not a valid Thumb address (LSB != 1)")
+          if not (SLOT0_START <= reset <= SLOT0_END):
+              sys.exit(
+                  f"FAIL: Reset_Handler 0x{reset:08X} outside slot0_partition [0x{SLOT0_START:08X}, 0x{SLOT0_END:08X}]"
+              )
+
+          # 4. arm-zephyr-eabi-nm: zero NVMC symbols & fatal error handler present
+          print("\n=== Symbol Audit (arm-zephyr-eabi-nm) ===")
+          nm_out = run(["arm-zephyr-eabi-nm", ELF])
+          nvmc_re = re.compile(r"(^|[^A-Za-z0-9_])(nrf_nvmc_|nrfx_nvmc_)")
+          forbidden_nvmc = []
+          fatal_handler_lines = []
+          for line in nm_out.splitlines():
+              cols = line.split()
+              if len(cols) < 2:
+                  continue
+              sym_type = cols[-2]
+              sym_name = cols[-1]
+              if nvmc_re.search(sym_name):
+                  forbidden_nvmc.append(line.strip())
+              if sym_name == "k_sys_fatal_error_handler" and sym_type in ("T", "t"):
+                  fatal_handler_lines.append(line.strip())
+
+          if forbidden_nvmc:
+              print("Forbidden flash-controller symbols detected:")
+              for item in forbidden_nvmc:
+                  print(f"  {item}")
+              sys.exit("FAIL: NVMC flash write/erase symbols must never be linked")
+
+          if not fatal_handler_lines:
+              sys.exit("FAIL: strong text symbol k_sys_fatal_error_handler not found in ELF")
+
+          print("NVMC flash symbols: 0 (PASS)")
+          print(f"Fatal fault handler: {fatal_handler_lines[0]} (PASS)")
+          print("\nALL ANTI-BRICK & MEMORY SAFETY GATES PASSED.")
+          PY
+
+      - name: Generate SHA-256 checksum
+        run: |
+          set -euo pipefail
+          (cd build/zephyr && sha256sum zephyr.bin) > build/zephyr/zephyr.bin.sha256
+          cat build/zephyr/zephyr.bin.sha256
+          (cd build/zephyr && sha256sum -c zephyr.bin.sha256)
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sp1-drum-firmware
+          path: |
+            build/zephyr/zephyr.bin
+            build/zephyr/zephyr.bin.sha256
+          if-no-files-found: error

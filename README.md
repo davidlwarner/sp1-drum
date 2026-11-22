@@ -103,11 +103,14 @@ The SP-1 includes a factory hardware bootloader in protected flash (`0x00000..0x
 1. **Power off your SP-1:** If running, hold **`Function (••)`** for 3 seconds until the LEDs fade out and the unit enters `SYSTEM_OFF` (or unplug USB-C if the battery is empty).
 2. **Enter `T1+T4` Bootloader Mode:** Press and hold **`Track 1 (T1)` + `Track 4 (T4)`** simultaneously, then plug the USB-C cable into your computer while keeping `T1+T4` held.
 3. **Confirm 4 Solid Track LEDs:** All four corner Track LEDs will illuminate solid, indicating the Teenage Engineering bootloader is active. You may now release `T1+T4`.
-4. **Flash via Web Serial:**
-   - Download `zephyr.bin` from the [`preview-firmware`](https://github.com/davidlwarner/sp1-drum/raw/preview-firmware/zephyr.bin) branch (or build `build/zephyr/zephyr.bin` locally).
+4. **Download & Verify `zephyr.bin`:**
+   - **Versioned Releases (Recommended):** Download `zephyr.bin` (and optional `zephyr.bin.sha256`) from [**GitHub Releases**](https://github.com/davidlwarner/sp1-drum/releases).
+   - **Commit-by-Commit Dev Builds:** Open the latest passing run on the [**GitHub Actions CI**](https://github.com/davidlwarner/sp1-drum/actions/workflows/ci.yml) tab and download the `sp1-drum-firmware` build artifact (contains `zephyr.bin` and `zephyr.bin.sha256`), or build `build/zephyr/zephyr.bin` locally.
+   - *(Optional)* Verify integrity before flashing: `sha256sum -c zephyr.bin.sha256`.
+5. **Flash via Web Serial:**
    - Open the Solderless Engineering Web Serial utility ([`https://solderless.engineering`](https://solderless.engineering)) in Google Chrome or Microsoft Edge.
    - Connect to the Stem Player bootloader over Web Serial, select `zephyr.bin`, and wait for the flash progress bar to complete.
-5. **Reboot & Play:** Unplug and reconnect USB-C (or hold `Function ••` for `1.5 s` to wake on battery). `sp1-drum` immediately boots into standalone 48 kHz drum machine mode.
+6. **Reboot & Play:** Unplug and reconnect USB-C (or hold `Function ••` for `1.5 s` to wake on battery). `sp1-drum` immediately boots into standalone 48 kHz drum machine mode.
 
 ---
 

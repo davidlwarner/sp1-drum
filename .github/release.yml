@@ -1,0 +1,28 @@
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+      - skip-changelog
+    authors:
+      - dependabot
+  categories:
+    - title: Features
+      labels:
+        - feat
+        - feature
+        - enhancement
+    - title: Bug Fixes
+      labels:
+        - fix
+        - bug
+    - title: Performance & Real-Time DSP
+      labels:
+        - perf
+        - performance
+    - title: Documentation
+      labels:
+        - docs
+        - documentation
+    - title: Other Changes
+      labels:
+        - "*"

@@ -146,6 +146,6 @@ Measured on stock `ericlewis/sp1-midi` vs. complete `sp1-drum` Milestone 4 produ
 
 ### Milestone 4 — Zephyr ARM Build, Cortex-M4F DWT Cycle Profiling & Public User Manual *(Complete)*
 - [x] Validate all SP-1 "Big Five" safety gates (`CONFIG_USE_DT_CODE_PARTITION=y`, `slot0_partition` linked at `0x00020000`, watchdog feeds, `k_sys_fatal_error_handler()` cold reboot override, `SYSTEM_OFF` codec/oscillator/LED teardown, `T1+T4` bootloader recovery).
-- [x] Build production `build/zephyr/zephyr.bin` (`FLASH: 217,336 B / 23.79%`, `SRAM: 104,708 B / 39.94% <= 128 KB`) with zero compiler warnings under Zephyr `v4.3.1` + SDK `0.17.4` and stage on `origin/preview-firmware` for Web Serial flashing via `solderless.engineering`.
+- [x] Build production `build/zephyr/zephyr.bin` (`FLASH: 217,336 B / 23.79%`, `SRAM: 104,708 B / 39.94% <= 128 KB`) with zero compiler warnings under Zephyr `v4.3.1` + SDK `0.17.4` and publish verified binaries via GitHub Actions CI & GitHub Releases for Web Serial flashing via `solderless.engineering`.
 - [x] Add hardware DWT `CYCCNT` cycle-counter instrumentation (`sp1_audio_cycle_stats_t` in `src/hal/`) and host benchmark verification (`tests/test_cycle_budget.c`) confirming worst-case 4-voice + full Master FX load stays within `<= 55%` (`47.3%` avg / `48.7%` peak of `128,000` cycles/block, zero `__aeabi_d*` soft-float promotions).
 - [x] Publish the open-source landing page ([`README.md`](../README.md)) and comprehensive Screenless Musician's User Manual ([`docs/USER_MANUAL.md`](USER_MANUAL.md)).
