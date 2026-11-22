@@ -18,6 +18,7 @@ extern "C" {
 #include "Leds.hpp"
 #include "MidiController.hpp"
 #include "power/PowerManager.hpp"
+#include "system/ResetBreadcrumbs.hpp"
 #include "system/Watchdog.hpp"
 #include "hal/sp1_hal.h"
 
@@ -345,6 +346,9 @@ static bool start_sp1_runtime(void) {
 }
 
 int main(void) {
+    core::reset_breadcrumbs::capture_early();
+    core::reset_breadcrumbs::clear_live_markers();
+
     core::watchdog::start();
     const int main_wdt = core::watchdog::register_channel("main", 5000);
     g_main_wdt_channel = main_wdt;
@@ -398,6 +402,9 @@ int main(void) {
         LOG_ERR("USB init failed");
     } else {
         LOG_INF("USB composite device ready (CDC ACM + MIDI)");
+        // Print any saved previous-boot crash dump / watchdog breadcrumb after
+        // USB-C CDC ACM enumerates on the host terminal (~1.5 s).
+        core::reset_breadcrumbs::schedule_boot_report(1500U);
     }
     core::watchdog::feed(main_wdt);
 

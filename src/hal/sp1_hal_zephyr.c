@@ -10,10 +10,8 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/pwm.h>
-#include <zephyr/fatal.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/reboot.h>
 #include <zephyr/usb/class/usbd_midi2.h>
 
 #include <soc.h>
@@ -127,13 +125,8 @@ static inline uint32_t sp1_dwt_cyccnt_read(void) {
 #endif
 }
 
-/* ── Safety Gate: Reboot Rather Than Halt on Fatal Kernel Faults ─────────── */
-
-void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf) {
-    (void)reason;
-    (void)esf;
-    sys_reboot(SYS_REBOOT_COLD);
-}
+/* Fatal fault handler with crash breadcrumbs and USB-C console flush lives in
+ * subsys/system/ResetBreadcrumbs.cpp::k_sys_fatal_error_handler(). */
 
 static void sp1_i2s_prime_silent(uint32_t count) {
     for (uint32_t i = 0U; i < count; ++i) {
