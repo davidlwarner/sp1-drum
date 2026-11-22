@@ -72,12 +72,15 @@ static void test_normal_mode_faders_mutes_transport_bpm_and_volume(void) {
     press_and_release(&ui, &seq, SP1_BTN_RWD);
     TEST_ASSERT_EQ_U32(11800U, sp1_seq_get_bpm_x100(&seq));
 
-    /* Vol- / Vol+ (unshifted tap) -> Master Output Volume (0..127, step +/-8) */
+    /* Vol- / Vol+ (unshifted tap) -> Master Output Volume (0..127, step +/-8, default 64) */
+    TEST_ASSERT_EQ_INT(64, sp1_ui_mapper_get_master_volume(&ui));
     press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
-    TEST_ASSERT_EQ_INT(116, sp1_ui_mapper_get_master_volume(&ui));
+    TEST_ASSERT_EQ_INT(72, sp1_ui_mapper_get_master_volume(&ui));
     press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
-    TEST_ASSERT_EQ_INT(124, sp1_ui_mapper_get_master_volume(&ui));
-    press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
+    TEST_ASSERT_EQ_INT(80, sp1_ui_mapper_get_master_volume(&ui));
+    for (int i = 0; i < 8; ++i) {
+        press_and_release(&ui, &seq, SP1_BTN_VOL_UP);
+    }
     TEST_ASSERT_EQ_INT(127, sp1_ui_mapper_get_master_volume(&ui)); /* Clamped at 127 */
     for (int i = 0; i < 20; ++i) {
         press_and_release(&ui, &seq, SP1_BTN_VOL_DOWN);

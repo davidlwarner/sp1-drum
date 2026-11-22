@@ -31,7 +31,7 @@ extern "C" {
 #define SP1_UI_SWING_STEP               0.02f   /* +/-  2% Global Swing (Function + Vol- / Vol+) */
 #define SP1_UI_VOLUME_MIN               0U      /* Mute / min Master Output Volume */
 #define SP1_UI_VOLUME_MAX               127U    /* Full-scale Master Output Volume */
-#define SP1_UI_VOLUME_DEFAULT           108U    /* Boot default Master Output Volume */
+#define SP1_UI_VOLUME_DEFAULT           64U     /* Medium (~50%) boot default Master Output Volume */
 #define SP1_UI_VOLUME_STEP              8U      /* +/-  8 volume step (Vol- / Vol+ tap) */
 
 /* Generous 16% center detent [0.42..0.58] snapping Function + Fader to exact 0 ms grid lock. */
@@ -71,7 +71,7 @@ typedef struct {
     float hat_decay;            /* [0.0f = Closed .. 1.0f = Open], default 0.20f */
     float perc_timbre;          /* [0.0f..1.0f], default 0.45f */
     uint8_t stutter_div;        /* Effective stutter division (0=OFF, 1=1/4 .. 5=1/64) */
-    uint8_t master_volume;      /* Master output volume [0..127], default 108 */
+    uint8_t master_volume;      /* Master output volume [0..127], default 64 (medium) */
     uint8_t pad[2];
 } sp1_ui_dsp_params_t;
 

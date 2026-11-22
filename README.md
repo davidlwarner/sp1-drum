@@ -42,7 +42,7 @@
 | **`Fader 1..4`** | Track 1..4 Euclidean Pulses (`k`) | Distributes `0..n` hits evenly across track step length `n` (`E(k, n)`) |
 | **`Tap T1..T4`** | Track 1..4 Mute Toggle | Toggles mute on release when no fader moved while held (mutes internal synth voice & outbound MIDI notes) |
 | **`Tap RWD / FWD`** | Fine Master Tempo | `-2 BPM` / `+2 BPM` per unshifted tap (`60..180 BPM`, default `120 BPM`; suppressed if a fader or track reset is used while held) |
-| **`Vol-` / `Vol+`** | Master Output Volume | `-8` / `+8` per unshifted tap (`0..127`, default `108`) across `CS42L42` headphone DAC & `TAS2505` speaker amp |
+| **`Vol-` / `Vol+`** | Master Output Volume | `-8` / `+8` per unshifted tap (`0..127`, default `64` / medium) across `CS42L42` headphone DAC & `TAS2505` speaker amp |
 
 ### 2. `Function (••)` Shift Mode — J Dilla Micro-Timing, Coarse Tempo, Swing & Power
 
