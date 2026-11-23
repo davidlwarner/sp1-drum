@@ -402,9 +402,6 @@ int main(void) {
         LOG_ERR("USB init failed");
     } else {
         LOG_INF("USB composite device ready (CDC ACM + MIDI)");
-        // Print any saved previous-boot crash dump / watchdog breadcrumb after
-        // USB-C CDC ACM enumerates on the host terminal (~1.5 s).
-        core::reset_breadcrumbs::schedule_boot_report(1500U);
     }
     core::watchdog::feed(main_wdt);
 

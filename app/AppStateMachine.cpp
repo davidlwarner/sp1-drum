@@ -1,5 +1,6 @@
 #include "AppStateMachine.hpp"
 #include "power/PowerManager.hpp"
+#include "system/ResetBreadcrumbs.hpp"
 #include "system/Watchdog.hpp"
 #include "hal/sp1_hal.h"
 
@@ -15,6 +16,7 @@ constexpr int kPollCadenceMs = 20;
 constexpr int64_t kFnHoldPowerOnMs = 1500;   // 1.5 second hold to power on from SYSTEM_OFF
 constexpr int64_t kFnHoldShutdownMs = 3000;  // 3 second hold to shut down
 constexpr int64_t kFnReleaseStableMs = 30;   // debounce before sys_poweroff
+constexpr int64_t kBootReportDelayMs = 2500; // delay in STATE_RUNNING for USB-C CDC ACM enum
 
 void feed(AppMachine& m) {
     core::watchdog::feed(m.main_watchdog_channel);
@@ -164,6 +166,10 @@ static void running_entry(void* o) {
         m.applied_volume = SP1_UI_VOLUME_DEFAULT;
         feed(m);
     }
+    if (!m.boot_report_printed && m.boot_report_due_ms == 0 &&
+        core::reset_breadcrumbs::has_boot_report()) {
+        m.boot_report_due_ms = k_uptime_get() + kBootReportDelayMs;
+    }
     LOG_INF("SP-1 Drum Machine: Running (48 kHz I2S0 audio=%s + 50 Hz control loop)",
             m.audio_active ? "active" : "fallback");
 }
@@ -171,6 +177,12 @@ static void running_entry(void* o) {
 static smf_state_result running_run(void* o) {
     auto& m = smf::ctx<AppMachine>(o);
     feed(m);
+
+    if (!m.boot_report_printed && m.boot_report_due_ms != 0 &&
+        k_uptime_get() >= m.boot_report_due_ms) {
+        m.boot_report_printed = true;
+        core::reset_breadcrumbs::print_boot_report();
+    }
 
     if (check_fn_hold_shutdown(m)) {
         smf::set_state(m.ctx, app_states[STATE_SHUTTING_DOWN]);

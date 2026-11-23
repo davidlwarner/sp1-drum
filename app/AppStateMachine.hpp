@@ -52,6 +52,10 @@ struct AppMachine {
 
     // Shutdown button-release debounce
     int64_t fn_released_ms = 0;
+
+    // One-shot delayed previous-boot crash breadcrumb report in STATE_RUNNING
+    bool boot_report_printed = false;
+    int64_t boot_report_due_ms = 0;
 };
 
 extern const smf_state app_states[STATE_COUNT];

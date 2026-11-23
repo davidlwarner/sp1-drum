@@ -125,7 +125,8 @@ static inline uint32_t sp1_dwt_cyccnt_read(void) {
 #endif
 }
 
-/* Fatal fault handler with crash breadcrumbs and USB-C console flush lives in
+/* Minimal atomic fatal fault handler (records .noinit crash breadcrumbs and
+ * immediately cold-reboots) lives in
  * subsys/system/ResetBreadcrumbs.cpp::k_sys_fatal_error_handler(). */
 
 static void sp1_i2s_prime_silent(uint32_t count) {
