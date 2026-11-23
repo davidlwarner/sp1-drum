@@ -588,17 +588,29 @@ static int cs42l42_route_output(const struct device *dev, audio_channel_t channe
 	return -ENOTSUP;
 }
 
-bool cs42l42_codec_is_headphone_connected(const struct device *dev)
+bool cs42l42_codec_read_plug_status(const struct device *dev, uint8_t *out_status)
 {
 	struct cs42l42_data *const data = dev->data;
 	uint8_t value = 0U;
 
-	if (!data->configured) {
+	if (!data->configured || out_status == NULL) {
 		return false;
 	}
 
 	cs42l42_reset_page_cache(data);
 	if (!cs42l42_read_reg(dev, CS42L42_REG_TSRS_PLUG_STATUS, &value)) {
+		return false;
+	}
+
+	*out_status = value;
+	return true;
+}
+
+bool cs42l42_codec_is_headphone_connected(const struct device *dev)
+{
+	uint8_t value = 0U;
+
+	if (!cs42l42_codec_read_plug_status(dev, &value)) {
 		return false;
 	}
 

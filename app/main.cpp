@@ -266,6 +266,10 @@ static void on_input_event(struct input_event *evt, void*) {
     sp1_button_id_t hal_btn = SP1_BTN_TRACK_1;
     if (map_input_key_to_sp1_btn(evt->code, &hal_btn)) {
         sp1_hal_controls_on_button_event(hal_btn, pressed);
+    } else if (!k_is_in_isr()) {
+        LOG_INF("Input unmapped key code=%u val=%d",
+                static_cast<unsigned int>(evt->code),
+                static_cast<int>(evt->value));
     }
 }
 INPUT_CALLBACK_DEFINE(NULL, on_input_event, NULL);

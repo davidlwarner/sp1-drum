@@ -81,6 +81,8 @@ static sp1_fader_filter_t g_fader_filters[SP1_NUM_FADERS];
 static sp1_controls_snapshot_t g_live_controls;
 static sp1_controls_bus_t g_controls_bus;
 static uint16_t g_prev_polled_buttons_down = 0U;
+static uint16_t g_latched_pressed_buttons = 0U;
+static uint16_t g_latched_released_buttons = 0U;
 
 /* Static RAM: 32 B DWT CYCCNT audio block cycle telemetry + spinlock */
 static struct k_spinlock g_cycle_stats_lock;
@@ -95,6 +97,7 @@ static bool g_tas2505_ready = false;
 static uint8_t g_audio_volume = 64U;
 static bool g_audio_global_muted = false;
 static int8_t g_hp_routed_state = -1; /* -1 = unapplied, 0 = speaker, 1 = headphones */
+static int16_t g_last_plug_status = -1;
 
 /* ── Hardware Watchdog Reload Helper (Safe Across Slow I2C Bring-Up) ─────── */
 
@@ -167,6 +170,8 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
     sp1_dwt_cyccnt_init();
 
     uint32_t consecutive_write_fails = 0U;
+    uint32_t recovery_count = 0U;
+    int64_t last_recovery_log_ms = -10000;
 
     while (__atomic_load_n(&g_audio_running_flag, __ATOMIC_ACQUIRE) != 0U) {
         void *dma_block = NULL;
@@ -200,14 +205,32 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
 
             consecutive_write_fails += 1U;
             if (write_err == -EIO) {
-                /* I2S_STATE_ERROR: drop/prepare, pre-queue 2 silent slabs, and restart cleanly. */
-                (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
-                (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_PREPARE);
-                sp1_i2s_prime_silent(2U);
-                const int trig_err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
-                if (trig_err < 0 || consecutive_write_fails > 1U) {
-                    /* Yield on repeated errors so main/WDT/USB are never starved. */
-                    k_msleep(5);
+                /* In Zephyr i2s_nrfx, I2S_TRIGGER_DROP transitions ERROR (4) -> READY (1).
+                 * Never call I2S_TRIGGER_PREPARE in ERROR, and never sleep AFTER START. */
+                const int drop_err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+                if (consecutive_write_fails > 1U) {
+                    /* Yield while I2S is safely stopped in READY so main/WDT are never starved. */
+                    k_msleep(2);
+                }
+                int start_err = drop_err;
+                if (drop_err == 0) {
+                    sp1_i2s_prime_silent(2U);
+                    start_err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
+                }
+                recovery_count += 1U;
+                const int64_t now_ms = k_uptime_get();
+                if ((now_ms - last_recovery_log_ms) >= 2000) {
+                    last_recovery_log_ms = now_ms;
+                    if (drop_err == 0 && start_err == 0) {
+                        LOG_WRN("I2S0 TX recovered from state ERROR (count=%u)",
+                                (unsigned)recovery_count);
+                    } else {
+                        LOG_ERR("I2S0 TX recovery failed (drop=%d start=%d count=%u)",
+                                drop_err, start_err, (unsigned)recovery_count);
+                    }
+                }
+                if (drop_err < 0 || start_err < 0) {
+                    k_msleep(2);
                 }
             } else {
                 k_msleep(2);
@@ -229,6 +252,8 @@ int sp1_hal_controls_init(void) {
     sp1_controls_snapshot_init(&g_live_controls);
     sp1_controls_bus_init(&g_controls_bus);
     g_prev_polled_buttons_down = 0U;
+    g_latched_pressed_buttons = 0U;
+    g_latched_released_buttons = 0U;
     k_spin_unlock(&g_controls_lock, key);
     return 0;
 }
@@ -240,15 +265,24 @@ void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
 
     const uint16_t bit = SP1_BTN_BIT(btn);
     k_spinlock_key_t key = k_spin_lock(&g_controls_lock);
+    const uint16_t prev_down = g_live_controls.buttons_down;
     if (pressed) {
         g_live_controls.buttons_down |= bit;
+        g_latched_pressed_buttons |= bit;
     } else {
         g_live_controls.buttons_down &= (uint16_t)(~bit);
+        g_latched_released_buttons |= bit;
     }
+    const uint16_t next_down = g_live_controls.buttons_down;
 
     g_live_controls.seq++;
     sp1_controls_bus_publish(&g_controls_bus, &g_live_controls);
     k_spin_unlock(&g_controls_lock, key);
+
+    if (next_down != prev_down && !k_is_in_isr()) {
+        LOG_INF("Buttons: buttons=0x%04x (btn=%u %s)",
+                (unsigned)next_down, (unsigned)btn, pressed ? "DOWN" : "UP");
+    }
 }
 
 void sp1_hal_controls_on_fader_raw(uint8_t fader_idx, int16_t raw_sample) {
@@ -274,13 +308,17 @@ void sp1_hal_controls_poll(sp1_controls_snapshot_t *out_snapshot) {
     k_spinlock_key_t key = k_spin_lock(&g_controls_lock);
     sp1_controls_bus_read(&g_controls_bus, &snap);
 
-    /* Derive one-shot rising/falling edge masks purely on the consumer side
-     * so the producer remains the sole writer to g_live_controls / g_controls_bus. */
+    /* Derive one-shot rising/falling edge masks merged with latched edges so
+     * brief taps between 20 ms polls are never dropped. */
     const uint16_t cur_down = snap.buttons_down;
     const uint16_t prev_down = g_prev_polled_buttons_down;
-    snap.buttons_pressed = (uint16_t)(cur_down & (uint16_t)(~prev_down));
-    snap.buttons_released = (uint16_t)((uint16_t)(~cur_down) & prev_down);
+    snap.buttons_pressed =
+        (uint16_t)((cur_down & (uint16_t)(~prev_down)) | g_latched_pressed_buttons);
+    snap.buttons_released =
+        (uint16_t)(((uint16_t)(~cur_down) & prev_down) | g_latched_released_buttons);
     g_prev_polled_buttons_down = cur_down;
+    g_latched_pressed_buttons = 0U;
+    g_latched_released_buttons = 0U;
     k_spin_unlock(&g_controls_lock, key);
 
     if (out_snapshot != NULL) {
@@ -372,6 +410,7 @@ int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
     g_audio_volume = 64U;
     g_audio_global_muted = false;
     g_hp_routed_state = -1;
+    g_last_plug_status = -1;
     sp1_hal_audio_reset_cycle_stats();
 
     if (!device_is_ready(g_i2s_dev)) {
@@ -445,7 +484,7 @@ int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
     return 0;
 }
 
-static void sp1_audio_apply_routing(bool hp_connected) {
+static void sp1_audio_apply_routing(bool hp_connected, uint8_t plug_status) {
     audio_property_value_t mute_on;
     audio_property_value_t mute_off;
     audio_property_value_t vol_val;
@@ -477,7 +516,8 @@ static void sp1_audio_apply_routing(bool hp_connected) {
             (void)audio_codec_set_property(
                 g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_off);
         }
-        LOG_INF("Audio route -> Headphones (CS42L42, vol=%u/127)", (unsigned)g_audio_volume);
+        LOG_INF("Audio route -> Headphones (CS42L42, vol=%u/127, 0x130F=0x%02x)",
+                (unsigned)g_audio_volume, (unsigned)plug_status);
     } else {
         /* Mute headphones first, then set volume & unmute TAS2505 speaker. */
         if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
@@ -490,7 +530,8 @@ static void sp1_audio_apply_routing(bool hp_connected) {
             (void)audio_codec_set_property(
                 g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_off);
         }
-        LOG_INF("Audio route -> Speaker (TAS2505, vol=%u/127)", (unsigned)g_audio_volume);
+        LOG_INF("Audio route -> Speaker (TAS2505, vol=%u/127, 0x130F=0x%02x)",
+                (unsigned)g_audio_volume, (unsigned)plug_status);
     }
 }
 
@@ -613,14 +654,26 @@ void sp1_hal_audio_service_routing(void) {
         return;
     }
 
-    const bool hp_connected = cs42l42_codec_is_headphone_connected(g_cs42l42_dev);
+    uint8_t plug_status = 0U;
+    const bool read_ok = cs42l42_codec_read_plug_status(g_cs42l42_dev, &plug_status);
+    const bool hp_connected = read_ok && (((plug_status & 0x0CU) >> 2U) == 0x03U);
+
+    if (read_ok && (int16_t)plug_status != g_last_plug_status) {
+        if (g_last_plug_status >= 0) {
+            LOG_INF("CS42L42 TSRS_PLUG_STATUS (0x130F): 0x%02x -> 0x%02x (hp=%u)",
+                    (unsigned)g_last_plug_status, (unsigned)plug_status,
+                    hp_connected ? 1U : 0U);
+        }
+        g_last_plug_status = (int16_t)plug_status;
+    }
+
     const int8_t desired = hp_connected ? 1 : 0;
     if (desired == g_hp_routed_state) {
         return;
     }
 
     g_hp_routed_state = desired;
-    sp1_audio_apply_routing(hp_connected);
+    sp1_audio_apply_routing(hp_connected, plug_status);
 }
 
 void sp1_hal_audio_record_cycles(uint32_t elapsed_cycles) {

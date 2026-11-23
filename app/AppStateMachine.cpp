@@ -281,6 +281,14 @@ static smf_state_result running_run(void* o) {
         sp1_hal_leds_set_frame(&led_frame);
     }
 
+    if (m.seq != nullptr) {
+        const bool seq_running = sp1_seq_is_running(m.seq);
+        if (seq_running != m.prev_seq_running) {
+            m.prev_seq_running = seq_running;
+            LOG_INF("Sequencer: %s", seq_running ? "PLAYING" : "STOPPED");
+        }
+    }
+
     if (m.power != nullptr) {
         m.power->service_tick();
     }

@@ -60,6 +60,9 @@ struct AppMachine {
     // Deferred first-tick codec volume/routing init and 200 ms jack-detect poll divider
     bool routing_initialized = false;
     uint8_t routing_poll_ticks = 0U;
+
+    // Last logged sequencer running state for edge-triggered serial diagnostics
+    bool prev_seq_running = false;
 };
 
 extern const smf_state app_states[STATE_COUNT];

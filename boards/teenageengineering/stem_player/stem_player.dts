@@ -191,22 +191,22 @@
 		keyup-threshold-mv = <0>;
 
 		track_1 {
-			press-thresholds-mv = <179 517 779 996 1178 1334 1467 1584>;
+			press-thresholds-mv = <179 517 779 996 1178 1334 1467>;
 			zephyr,code = <INPUT_KEY_1>;
 		};
 
 		track_2 {
-			press-thresholds-mv = <364 517 893 996 1259 1334 1528 1584>;
+			press-thresholds-mv = <364 517 893 996 1259 1334 1528>;
 			zephyr,code = <INPUT_KEY_2>;
 		};
 
 		track_3 {
-			press-thresholds-mv = <655 779 893 996 1403 1467 1528 1584>;
+			press-thresholds-mv = <655 779 893 996 1403 1467 1528>;
 			zephyr,code = <INPUT_KEY_3>;
 		};
 
 		track_4 {
-			press-thresholds-mv = <1091 1178 1259 1334 1403 1467 1528 1584>;
+			press-thresholds-mv = <1091 1178 1259 1334 1403 1467 1528>;
 			zephyr,code = <INPUT_KEY_4>;
 		};
 
