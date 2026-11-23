@@ -107,7 +107,7 @@ static uint32_t g_led_play_packed = 0U;
 static uint32_t g_target_volume = SP1_UI_VOLUME_DEFAULT;
 static int g_main_wdt_channel = -1;
 
-static constexpr uint32_t kAudioCtrlDecimBlocks = 10U; /* 10 * 2.0 ms = 20 ms (50 Hz) */
+static constexpr uint32_t kAudioCtrlDecimBlocks = 12U; /* 12 * 80 frames = 960 frames = 20 ms (50 Hz) */
 static constexpr uint32_t kAudioCtrlCadenceMs = 20U;
 
 /* Static RAM: 4 * 96 * 4 B = 1536 B audio callback float block buffers */

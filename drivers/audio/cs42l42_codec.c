@@ -606,6 +606,13 @@ bool cs42l42_codec_read_plug_status(const struct device *dev, uint8_t *out_statu
 	return true;
 }
 
+bool cs42l42_codec_plug_status_is_connected(uint8_t status)
+{
+	/* On SP-1 hardware, TSRS_PLUG_STATUS (0x130F) bits [3:2] settle to 0b11 (0x0C)
+	 * when the 3.5 mm jack is open/unplugged, and pull low (!= 0x0C) when inserted. */
+	return (status & CS42L42_MASK_TS_PLUG_STATUS) != CS42L42_MASK_TS_PLUG_STATUS;
+}
+
 bool cs42l42_codec_is_headphone_connected(const struct device *dev)
 {
 	uint8_t value = 0U;
@@ -614,7 +621,7 @@ bool cs42l42_codec_is_headphone_connected(const struct device *dev)
 		return false;
 	}
 
-	return (uint8_t)((value & CS42L42_MASK_TS_PLUG_STATUS) >> 2) == CS42L42_TS_PLUG_STATE;
+	return cs42l42_codec_plug_status_is_connected(value);
 }
 
 void cs42l42_codec_log_state(const struct device *dev, const char *tag)

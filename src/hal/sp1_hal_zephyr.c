@@ -52,14 +52,22 @@ static const struct pwm_dt_spec g_play_leds[SP1_NUM_PLAY_LEDS] = {
 
 /* ── Static RAM Allocations (Explicit Byte Budgets) ──────────────────────── */
 
-/* 96 stereo frames * 2 channels * 4 bytes (24-bit-in-32-bit I2S word) = 768 B/block */
-#define SP1_I2S_DMA_BLOCK_BYTES     (SP1_AUDIO_BLOCK_SAMPLES * sizeof(int32_t))
-#define SP1_I2S_DMA_BLOCK_COUNT     8U
+/* 240 stereo frames (5.0 ms @ 48 kHz) * 2 channels * 4 bytes (24-bit-in-32-bit I2S word) = 1920 B/block.
+ * Rendered as 3 x 80-frame DSP sub-blocks so portable 96-frame scratch buffers stay unchanged. */
+#define SP1_I2S_DMA_SUB_FRAMES      80U
+#define SP1_I2S_DMA_SUB_BLOCKS      3U
+#define SP1_I2S_DMA_BLOCK_FRAMES    (SP1_I2S_DMA_SUB_FRAMES * SP1_I2S_DMA_SUB_BLOCKS)
+#define SP1_I2S_DMA_BLOCK_SAMPLES   (SP1_I2S_DMA_BLOCK_FRAMES * SP1_AUDIO_CHANNELS)
+#define SP1_I2S_DMA_BLOCK_BYTES     (SP1_I2S_DMA_BLOCK_SAMPLES * sizeof(int32_t))
+#define SP1_I2S_DMA_BLOCK_COUNT     8U  /* 8 * 5.0 ms = 40 ms total DMA ring headroom */
+#define SP1_I2S_PRIME_BLOCKS        4U  /* 4 * 5.0 ms = 20 ms pre-queued before START */
 #define SP1_AUDIO_THREAD_STACK_SIZE 4096U
-/* Preemptible high-priority thread (never cooperative, so I2S errors cannot starve main/WDT) */
-#define SP1_AUDIO_THREAD_PRIO       K_PRIO_PREEMPT(0)
+/* High cooperative priority so USB CDC ACM logging, I2C0, and ADC keys cannot preempt a
+ * 5 ms audio block render; blocks in i2s_write()/k_mem_slab_alloc() every 5 ms and yields
+ * via k_msleep(2) on error so main()/NRF_WDT0 are never starved. */
+#define SP1_AUDIO_THREAD_PRIO       K_PRIO_COOP(2)
 
-/* Static RAM: 8 * 768 B = 6144 B I2S EasyDMA TX slab */
+/* Static RAM: 8 * 1920 B = 15360 B I2S EasyDMA TX slab */
 K_MEM_SLAB_DEFINE_STATIC(g_i2s_tx_slab, SP1_I2S_DMA_BLOCK_BYTES, SP1_I2S_DMA_BLOCK_COUNT, 4);
 
 /* Static RAM: 4096 B audio render thread stack + ~128 B k_thread control block */
@@ -67,13 +75,14 @@ K_THREAD_STACK_DEFINE(g_audio_thread_stack, SP1_AUDIO_THREAD_STACK_SIZE);
 static struct k_thread g_audio_thread_data;
 static bool g_audio_thread_created = false;
 
-/* Static RAM: 384 B DSP scratch block (96 stereo int16_t frames) */
+/* Static RAM: 384 B DSP scratch block (up to 96 stereo int16_t frames per sub-block) */
 static int16_t g_audio_dsp_scratch[SP1_AUDIO_BLOCK_SAMPLES];
 
 /* Static RAM: 2 * 524 B = 1048 B lock-free MIDI RX/TX SPSC queues */
 static sp1_midi_spsc_queue_t g_midi_rx_q;
 static sp1_midi_spsc_queue_t g_midi_tx_q;
 static uint32_t g_midi_ready_flag = 0U;
+static int64_t g_midi_tx_backoff_until_ms = 0;
 
 /* Static RAM: 16 B fader filters + 40 B live controls + 84 B double-buffered bus + 2 B edge state + spinlock */
 static struct k_spinlock g_controls_lock;
@@ -184,14 +193,18 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
 
         const uint32_t cyc_start = sp1_dwt_cyccnt_read();
 
-        if (g_audio_cb != NULL) {
-            g_audio_cb(g_audio_dsp_scratch, SP1_AUDIO_BLOCK_FRAMES, g_audio_ctx);
-        } else {
-            memset(g_audio_dsp_scratch, 0, sizeof(g_audio_dsp_scratch));
+        int32_t *dst_i2s = (int32_t *)dma_block;
+        for (uint32_t sub = 0U; sub < SP1_I2S_DMA_SUB_BLOCKS; ++sub) {
+            if (g_audio_cb != NULL) {
+                g_audio_cb(g_audio_dsp_scratch, SP1_I2S_DMA_SUB_FRAMES, g_audio_ctx);
+            } else {
+                memset(g_audio_dsp_scratch, 0,
+                       SP1_I2S_DMA_SUB_FRAMES * SP1_AUDIO_CHANNELS * sizeof(int16_t));
+            }
+            sp1_audio_pack_s16_to_i2s24_in_32(
+                g_audio_dsp_scratch, dst_i2s, SP1_I2S_DMA_SUB_FRAMES);
+            dst_i2s += (SP1_I2S_DMA_SUB_FRAMES * SP1_AUDIO_CHANNELS);
         }
-
-        sp1_audio_pack_s16_to_i2s24_in_32(
-            g_audio_dsp_scratch, (int32_t *)dma_block, SP1_AUDIO_BLOCK_FRAMES);
 
         const uint32_t cyc_elapsed = sp1_dwt_cyccnt_read() - cyc_start;
         sp1_hal_audio_record_cycles(cyc_elapsed);
@@ -214,7 +227,7 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
                 }
                 int start_err = drop_err;
                 if (drop_err == 0) {
-                    sp1_i2s_prime_silent(2U);
+                    sp1_i2s_prime_silent(SP1_I2S_PRIME_BLOCKS);
                     start_err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
                 }
                 recovery_count += 1U;
@@ -357,6 +370,7 @@ int sp1_hal_midi_init(void) {
     sp1_midi_queue_init(&g_midi_rx_q);
     sp1_midi_queue_init(&g_midi_tx_q);
     __atomic_store_n(&g_midi_ready_flag, 0U, __ATOMIC_RELEASE);
+    g_midi_tx_backoff_until_ms = 0;
     return 0;
 }
 
@@ -366,6 +380,7 @@ bool sp1_hal_midi_is_ready(void) {
 
 void sp1_hal_midi_set_ready(bool ready) {
     __atomic_store_n(&g_midi_ready_flag, ready ? 1U : 0U, __ATOMIC_RELEASE);
+    g_midi_tx_backoff_until_ms = 0;
 }
 
 bool sp1_hal_midi_send(const sp1_midi_msg_t *msg) {
@@ -378,16 +393,25 @@ bool sp1_hal_midi_receive(sp1_midi_msg_t *out_msg) {
 
 void sp1_hal_midi_flush_tx(void) {
     const bool usb_ready = sp1_hal_midi_is_ready() && device_is_ready(g_usb_midi_dev);
+    const int64_t now_ms = k_uptime_get();
+    const bool in_backoff = (now_ms < g_midi_tx_backoff_until_ms);
 
     sp1_midi_msg_t msg;
     while (sp1_midi_queue_pop(&g_midi_tx_q, &msg)) {
-        if (!usb_ready) {
+        if (!usb_ready || in_backoff) {
             continue;
         }
         uint32_t word0 = 0U;
         if (sp1_midi_encode_ump32(&msg, 0U, &word0)) {
             const struct midi_ump ump = { .data = { word0 } };
-            (void)usbd_midi_send(g_usb_midi_dev, ump);
+            if (usbd_midi_send(g_usb_midi_dev, ump) < 0) {
+                /* Host is not draining USB MIDI IN (no DAW open): back off 1 s and
+                 * drop remaining stale TX packets so net_buf allocation never floods. */
+                g_midi_tx_backoff_until_ms = now_ms + 1000;
+                while (sp1_midi_queue_pop(&g_midi_tx_q, &msg)) {
+                }
+                break;
+            }
         }
     }
 }
@@ -542,8 +566,8 @@ int sp1_hal_audio_start(void) {
 
     __atomic_store_n(&g_audio_running_flag, 1U, __ATOMIC_RELEASE);
 
-    /* Pre-fill and queue two silent DMA TX slabs before triggering I2S0 START. */
-    sp1_i2s_prime_silent(2U);
+    /* Pre-fill and queue four silent 5 ms DMA TX slabs (20 ms) before triggering I2S0 START. */
+    sp1_i2s_prime_silent(SP1_I2S_PRIME_BLOCKS);
 
     const int err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
     if (err < 0) {
@@ -590,7 +614,7 @@ int sp1_hal_audio_stop(void) {
 
 int sp1_hal_audio_submit_block(const int16_t *interleaved_stereo, uint32_t num_frames) {
     if (!g_audio_configured || interleaved_stereo == NULL ||
-        num_frames != SP1_AUDIO_BLOCK_FRAMES) {
+        num_frames != SP1_I2S_DMA_BLOCK_FRAMES) {
         return -EINVAL;
     }
 
@@ -601,7 +625,7 @@ int sp1_hal_audio_submit_block(const int16_t *interleaved_stereo, uint32_t num_f
     }
 
     sp1_audio_pack_s16_to_i2s24_in_32(
-        interleaved_stereo, (int32_t *)dma_block, SP1_AUDIO_BLOCK_FRAMES);
+        interleaved_stereo, (int32_t *)dma_block, SP1_I2S_DMA_BLOCK_FRAMES);
 
     err = i2s_write(g_i2s_dev, dma_block, SP1_I2S_DMA_BLOCK_BYTES);
     if (err < 0) {
@@ -656,7 +680,7 @@ void sp1_hal_audio_service_routing(void) {
 
     uint8_t plug_status = 0U;
     const bool read_ok = cs42l42_codec_read_plug_status(g_cs42l42_dev, &plug_status);
-    const bool hp_connected = read_ok && (((plug_status & 0x0CU) >> 2U) == 0x03U);
+    const bool hp_connected = read_ok && cs42l42_codec_plug_status_is_connected(plug_status);
 
     if (read_ok && (int16_t)plug_status != g_last_plug_status) {
         if (g_last_plug_status >= 0) {

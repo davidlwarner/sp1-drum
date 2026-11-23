@@ -53,8 +53,9 @@ struct MidiController {
     // Octave offset for track button notes (rocker shifts ±1 octave)
     int8_t octave_offset = 0;  // -5 to +5 → note range 0–127
 
-    // USB MIDI ready flag
+    // USB MIDI ready flag & TX pool exhaustion backoff
     std::atomic<bool> ready{false};
+    int64_t tx_backoff_until_ms_ = 0;
     uint32_t poll_count_ = 0;
 
     // ADC specs for the 4 faders

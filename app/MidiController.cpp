@@ -1,6 +1,7 @@
 #include "MidiController.hpp"
 #include "hal/sp1_hal.h"
 
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <algorithm>
 #include <cmath>
@@ -13,23 +14,39 @@ void MidiController::send_cc(uint8_t cc, uint8_t value) {
     if (!ready.load(std::memory_order_relaxed) || midi_dev == nullptr) {
         return;
     }
+    const int64_t now_ms = k_uptime_get();
+    if (now_ms < tx_backoff_until_ms_) {
+        return;
+    }
     const struct midi_ump ump = UMP_MIDI1_CHANNEL_VOICE(
         static_cast<uint32_t>(kMidiGroup), UMP_MIDI_CONTROL_CHANGE, kMidiChannel, cc, value);
-    usbd_midi_send(midi_dev, ump);
+    if (usbd_midi_send(midi_dev, ump) < 0) {
+        tx_backoff_until_ms_ = now_ms + 1000;
+    }
 }
 
 void MidiController::send_note(uint8_t note, bool on, uint8_t velocity) {
     if (!ready.load(std::memory_order_relaxed) || midi_dev == nullptr) {
         return;
     }
+    const int64_t now_ms = k_uptime_get();
+    if (now_ms < tx_backoff_until_ms_) {
+        return;
+    }
     const uint8_t cmd = on ? UMP_MIDI_NOTE_ON : UMP_MIDI_NOTE_OFF;
     const struct midi_ump ump = UMP_MIDI1_CHANNEL_VOICE(
         static_cast<uint32_t>(kMidiGroup), cmd, kMidiChannel, note, on ? velocity : 0U);
-    usbd_midi_send(midi_dev, ump);
+    if (usbd_midi_send(midi_dev, ump) < 0) {
+        tx_backoff_until_ms_ = now_ms + 1000;
+    }
 }
 
 void MidiController::send_mmc(uint8_t command) {
     if (!ready.load(std::memory_order_relaxed) || midi_dev == nullptr) {
+        return;
+    }
+    const int64_t now_ms = k_uptime_get();
+    if (now_ms < tx_backoff_until_ms_) {
         return;
     }
 
@@ -47,7 +64,9 @@ void MidiController::send_mmc(uint8_t command) {
         (0x06U << 24)            // byte 2: MMC command
         | (static_cast<uint32_t>(command) << 16) // byte 3: sub-command
     }};
-    usbd_midi_send(midi_dev, ump);
+    if (usbd_midi_send(midi_dev, ump) < 0) {
+        tx_backoff_until_ms_ = now_ms + 1000;
+    }
 }
 
 void MidiController::poll_faders() {
