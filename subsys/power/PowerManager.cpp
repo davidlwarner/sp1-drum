@@ -1,5 +1,6 @@
 #include "PowerManager.hpp"
 #include "system/ResetBreadcrumbs.hpp"
+#include "system/Watchdog.hpp"
 #include "charger/charger_bq24232.h"
 #include <zephyr/drivers/charger.h>
 #include <zephyr/drivers/gpio.h>
@@ -133,6 +134,10 @@ void PowerManager::service_tick() {
         return;
     }
     run_poll();
+}
+
+void PowerManager::feed_watchdog() const {
+    core::watchdog::feed();
 }
 
 void PowerManager::run_poll() {

@@ -21,6 +21,9 @@ public:
     /// Call periodically from a work queue (10–50 ms).
     void service_tick();
 
+    /// Feed hardware NRF_WDT0 watchdog reload channels directly.
+    void feed_watchdog() const;
+
     // ── Charging / USB ──────────────────────────────────────────
     bool is_charging() const;
     bool is_external_power_present() const;

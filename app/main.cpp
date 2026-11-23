@@ -303,9 +303,9 @@ static void run_boot_led_sweep(int wdt_channel) {
 }
 
 static bool start_sp1_runtime(void) {
-    sp1_seq_start(&g_sequencer);
+    // Boot stopped: wait for the user to press Play before advancing steps.
 
-    // Seed initial LED frame immediately so hardware shows live sequencer state.
+    // Seed initial LED frame immediately so hardware shows stopped sequencer state.
     {
         sp1_led_frame_t init_leds{};
         sp1_ui_mapper_render_leds(&g_ui_mapper, &g_sequencer, 0U, &init_leds);
@@ -326,6 +326,7 @@ static bool start_sp1_runtime(void) {
     if (g_main_wdt_channel >= 0) {
         core::watchdog::feed(g_main_wdt_channel);
     }
+    core::watchdog::feed();
 
     bool audio_active = false;
     if (sp1_hal_audio_init(sp1_audio_render_cb, nullptr) < 0) {
@@ -342,6 +343,7 @@ static bool start_sp1_runtime(void) {
     if (g_main_wdt_channel >= 0) {
         core::watchdog::feed(g_main_wdt_channel);
     }
+    core::watchdog::feed();
     return audio_active;
 }
 

@@ -132,6 +132,23 @@ static bool tas2505_read_reg(const struct device *dev, uint8_t page, uint8_t reg
 	return true;
 }
 
+/* Map logical volume 0..127 -> TAS2505 Page 1 Reg 46 (SPK_VOL):
+ *   0       -> 0x7F (hardware mute / disconnected)
+ *   1..127  -> -42.0 dB .. 0.0 dB (64 -> 0x2A = -21.0 dB).
+ * TAS2505 uses 0.5 dB/step from 0x00..0x48 (0..-36 dB) and 1.0 dB/step above 0x48. */
+static uint8_t tas2505_volume_to_reg(int vol_0_to_127)
+{
+	if (vol_0_to_127 <= 0) {
+		return 0x7FU;
+	}
+	const uint32_t clamped = (vol_0_to_127 >= 127) ? 127U : (uint32_t)vol_0_to_127;
+	const uint32_t atten_half_db = ((127U - clamped) * 84U + 63U) / 126U;
+	if (atten_half_db <= 72U) {
+		return (uint8_t)atten_half_db;
+	}
+	return (uint8_t)(72U + ((atten_half_db - 72U) / 2U));
+}
+
 static bool tas2505_set_volume_raw(const struct device *dev, uint8_t volume)
 {
 	struct tas2505_data *const data = dev->data;
@@ -145,13 +162,13 @@ static bool tas2505_set_mute_raw(const struct device *dev, bool mute)
 	struct tas2505_data *const data = dev->data;
 
 	tas2505_reset_page_cache(data);
-	if (mute) {
+	if (mute || data->volume >= 0x7FU) {
 		return tas2505_write_reg(dev, 1, 46, 0x7F) &&
 		       tas2505_write_reg(dev, 0, 63, 0x30) &&
 		       tas2505_write_reg(dev, 1, 45, 0x00);
 	}
 
-	return tas2505_write_reg(dev, 1, 46, 0x00) &&
+	return tas2505_write_reg(dev, 1, 46, data->volume) &&
 	       tas2505_write_reg(dev, 1, 48, 0x50) &&
 	       tas2505_write_reg(dev, 1, 45, 0x02) &&
 	       tas2505_write_reg(dev, 0, 63, 0xB0) &&
@@ -243,9 +260,6 @@ static int tas2505_configure(const struct device *dev, struct audio_codec_cfg *c
 
 	data->configured = true;
 	data->muted = true;
-	if (!tas2505_set_volume_raw(dev, data->volume)) {
-		return -EIO;
-	}
 	if (!tas2505_set_mute_raw(dev, data->muted)) {
 		return -EIO;
 	}
@@ -301,12 +315,30 @@ static int tas2505_set_property(const struct device *dev,
 		data->muted = val.mute;
 		return 0;
 
-	case AUDIO_PROPERTY_OUTPUT_VOLUME:
-		if (!tas2505_set_volume_raw(dev, (uint8_t)val.vol)) {
+	case AUDIO_PROPERTY_OUTPUT_VOLUME: {
+		const uint8_t prev_vol = data->volume;
+		const uint8_t reg = tas2505_volume_to_reg(val.vol);
+		data->volume = reg;
+		if (data->muted) {
+			return 0;
+		}
+		if (reg >= 0x7FU) {
+			if (!tas2505_set_mute_raw(dev, true)) {
+				return -EIO;
+			}
+			return 0;
+		}
+		if (prev_vol >= 0x7FU) {
+			if (!tas2505_set_mute_raw(dev, false)) {
+				return -EIO;
+			}
+			return 0;
+		}
+		if (!tas2505_set_volume_raw(dev, reg)) {
 			return -EIO;
 		}
-		data->volume = (uint8_t)val.vol;
 		return 0;
+	}
 
 	default:
 		return -ENOTSUP;
@@ -400,7 +432,7 @@ static int tas2505_init(const struct device *dev)
 	data->current_page = 0xFFU;
 	data->configured = false;
 	data->muted = true;
-	data->volume = 0x7FU;
+	data->volume = tas2505_volume_to_reg(64);
 	data->error_cb = NULL;
 	return 0;
 }

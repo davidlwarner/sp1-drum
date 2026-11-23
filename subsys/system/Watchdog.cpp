@@ -176,6 +176,10 @@ void feed(int channel_id) {
     k_spinlock_key_t key = k_spin_lock(&channels_lock);
     if (channels[channel_id].active) {
         channels[channel_id].deadline_ms = now_ms + channels[channel_id].timeout_ms;
+        if (latched_expired_channel == channel_id) {
+            latched_expired_channel = -1;
+            last_expired_channel = -1;
+        }
     }
     k_spin_unlock(&channels_lock, key);
 }

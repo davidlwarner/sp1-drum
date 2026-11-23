@@ -62,6 +62,76 @@ jobs:
           cmake --build build-host-san --parallel
           ctest --test-dir build-host-san --output-on-failure
 
+      - name: Fatal-Handler Crash-Loop Regression Guard
+        run: |
+          python3 - <<'PY'
+          import re
+          import sys
+
+          SRC = "subsys/system/ResetBreadcrumbs.cpp"
+          CONF = "prj.conf"
+          FORBIDDEN = (
+              "arch_irq_unlock",
+              "irq_unlock",
+              "k_busy_wait",
+              "k_sleep",
+              "k_msleep",
+              "k_usleep",
+              "LOG_PANIC",
+          )
+
+          def strip_comments(text: str) -> str:
+              text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+              text = re.sub(r"//[^\n]*", "", text)
+              return text
+
+          def extract_fn_body(code: str, fn_name: str):
+              m = re.search(rf"\b{re.escape(fn_name)}\s*\([^;{{}}]*\)\s*\{{", code)
+              if not m:
+                  return None
+              depth = 1
+              pos = m.end()
+              while pos < len(code) and depth > 0:
+                  ch = code[pos]
+                  if ch == "{":
+                      depth += 1
+                  elif ch == "}":
+                      depth -= 1
+                  pos += 1
+              return code[m.start():pos]
+
+          with open(SRC, "r", encoding="utf-8") as f:
+              code = strip_comments(f.read())
+
+          fatal_body = extract_fn_body(code, "k_sys_fatal_error_handler")
+          if fatal_body is None:
+              sys.exit(f"FAIL: k_sys_fatal_error_handler() not found in {SRC}")
+
+          checked = [("k_sys_fatal_error_handler", fatal_body)]
+          helper_body = extract_fn_body(code, "handle_fatal_error")
+          if helper_body is not None:
+              checked.append(("handle_fatal_error", helper_body))
+
+          violations = []
+          for name, body in checked:
+              for sym in FORBIDDEN:
+                  if re.search(rf"\b{re.escape(sym)}\b", body):
+                      violations.append(f"{name}() calls forbidden symbol '{sym}'")
+
+          with open(CONF, "r", encoding="utf-8") as f:
+              for lineno, line in enumerate(f, start=1):
+                  stripped = line.split("#", 1)[0].strip()
+                  if stripped == "CONFIG_LOG_MODE_IMMEDIATE=y":
+                      violations.append(f"{CONF}:{lineno} enables CONFIG_LOG_MODE_IMMEDIATE=y")
+
+          if violations:
+              for v in violations:
+                  print(f"FAIL: {v}")
+              sys.exit(1)
+
+          print("Fatal-handler crash-loop regression guard: PASS")
+          PY
+
   arm-firmware:
     name: ARM Firmware (stem_player) & Anti-Brick Gate
     runs-on: ubuntu-24.04

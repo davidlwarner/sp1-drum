@@ -20,6 +20,11 @@ constexpr int64_t kBootReportDelayMs = 2500; // delay in STATE_RUNNING for USB-C
 
 void feed(AppMachine& m) {
     core::watchdog::feed(m.main_watchdog_channel);
+    if (m.power != nullptr) {
+        m.power->feed_watchdog();
+    } else {
+        core::watchdog::feed();
+    }
 }
 
 void render_wake_hold_progress(leds::Leds* leds, int64_t elapsed_ms) {
@@ -164,6 +169,10 @@ static void running_entry(void* o) {
         m.audio_active = m.start_runtime();
         m.runtime_started = true;
         m.applied_volume = SP1_UI_VOLUME_DEFAULT;
+        if (m.audio_active) {
+            sp1_hal_audio_set_volume(SP1_UI_VOLUME_DEFAULT);
+            sp1_hal_audio_service_routing();
+        }
         feed(m);
     }
     if (!m.boot_report_printed && m.boot_report_due_ms == 0 &&
@@ -222,6 +231,8 @@ static smf_state_result running_run(void* o) {
                 m.applied_volume = target_vol;
             }
         }
+
+        sp1_hal_audio_service_routing();
     } else if (m.seq != nullptr && m.ui != nullptr) {
         /* Fallback 50 Hz visual/control tick when I2S/codec init failed:
          * keeps all 8 PWM LEDs, Euclidean step playback, buttons, faders,

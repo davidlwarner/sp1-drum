@@ -101,6 +101,12 @@ void sp1_hal_audio_set_volume(uint8_t volume_0_to_127);
 void sp1_hal_audio_set_mute(bool muted);
 
 /**
+ * Poll 3.5 mm headphone jack insertion state (non-RT main thread) and route
+ * output exclusively to CS42L42 headphones or TAS2505 speaker at current volume.
+ */
+void sp1_hal_audio_service_routing(void);
+
+/**
  * Tear-free spinlock-guarded cycle telemetry accessors.
  */
 void sp1_hal_audio_record_cycles(uint32_t elapsed_cycles);

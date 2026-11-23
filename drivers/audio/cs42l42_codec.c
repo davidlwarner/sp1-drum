@@ -176,8 +176,8 @@ static const struct cs42l42_script_reg_write setup_script_route[] = {
 	{CS42L42_REG_ASP_FRM_CFG, 0x1A},
 	{CS42L42_REG_ASP_RX_CH1_AP_RES, 0x02},
 	{CS42L42_REG_ASP_RX_CH2_AP_RES, 0x42},
-	{CS42L42_REG_HP_VOL_A, 0x4C},
-	{CS42L42_REG_HP_VOL_B, 0x4C},
+	{CS42L42_REG_HP_VOL_A, 0x2A},
+	{CS42L42_REG_HP_VOL_B, 0x2A},
 	{CS42L42_REG_ASP_RX_ENABLE, 0x0C},
 	{CS42L42_REG_DAC_CTL, 0x01},
 	{CS42L42_REG_MIXER_CHA_VOL, 0x00},
@@ -401,6 +401,19 @@ static bool cs42l42_start_stream_script(const struct device *dev)
 	return true;
 }
 
+/* Map logical volume 0..127 -> CS42L42 HP_VOL (0.5 dB/step attenuation):
+ *   0       -> 0xFF (digital mute)
+ *   1..127  -> 84..0 (0x54 = -42.0 dB .. 0x00 = 0.0 dB); 64 -> 42 (0x2A = -21.0 dB). */
+static uint8_t cs42l42_volume_to_reg(int vol_0_to_127)
+{
+	if (vol_0_to_127 <= 0) {
+		return 0xFFU;
+	}
+	const uint32_t clamped = (vol_0_to_127 >= 127) ? 127U : (uint32_t)vol_0_to_127;
+	const uint32_t atten_half_db = ((127U - clamped) * 84U + 63U) / 126U;
+	return (uint8_t)atten_half_db;
+}
+
 static bool cs42l42_set_volume_raw(const struct device *dev, uint8_t volume)
 {
 	struct cs42l42_data *const data = dev->data;
@@ -413,10 +426,12 @@ static bool cs42l42_set_volume_raw(const struct device *dev, uint8_t volume)
 static bool cs42l42_set_mute_raw(const struct device *dev, bool mute)
 {
 	struct cs42l42_data *const data = dev->data;
+	const bool effective_mute = mute || (data->volume == 0xFFU);
 
 	cs42l42_reset_page_cache(data);
 	return cs42l42_write_reg(dev, CS42L42_REG_HP_CTL,
-				 mute ? CS42L42_MUTED_HP_CTL_VALUE : CS42L42_UNMUTED_HP_CTL_VALUE);
+				 effective_mute ? CS42L42_MUTED_HP_CTL_VALUE
+						: CS42L42_UNMUTED_HP_CTL_VALUE);
 }
 
 static int cs42l42_configure(const struct device *dev, struct audio_codec_cfg *cfg)
@@ -505,17 +520,31 @@ static int cs42l42_set_property(const struct device *dev,
 		data->muted = val.mute;
 		return 0;
 
-	case AUDIO_PROPERTY_OUTPUT_VOLUME:
+	case AUDIO_PROPERTY_OUTPUT_VOLUME: {
 		if (channel != AUDIO_CHANNEL_ALL &&
 		    channel != AUDIO_CHANNEL_HEADPHONE_LEFT &&
 		    channel != AUDIO_CHANNEL_HEADPHONE_RIGHT) {
 			return -ENOTSUP;
 		}
-		if (!cs42l42_set_volume_raw(dev, (uint8_t)val.vol)) {
+		const uint8_t prev_vol = data->volume;
+		const uint8_t reg = cs42l42_volume_to_reg(val.vol);
+		if (!cs42l42_set_volume_raw(dev, reg)) {
 			return -EIO;
 		}
-		data->volume = (uint8_t)val.vol;
+		data->volume = reg;
+		if (!data->muted) {
+			if (reg == 0xFFU) {
+				if (!cs42l42_set_mute_raw(dev, true)) {
+					return -EIO;
+				}
+			} else if (prev_vol == 0xFFU) {
+				if (!cs42l42_set_mute_raw(dev, false)) {
+					return -EIO;
+				}
+			}
+		}
 		return 0;
+	}
 
 	default:
 		return -ENOTSUP;
@@ -563,6 +592,10 @@ bool cs42l42_codec_is_headphone_connected(const struct device *dev)
 {
 	struct cs42l42_data *const data = dev->data;
 	uint8_t value = 0U;
+
+	if (!data->configured) {
+		return false;
+	}
 
 	cs42l42_reset_page_cache(data);
 	if (!cs42l42_read_reg(dev, CS42L42_REG_TSRS_PLUG_STATUS, &value)) {
@@ -634,7 +667,7 @@ static int cs42l42_init(const struct device *dev)
 	data->current_page = 0xFFU;
 	data->configured = false;
 	data->muted = true;
-	data->volume = 0x4CU;
+	data->volume = cs42l42_volume_to_reg(64);
 	data->error_cb = NULL;
 
 	return 0;

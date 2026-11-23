@@ -403,6 +403,10 @@ void sp1_hal_audio_set_mute(bool muted) {
     g_audio_muted = muted;
 }
 
+void sp1_hal_audio_service_routing(void) {
+    /* Host WAV backend has no physical headphone/speaker codecs to route. */
+}
+
 void sp1_hal_audio_record_cycles(uint32_t elapsed_cycles) {
     host_cycle_spin_lock();
     sp1_audio_cycle_stats_record(&g_host_cycle_stats, elapsed_cycles);

@@ -16,6 +16,8 @@
 
 #include <soc.h>
 
+#include "audio/cs42l42_codec.h"
+
 LOG_MODULE_REGISTER(sp1_hal, LOG_LEVEL_INF);
 
 /* ── Static Hardware Device Bindings (stem_player.dts / app.overlay) ─────── */
@@ -90,6 +92,9 @@ static uint32_t g_audio_running_flag = 0U;
 static bool g_audio_configured = false;
 static bool g_cs42l42_ready = false;
 static bool g_tas2505_ready = false;
+static uint8_t g_audio_volume = 64U;
+static bool g_audio_global_muted = false;
+static int8_t g_hp_routed_state = -1; /* -1 = unapplied, 0 = speaker, 1 = headphones */
 
 /* ── Hardware Watchdog Reload Helper (Safe Across Slow I2C Bring-Up) ─────── */
 
@@ -186,21 +191,26 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
         const uint32_t cyc_elapsed = sp1_dwt_cyccnt_read() - cyc_start;
         sp1_hal_audio_record_cycles(cyc_elapsed);
 
-        if (i2s_write(g_i2s_dev, dma_block, SP1_I2S_DMA_BLOCK_BYTES) < 0) {
+        const int write_err = i2s_write(g_i2s_dev, dma_block, SP1_I2S_DMA_BLOCK_BYTES);
+        if (write_err < 0) {
             k_mem_slab_free(&g_i2s_tx_slab, dma_block);
             k_spinlock_key_t key = k_spin_lock(&g_cycle_stats_lock);
             g_audio_cycle_stats.underrun_count += 1U;
             k_spin_unlock(&g_cycle_stats_lock, key);
 
-            /* Never spin tightly on I2S error: yield so main/WDT/USB stay responsive. */
-            k_msleep(2);
             consecutive_write_fails += 1U;
-            if (consecutive_write_fails >= 8U) {
-                consecutive_write_fails = 0U;
+            if (write_err == -EIO) {
+                /* I2S_STATE_ERROR: drop/prepare, pre-queue 2 silent slabs, and restart cleanly. */
                 (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
-                k_msleep(5);
+                (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_PREPARE);
                 sp1_i2s_prime_silent(2U);
-                (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
+                const int trig_err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
+                if (trig_err < 0 || consecutive_write_fails > 1U) {
+                    /* Yield on repeated errors so main/WDT/USB are never starved. */
+                    k_msleep(5);
+                }
+            } else {
+                k_msleep(2);
             }
             continue;
         }
@@ -359,6 +369,9 @@ int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
     g_audio_configured = false;
     g_cs42l42_ready = false;
     g_tas2505_ready = false;
+    g_audio_volume = 64U;
+    g_audio_global_muted = false;
+    g_hp_routed_state = -1;
     sp1_hal_audio_reset_cycle_stats();
 
     if (!device_is_ready(g_i2s_dev)) {
@@ -432,27 +445,76 @@ int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
     return 0;
 }
 
+static void sp1_audio_apply_routing(bool hp_connected) {
+    audio_property_value_t mute_on;
+    audio_property_value_t mute_off;
+    audio_property_value_t vol_val;
+    mute_on.mute = true;
+    mute_off.mute = false;
+    vol_val.vol = (int)g_audio_volume;
+
+    if (g_audio_global_muted) {
+        if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
+            (void)audio_codec_set_property(
+                g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_on);
+        }
+        if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
+            (void)audio_codec_set_property(
+                g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_on);
+        }
+        return;
+    }
+
+    if (hp_connected) {
+        /* Mute speaker first, then set volume & unmute CS42L42 headphones. */
+        if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
+            (void)audio_codec_set_property(
+                g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_on);
+        }
+        if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
+            (void)audio_codec_set_property(
+                g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_VOLUME, AUDIO_CHANNEL_ALL, vol_val);
+            (void)audio_codec_set_property(
+                g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_off);
+        }
+        LOG_INF("Audio route -> Headphones (CS42L42, vol=%u/127)", (unsigned)g_audio_volume);
+    } else {
+        /* Mute headphones first, then set volume & unmute TAS2505 speaker. */
+        if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
+            (void)audio_codec_set_property(
+                g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_on);
+        }
+        if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
+            (void)audio_codec_set_property(
+                g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_VOLUME, AUDIO_CHANNEL_ALL, vol_val);
+            (void)audio_codec_set_property(
+                g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_off);
+        }
+        LOG_INF("Audio route -> Speaker (TAS2505, vol=%u/127)", (unsigned)g_audio_volume);
+    }
+}
+
 int sp1_hal_audio_start(void) {
     if (!g_audio_configured) {
         return -EINVAL;
     }
 
+    /* Apply initial volume & headphone/speaker routing BEFORE starting I2S0 EasyDMA
+     * so I2C codec setup never delays the audio thread past the pre-queued TX slabs. */
+    sp1_hal_audio_set_volume(g_audio_volume);
+    g_hp_routed_state = -1;
+    sp1_hal_audio_service_routing();
+    sp1_wdt_feed_all();
+
     __atomic_store_n(&g_audio_running_flag, 1U, __ATOMIC_RELEASE);
 
-    /* Prime two silent DMA blocks before starting I2S0 EasyDMA. */
+    /* Pre-fill and queue two silent DMA TX slabs before triggering I2S0 START. */
     sp1_i2s_prime_silent(2U);
 
     const int err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
     if (err < 0) {
         __atomic_store_n(&g_audio_running_flag, 0U, __ATOMIC_RELEASE);
         return err;
-    }
-
-    if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
-        audio_codec_start_output(g_cs42l42_dev);
-    }
-    if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
-        audio_codec_start_output(g_tas2505_dev);
     }
 
     if (!g_audio_thread_created) {
@@ -468,6 +530,8 @@ int sp1_hal_audio_start(void) {
         (void)k_thread_name_set(&g_audio_thread_data, "sp1_audio");
     }
 
+    /* Yield immediately so sp1_audio fills the TX queue before the 2 primed slabs drain. */
+    k_yield();
     return 0;
 }
 
@@ -481,6 +545,7 @@ int sp1_hal_audio_stop(void) {
     if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
         audio_codec_stop_output(g_cs42l42_dev);
     }
+    g_hp_routed_state = -1;
     if (g_audio_configured && device_is_ready(g_i2s_dev)) {
         (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
     }
@@ -515,10 +580,12 @@ int sp1_hal_audio_submit_block(const int16_t *interleaved_stereo, uint32_t num_f
 
 void sp1_hal_audio_set_volume(uint8_t volume_0_to_127) {
     const uint8_t clamped = (volume_0_to_127 > 127U) ? 127U : volume_0_to_127;
-    /* CS42L42 (0x2601/0x2609) and TAS2505 (Page 1 Reg 46) use hardware attenuation
-     * registers where 0x00 = 0 dB full scale and 0x7F = max attenuation / mute. */
+    g_audio_volume = clamped;
+
+    /* Both CS42L42 and TAS2505 map logical 0..127 perceptually (0 = mute,
+     * 1..127 = -42 dB .. 0 dB, 64 = -21 dB) while preserving muted codec state. */
     audio_property_value_t val;
-    val.vol = (int)(127U - clamped);
+    val.vol = (int)clamped;
 
     if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
         (void)audio_codec_set_property(
@@ -531,17 +598,38 @@ void sp1_hal_audio_set_volume(uint8_t volume_0_to_127) {
 }
 
 void sp1_hal_audio_set_mute(bool muted) {
-    audio_property_value_t val;
-    val.mute = muted;
+    g_audio_global_muted = muted;
 
-    if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
-        (void)audio_codec_set_property(
-            g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, val);
+    if (muted) {
+        audio_property_value_t val;
+        val.mute = true;
+        if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
+            (void)audio_codec_set_property(
+                g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, val);
+        }
+        if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
+            (void)audio_codec_set_property(
+                g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, val);
+        }
+    } else {
+        g_hp_routed_state = -1;
+        sp1_hal_audio_service_routing();
     }
-    if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
-        (void)audio_codec_set_property(
-            g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, val);
+}
+
+void sp1_hal_audio_service_routing(void) {
+    if (!g_audio_configured || !g_cs42l42_ready || !device_is_ready(g_cs42l42_dev)) {
+        return;
     }
+
+    const bool hp_connected = cs42l42_codec_is_headphone_connected(g_cs42l42_dev);
+    const int8_t desired = hp_connected ? 1 : 0;
+    if (desired == g_hp_routed_state) {
+        return;
+    }
+
+    g_hp_routed_state = desired;
+    sp1_audio_apply_routing(hp_connected);
 }
 
 void sp1_hal_audio_record_cycles(uint32_t elapsed_cycles) {
