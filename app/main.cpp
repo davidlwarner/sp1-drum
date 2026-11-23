@@ -331,14 +331,11 @@ static bool start_sp1_runtime(void) {
     bool audio_active = false;
     if (sp1_hal_audio_init(sp1_audio_render_cb, nullptr) < 0) {
         LOG_WRN("SP-1 Audio HAL init failed; continuing with live UI/LEDs");
+    } else if (sp1_hal_audio_start() < 0) {
+        LOG_WRN("SP-1 Audio HAL start failed; continuing with live UI/LEDs");
     } else {
-        sp1_hal_audio_set_volume(SP1_UI_VOLUME_DEFAULT);
-        if (sp1_hal_audio_start() < 0) {
-            LOG_WRN("SP-1 Audio HAL start failed; continuing with live UI/LEDs");
-        } else {
-            audio_active = true;
-            LOG_INF("48 kHz I2S0 EasyDMA audio streaming active");
-        }
+        audio_active = true;
+        LOG_INF("48 kHz I2S0 EasyDMA audio streaming active");
     }
     if (g_main_wdt_channel >= 0) {
         core::watchdog::feed(g_main_wdt_channel);

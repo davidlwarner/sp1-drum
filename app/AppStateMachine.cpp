@@ -13,10 +13,12 @@ namespace app {
 namespace {
 
 constexpr int kPollCadenceMs = 20;
-constexpr int64_t kFnHoldPowerOnMs = 1500;   // 1.5 second hold to power on from SYSTEM_OFF
-constexpr int64_t kFnHoldShutdownMs = 3000;  // 3 second hold to shut down
-constexpr int64_t kFnReleaseStableMs = 30;   // debounce before sys_poweroff
-constexpr int64_t kBootReportDelayMs = 2500; // delay in STATE_RUNNING for USB-C CDC ACM enum
+constexpr int64_t kFnHoldPowerOnMs = 1500;    // 1.5 second hold to power on from SYSTEM_OFF
+constexpr int64_t kWakeHoldGraceMs = 60;      // 60 ms GPIO startup grace/debounce window
+constexpr int64_t kFnHoldShutdownMs = 3000;   // 3 second hold to shut down
+constexpr int64_t kFnReleaseStableMs = 30;    // debounce before sys_poweroff
+constexpr int64_t kBootReportDelayMs = 2500;  // delay in STATE_RUNNING for USB-C CDC ACM enum
+constexpr uint8_t kRoutingPollDividerTicks = 10U;  // 10 * 20 ms = 200 ms jack-detect poll
 
 void feed(AppMachine& m) {
     core::watchdog::feed(m.main_watchdog_channel);
@@ -34,8 +36,8 @@ void render_wake_hold_progress(leds::Leds* leds, int64_t elapsed_ms) {
     const int64_t clamped =
         (elapsed_ms < 0) ? 0 : ((elapsed_ms > kFnHoldPowerOnMs) ? kFnHoldPowerOnMs : elapsed_ms);
     uint32_t scaled = static_cast<uint32_t>((clamped * 1020) / kFnHoldPowerOnMs);
-    if (scaled < 24U) {
-        scaled = 24U;  // Instant dim spark on Play 1 to acknowledge press
+    if (scaled < 48U) {
+        scaled = 48U;  // Immediate visible Play 1 LED confirmation on wake
     }
     for (int i = 0; i < leds::kNumTrack; ++i) {
         leds->set_track(i, 0U);
@@ -107,9 +109,8 @@ static void idle_entry(void* o) {
         if (woke_from_off && !vbus_present) {
             m.wake_hold_required = true;
             m.wake_hold_start_ms = k_uptime_get();
-            if (m.leds != nullptr) {
-                m.leds->all_off();
-            }
+            // Immediately light Play 1 LED so user sees confirmation that Function woke the MCU.
+            render_wake_hold_progress(m.leds, 0);
             LOG_INF("SP-1 Drum Machine: SYSTEM_OFF GPIO wake — hold Function 1.5 s to power on");
             return;
         }
@@ -123,6 +124,12 @@ static smf_state_result idle_run(void* o) {
     feed(m);
 
     if (m.wake_hold_required) {
+        const int64_t elapsed_ms = k_uptime_get() - m.wake_hold_start_ms;
+        sp1_controls_snapshot_t wake_snap{};
+        sp1_hal_controls_poll(&wake_snap);
+        const bool hal_fn_pressed =
+            (wake_snap.buttons_down & SP1_BTN_BIT(SP1_BTN_FN)) != 0U;
+
         if (m.power != nullptr) {
             m.power->refresh_usb_power_state();
             if (m.power->is_external_power_present()) {
@@ -134,13 +141,13 @@ static smf_state_result idle_run(void* o) {
                 return SMF_EVENT_HANDLED;
             }
 
-            if (!m.power->function_button_pressed()) {
+            const bool gpio_fn_pressed = m.power->function_button_pressed();
+            if (elapsed_ms >= kWakeHoldGraceMs && !gpio_fn_pressed && !hal_fn_pressed) {
                 abort_wake_to_system_off(m);
                 return SMF_EVENT_HANDLED;
             }
         }
 
-        const int64_t elapsed_ms = k_uptime_get() - m.wake_hold_start_ms;
         render_wake_hold_progress(m.leds, elapsed_ms);
 
         if (elapsed_ms >= kFnHoldPowerOnMs) {
@@ -169,10 +176,8 @@ static void running_entry(void* o) {
         m.audio_active = m.start_runtime();
         m.runtime_started = true;
         m.applied_volume = SP1_UI_VOLUME_DEFAULT;
-        if (m.audio_active) {
-            sp1_hal_audio_set_volume(SP1_UI_VOLUME_DEFAULT);
-            sp1_hal_audio_service_routing();
-        }
+        m.routing_initialized = false;
+        m.routing_poll_ticks = 0U;
         feed(m);
     }
     if (!m.boot_report_printed && m.boot_report_due_ms == 0 &&
@@ -203,6 +208,20 @@ static smf_state_result running_run(void* o) {
     }
 
     if (m.audio_active) {
+        if (!m.routing_initialized) {
+            m.routing_initialized = true;
+            m.routing_poll_ticks = 0U;
+            sp1_hal_audio_set_volume(SP1_UI_VOLUME_DEFAULT);
+            m.applied_volume = SP1_UI_VOLUME_DEFAULT;
+            sp1_hal_audio_service_routing();
+        } else {
+            m.routing_poll_ticks++;
+            if (m.routing_poll_ticks >= kRoutingPollDividerTicks) {
+                m.routing_poll_ticks = 0U;
+                sp1_hal_audio_service_routing();
+            }
+        }
+
         if (m.led_track_packed != nullptr && m.led_play_packed != nullptr) {
             const uint32_t track_w = __atomic_load_n(m.led_track_packed, __ATOMIC_ACQUIRE);
             const uint32_t play_w = __atomic_load_n(m.led_play_packed, __ATOMIC_ACQUIRE);
@@ -231,8 +250,6 @@ static smf_state_result running_run(void* o) {
                 m.applied_volume = target_vol;
             }
         }
-
-        sp1_hal_audio_service_routing();
     } else if (m.seq != nullptr && m.ui != nullptr) {
         /* Fallback 50 Hz visual/control tick when I2S/codec init failed:
          * keeps all 8 PWM LEDs, Euclidean step playback, buttons, faders,

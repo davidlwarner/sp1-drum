@@ -499,13 +499,6 @@ int sp1_hal_audio_start(void) {
         return -EINVAL;
     }
 
-    /* Apply initial volume & headphone/speaker routing BEFORE starting I2S0 EasyDMA
-     * so I2C codec setup never delays the audio thread past the pre-queued TX slabs. */
-    sp1_hal_audio_set_volume(g_audio_volume);
-    g_hp_routed_state = -1;
-    sp1_hal_audio_service_routing();
-    sp1_wdt_feed_all();
-
     __atomic_store_n(&g_audio_running_flag, 1U, __ATOMIC_RELEASE);
 
     /* Pre-fill and queue two silent DMA TX slabs before triggering I2S0 START. */
@@ -530,8 +523,6 @@ int sp1_hal_audio_start(void) {
         (void)k_thread_name_set(&g_audio_thread_data, "sp1_audio");
     }
 
-    /* Yield immediately so sp1_audio fills the TX queue before the 2 primed slabs drain. */
-    k_yield();
     return 0;
 }
 

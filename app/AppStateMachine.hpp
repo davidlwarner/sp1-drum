@@ -56,6 +56,10 @@ struct AppMachine {
     // One-shot delayed previous-boot crash breadcrumb report in STATE_RUNNING
     bool boot_report_printed = false;
     int64_t boot_report_due_ms = 0;
+
+    // Deferred first-tick codec volume/routing init and 200 ms jack-detect poll divider
+    bool routing_initialized = false;
+    uint8_t routing_poll_ticks = 0U;
 };
 
 extern const smf_state app_states[STATE_COUNT];
