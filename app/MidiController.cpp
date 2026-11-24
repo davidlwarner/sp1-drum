@@ -1,5 +1,6 @@
 #include "MidiController.hpp"
 #include "hal/sp1_hal.h"
+#include "system/ResetBreadcrumbs.hpp"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -70,22 +71,37 @@ void MidiController::send_mmc(uint8_t command) {
 }
 
 void MidiController::poll_faders() {
+    int16_t buf[kNumFaders] = {};
+    uint32_t channels_mask = 0U;
     for (int i = 0; i < kNumFaders; ++i) {
-        int16_t sample = 0;
-        struct adc_sequence seq = {};
-        (void)adc_sequence_init_dt(&fader_adc[i], &seq);
-        seq.buffer = &sample;
-        seq.buffer_size = sizeof(sample);
+        channels_mask |= BIT(fader_adc[i].channel_id);
+    }
 
-        const int ret = adc_read_dt(&fader_adc[i], &seq);
-        if (ret < 0) {
-            if (poll_count_ < 3) {
-                LOG_WRN("Fader %d ADC read failed: %d", i, ret);
-            }
-            continue;
+    struct adc_sequence seq = {};
+    (void)adc_sequence_init_dt(&fader_adc[0], &seq);
+    seq.channels = channels_mask;
+    seq.buffer = buf;
+    seq.buffer_size = sizeof(buf);
+
+    core::reset_breadcrumbs::mark_control_phase(0x21U);
+    const int ret = adc_read(fader_adc[0].dev, &seq);
+    if (ret < 0) {
+        if (poll_count_ < 3) {
+            LOG_WRN("Fader batch ADC read failed: %d", ret);
         }
+        ++poll_count_;
+        return;
+    }
 
-        sample = static_cast<int16_t>(std::clamp<int>(sample, 0, 0x0FF0));
+    /* Map SAADC hardware-channel-sorted buf[] back to fader indices 0..3. */
+    for (int i = 0; i < kNumFaders; ++i) {
+        int buf_idx = 0;
+        for (int j = 0; j < kNumFaders; ++j) {
+            if (fader_adc[j].channel_id < fader_adc[i].channel_id) {
+                ++buf_idx;
+            }
+        }
+        int16_t sample = static_cast<int16_t>(std::clamp<int>(buf[buf_idx], 0, 0x0FF0));
         sp1_hal_controls_on_fader_raw(static_cast<uint8_t>(i), sample);
 
         if (poll_count_ < 3) {
@@ -103,6 +119,7 @@ void MidiController::poll_faders() {
 
         if (cc_val != last_fader_cc[i]) {
             last_fader_cc[i] = cc_val;
+            core::reset_breadcrumbs::mark_control_phase(0x28U);
             send_cc(kCcFader1 + static_cast<uint8_t>(i), cc_val);
         }
     }
