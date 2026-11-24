@@ -203,18 +203,25 @@ static inline float render_kick_sample(sp1_kick_voice_t *v) {
     v->phase += sp1_hz_to_phase_inc(freq_hz);
 
     /* Transient phase-distortion punch (clamped < INT32_MAX) */
-    const uint32_t pd_offset = (uint32_t)((int32_t)(v->click_env * v->pd_depth_scale));
+    uint32_t pd_offset = 0U;
+    float click_chirp = 0.0f;
+    if (v->click_env > 0.0f) {
+        pd_offset = (uint32_t)((int32_t)(v->click_env * v->pd_depth_scale));
+        click_chirp = sp1_sine_lut((v->phase << 2U) + pd_offset) * v->click_env * 0.26f;
+    }
     const float sub_sine = sp1_sine_lut(v->phase + pd_offset);
     const float sub_tri = sp1_triangle_osc(v->phase);
-    const float click_chirp = sp1_sine_lut((v->phase << 2U) + pd_offset) * v->click_env * 0.26f;
 
     const float core = (sub_sine * 0.85f) + (sub_tri * 0.15f) + click_chirp;
     const float pre_drive = core * (1.15f + (v->drive_param * 1.15f));
 
     /* Blend division-free cubic tanh soft-clipper with West-Coast wavefolder LUT */
     const float sat = sp1_soft_clip(pre_drive);
-    const float folded = sp1_wavefold_lut(pre_drive * 0.75f);
-    const float shaped = sat + ((folded - sat) * (v->drive_param * 0.30f));
+    float shaped = sat;
+    if (v->drive_param > 0.01f) {
+        const float folded = sp1_wavefold_lut(pre_drive * 0.75f);
+        shaped = sat + ((folded - sat) * (v->drive_param * 0.30f));
+    }
 
     const float out = shaped * v->amp_env * v->velocity_gain;
 
@@ -299,19 +306,18 @@ static inline float render_hat_sample(sp1_hat_voice_t *v) {
         return 0.0f;
     }
 
-    /* Sum 6 square-wave oscillators tuned to inharmonic metallic ratios
-     * (205, 304, 369, 522, 540, 800 Hz) with upper harmonic edge taps (8x & 16x)
-     * so the resonant high-pass TPT SVF extracts crisp metallic shimmer. */
+    /* Sum 4 inharmonic metallic square-wave oscillators (205, 369, 522, 800 Hz)
+     * with upper harmonic edge tap (8x) for crisp metallic shimmer at <50% CPU. */
     int32_t metal_sum_i = 0;
-    for (uint32_t i = 0U; i < SP1_DSP_HAT_NUM_OSC; ++i) {
-        const uint32_t p = v->phase[i] + v->phase_inc[i];
-        v->phase[i] = p;
+    for (uint32_t i = 0U; i < 4U; ++i) {
+        const uint32_t idx = (i == 0U) ? 0U : ((i == 1U) ? 2U : ((i == 2U) ? 3U : 5U));
+        const uint32_t p = v->phase[idx] + v->phase_inc[idx];
+        v->phase[idx] = p;
         const int32_t sq_fund = ((int32_t)(p >> 31U) * 2) - 1;
         const int32_t sq_oct3 = ((int32_t)((p >> 28U) & 1U) * 2) - 1;
-        const int32_t sq_oct4 = ((int32_t)((p >> 27U) & 1U) * 2) - 1;
-        metal_sum_i += (sq_fund * 6) + (sq_oct3 * 9) + (sq_oct4 * 5);
+        metal_sum_i += (sq_fund * 4) + (sq_oct3 * 6);
     }
-    const float metal_sum = (float)metal_sum_i * 0.05f;
+    const float metal_sum = (float)metal_sum_i * 0.15f;
 
     const float air_noise = sp1_xorshift32_noise(&v->rng) * 0.35f;
     const float raw_mix = (metal_sum * 0.18f) + air_noise;
@@ -522,6 +528,21 @@ void sp1_drum_voices_render_block(sp1_drum_synth_t *synth,
                                   float *out_send_r,
                                   uint32_t num_frames) {
     if (synth == NULL || out_main_l == NULL || out_main_r == NULL || num_frames == 0U) {
+        return;
+    }
+
+    if (num_triggers == 0U &&
+        !synth->kick.active && !synth->snare.active &&
+        !synth->hat.active && !synth->perc.active) {
+        const size_t bytes = (size_t)num_frames * sizeof(float);
+        memset(out_main_l, 0, bytes);
+        memset(out_main_r, 0, bytes);
+        if (out_send_l != NULL) {
+            memset(out_send_l, 0, bytes);
+        }
+        if (out_send_r != NULL) {
+            memset(out_send_r, 0, bytes);
+        }
         return;
     }
 

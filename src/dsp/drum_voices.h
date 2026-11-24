@@ -161,12 +161,14 @@ static inline void sp1_svf_process(sp1_svf_t *f,
     f->ic1eq = (2.0f * v1) - f->ic1eq;
     f->ic2eq = (2.0f * v2) - f->ic2eq;
 
+#if !defined(__ARM_FP) || (__ARM_FP == 0)
     if (fabsf(f->ic1eq) < SP1_DSP_DENORMAL_FLOOR) {
         f->ic1eq = 0.0f;
     }
     if (fabsf(f->ic2eq) < SP1_DSP_DENORMAL_FLOOR) {
         f->ic2eq = 0.0f;
     }
+#endif
 
     if (lp != NULL) {
         *lp = v2;
