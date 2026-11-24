@@ -7,6 +7,8 @@ description: Verified hardware map for the Teenage Engineering Stem Player SP-1 
 
 Use this skill whenever writing or debugging SP-1 hardware abstraction code (`src/hal/`), Devicetree overlays, Kconfig options, or flashing procedures. All pinouts and register facts below are verified against `boards/teenageengineering/stem_player/stem_player.dts`, `stem_player-pinctrl.dtsi`, `reference/SP-1-dev/src/stemplayer_pins.h`, `reference/Wakes/`, and `reference/sp1-tape-looper/`.
 
+> **Companion Skill:** For deeper SP-1 community reverse-engineering context, accuracy guardrails (`hallucination-watchlist.md`, `corrections.md`, `working-confirmed.md`), and subsystem notes (codecs, power/BQ24232, eMMC, `solderless.engineering` bootloader protocol), see [`sp1-knowledgebase`](../sp1-knowledgebase/SKILL.md).
+
 ## 1. SoC & Memory Map (Nordic nRF52840 QIAA)
 
 - **CPU:** ARM Cortex-M4F @ 64 MHz with single-precision FPU (`CONFIG_FPU=y`, `CONFIG_FPU_SHARING=y`, `CONFIG_NRF_ENABLE_ICACHE=y`).
