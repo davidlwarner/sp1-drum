@@ -199,8 +199,13 @@ static inline float render_kick_sample(sp1_kick_voice_t *v) {
         return 0.0f;
     }
 
-    const float freq_hz = v->base_freq_hz + (v->pitch_span_hz * v->pitch_env);
-    v->phase += sp1_hz_to_phase_inc(freq_hz);
+    if (v->pitch_env > 0.0f) {
+        const float freq_hz = v->base_freq_hz + (v->pitch_span_hz * v->pitch_env);
+        v->phase += sp1_hz_to_phase_inc(freq_hz);
+    } else {
+        /* 45.0 Hz * (2^32 / 48000) = 4,026,532 */
+        v->phase += 4026532U;
+    }
 
     /* Transient phase-distortion punch (clamped < INT32_MAX) */
     uint32_t pd_offset = 0U;
@@ -311,18 +316,18 @@ static inline float render_hat_sample(sp1_hat_voice_t *v) {
         return 0.0f;
     }
 
-    /* Sum 4 inharmonic metallic square-wave oscillators (205, 369, 522, 800 Hz)
-     * with upper harmonic edge tap (8x) for crisp metallic shimmer at <50% CPU. */
+    /* Sum 3 inharmonic metallic square-wave oscillators (205, 522, 800 Hz)
+     * with upper harmonic edge tap (8x) for crisp metallic shimmer. */
     int32_t metal_sum_i = 0;
-    for (uint32_t i = 0U; i < 4U; ++i) {
-        const uint32_t idx = (i == 0U) ? 0U : ((i == 1U) ? 2U : ((i == 2U) ? 3U : 5U));
+    for (uint32_t i = 0U; i < 3U; ++i) {
+        const uint32_t idx = (i == 0U) ? 0U : ((i == 1U) ? 3U : 5U);
         const uint32_t p = v->phase[idx] + v->phase_inc[idx];
         v->phase[idx] = p;
         const int32_t sq_fund = ((int32_t)(p >> 31U) * 2) - 1;
         const int32_t sq_oct3 = ((int32_t)((p >> 28U) & 1U) * 2) - 1;
         metal_sum_i += (sq_fund * 4) + (sq_oct3 * 6);
     }
-    const float metal_sum = (float)metal_sum_i * 0.15f;
+    const float metal_sum = (float)metal_sum_i * 0.20f;
 
     const float air_noise = sp1_xorshift32_noise(&v->rng) * 0.35f;
     const float raw_mix = (metal_sum * 0.18f) + air_noise;

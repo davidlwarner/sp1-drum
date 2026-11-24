@@ -122,6 +122,7 @@ static void sp1_audio_render_cb(int16_t *interleaved_stereo,
         (num_frames > SP1_AUDIO_BLOCK_FRAMES) ? SP1_AUDIO_BLOCK_FRAMES : num_frames;
 
     const bool run_ctrl_tick = (g_audio_ctrl_decim == 0U);
+    const bool run_led_tick = (g_audio_ctrl_decim == 6U);
     g_audio_ctrl_decim++;
     if (g_audio_ctrl_decim >= kAudioCtrlDecimBlocks) {
         g_audio_ctrl_decim = 0U;
@@ -160,7 +161,7 @@ static void sp1_audio_render_cb(int16_t *interleaved_stereo,
                                                       SP1_SEQ_MAX_BLOCK_TRIGGERS);
     sp1_ui_mapper_on_triggers(&g_ui_mapper, triggers, trig_count);
 
-    if (run_ctrl_tick) {
+    if (run_led_tick) {
         sp1_led_frame_t led_frame{};
         sp1_ui_mapper_render_leds(&g_ui_mapper, &g_sequencer, kAudioCtrlCadenceMs, &led_frame);
         const uint32_t track_w =
