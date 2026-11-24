@@ -388,19 +388,21 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
         }
 
         /* 3. DJ-Style Resonant Cytomic TPT SVF Isolator */
-        float lp_l = 0.0f;
-        float hp_l = 0.0f;
-        float lp_r = 0.0f;
-        float hp_r = 0.0f;
-        sp1_svf_process(&fx->dj_svf_l, sig_l, &lp_l, NULL, &hp_l);
-        sp1_svf_process(&fx->dj_svf_r, sig_r, &lp_r, NULL, &hp_r);
+        if (dj_mode != 0) {
+            float lp_l = 0.0f;
+            float hp_l = 0.0f;
+            float lp_r = 0.0f;
+            float hp_r = 0.0f;
+            sp1_svf_process(&fx->dj_svf_l, sig_l, &lp_l, NULL, &hp_l);
+            sp1_svf_process(&fx->dj_svf_r, sig_r, &lp_r, NULL, &hp_r);
 
-        if (dj_mode < 0) {
-            sig_l = lp_l;
-            sig_r = lp_r;
-        } else if (dj_mode > 0) {
-            sig_l = hp_l;
-            sig_r = hp_r;
+            if (dj_mode < 0) {
+                sig_l = lp_l;
+                sig_r = lp_r;
+            } else {
+                sig_l = hp_l;
+                sig_r = hp_r;
+            }
         }
 
         /* 4. Zero-Order Hold Sample-Rate Decimator + Bitcrusher */

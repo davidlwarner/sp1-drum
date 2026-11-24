@@ -487,6 +487,10 @@ static smf_state_result deep_sleep_run(void* o) {
         m.soft_off_standby = false;
         m.runtime_started = false;
         m.routing_initialized = false;
+        if (core::reset_breadcrumbs::has_boot_report()) {
+            m.boot_report_printed = false;
+            m.boot_report_due_ms = k_uptime_get() + 500;
+        }
         m.fn_was_pressed = true;
         m.fn_hold_start_ms = 0;
         sp1_ui_power_hold_init(&m.power_hold, true);

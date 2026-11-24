@@ -218,7 +218,9 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
         }
 
         const uint32_t cyc_elapsed = sp1_dwt_cyccnt_read() - cyc_start;
-        sp1_hal_audio_record_cycles(cyc_elapsed);
+        const uint32_t cyc_per_96 =
+            (uint32_t)(((uint64_t)cyc_elapsed * SP1_AUDIO_BLOCK_FRAMES) / SP1_I2S_DMA_BLOCK_FRAMES);
+        sp1_hal_audio_record_cycles(cyc_per_96);
 
         const int write_err = i2s_write(g_i2s_dev, dma_block, SP1_I2S_DMA_BLOCK_BYTES);
         if (write_err < 0) {

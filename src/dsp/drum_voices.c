@@ -302,15 +302,16 @@ static inline float render_hat_sample(sp1_hat_voice_t *v) {
     /* Sum 6 square-wave oscillators tuned to inharmonic metallic ratios
      * (205, 304, 369, 522, 540, 800 Hz) with upper harmonic edge taps (8x & 16x)
      * so the resonant high-pass TPT SVF extracts crisp metallic shimmer. */
-    float metal_sum = 0.0f;
+    int32_t metal_sum_i = 0;
     for (uint32_t i = 0U; i < SP1_DSP_HAT_NUM_OSC; ++i) {
         const uint32_t p = v->phase[i] + v->phase_inc[i];
         v->phase[i] = p;
-        const float sq_fund = (p & 0x80000000U) ? 1.0f : -1.0f;
-        const float sq_oct3 = (p & 0x10000000U) ? 1.0f : -1.0f;
-        const float sq_oct4 = (p & 0x08000000U) ? 1.0f : -1.0f;
-        metal_sum += (sq_fund * 0.30f) + (sq_oct3 * 0.45f) + (sq_oct4 * 0.25f);
+        const int32_t sq_fund = ((int32_t)(p >> 31U) * 2) - 1;
+        const int32_t sq_oct3 = ((int32_t)((p >> 28U) & 1U) * 2) - 1;
+        const int32_t sq_oct4 = ((int32_t)((p >> 27U) & 1U) * 2) - 1;
+        metal_sum_i += (sq_fund * 6) + (sq_oct3 * 9) + (sq_oct4 * 5);
     }
+    const float metal_sum = (float)metal_sum_i * 0.05f;
 
     const float air_noise = sp1_xorshift32_noise(&v->rng) * 0.35f;
     const float raw_mix = (metal_sum * 0.18f) + air_noise;
