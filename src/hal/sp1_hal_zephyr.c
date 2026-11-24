@@ -7,7 +7,6 @@
 #include <zephyr/audio/codec.h>
 #include <zephyr/audio/midi.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/pwm.h>
@@ -281,6 +280,10 @@ static const char *sp1_button_name(sp1_button_id_t btn) {
     }
 }
 
+static int16_t g_fader_raw_latest[SP1_NUM_FADERS];
+static int8_t g_prev_ain0_btn = -1;
+static int8_t g_prev_ain1_btn = -1;
+
 int sp1_hal_controls_init(void) {
 #if defined(NRF_P1)
     /* Ensure P1.10 (BTN_COM) rail powering both resistor ladders and 4 faders is driven high. */
@@ -294,14 +297,24 @@ int sp1_hal_controls_init(void) {
     k_spinlock_key_t key = k_spin_lock(&g_controls_lock);
     for (uint32_t i = 0U; i < SP1_NUM_FADERS; ++i) {
         sp1_fader_filter_init(&g_fader_filters[i]);
+        g_fader_raw_latest[i] = 0;
     }
     sp1_controls_snapshot_init(&g_live_controls);
     sp1_controls_bus_init(&g_controls_bus);
     g_prev_polled_buttons_down = 0U;
     g_latched_pressed_buttons = 0U;
     g_latched_released_buttons = 0U;
+    g_prev_ain0_btn = -1;
+    g_prev_ain1_btn = -1;
     k_spin_unlock(&g_controls_lock, key);
     return 0;
+}
+
+int16_t sp1_hal_controls_get_fader_raw(uint8_t fader_idx) {
+    if (fader_idx >= SP1_NUM_FADERS) {
+        return 0;
+    }
+    return __atomic_load_n(&g_fader_raw_latest[fader_idx], __ATOMIC_ACQUIRE);
 }
 
 void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
@@ -881,6 +894,172 @@ uint32_t sp1_hal_time_ms(void) {
     return k_uptime_get_32();
 }
 
+#if defined(NRF_SAADC)
+static bool sp1_saadc_wait_event(volatile uint32_t *evt_reg, uint32_t timeout_us) {
+    for (uint32_t t = 0U; t < timeout_us; ++t) {
+        if (*evt_reg != 0U) {
+            return true;
+        }
+        k_busy_wait(1);
+    }
+    return false;
+}
+
+static int8_t sp1_decode_ain0_btn(int32_t mv) {
+    if (mv < 80) {
+        return -1;
+    }
+    static const struct {
+        int32_t mv;
+        sp1_button_id_t btn;
+    } k_ain0_keys[] = {
+        { 190,  SP1_BTN_TRACK_1 },
+        { 359,  SP1_BTN_TRACK_2 },
+        { 645,  SP1_BTN_TRACK_3 },
+        { 1073, SP1_BTN_TRACK_4 },
+        { 1604, SP1_BTN_PLAY },
+    };
+    int32_t best_diff = 100000;
+    int8_t best_btn = -1;
+    for (size_t i = 0U; i < (sizeof(k_ain0_keys) / sizeof(k_ain0_keys[0])); ++i) {
+        const int32_t diff = (mv >= k_ain0_keys[i].mv) ? (mv - k_ain0_keys[i].mv)
+                                                       : (k_ain0_keys[i].mv - mv);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_btn = (int8_t)k_ain0_keys[i].btn;
+        }
+    }
+    return best_btn;
+}
+
+static int8_t sp1_decode_ain1_btn(int32_t mv) {
+    if (mv < 150) {
+        return -1;
+    }
+    static const struct {
+        int32_t mv;
+        sp1_button_id_t btn;
+    } k_ain1_keys[] = {
+        { 358,  SP1_BTN_RWD },
+        { 647,  SP1_BTN_VOL_DOWN },
+        { 1076, SP1_BTN_FWD },
+        { 1606, SP1_BTN_VOL_UP },
+    };
+    int32_t best_diff = 100000;
+    int8_t best_btn = -1;
+    for (size_t i = 0U; i < (sizeof(k_ain1_keys) / sizeof(k_ain1_keys[0])); ++i) {
+        const int32_t diff = (mv >= k_ain1_keys[i].mv) ? (mv - k_ain1_keys[i].mv)
+                                                       : (k_ain1_keys[i].mv - mv);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_btn = (int8_t)k_ain1_keys[i].btn;
+        }
+    }
+    return best_btn;
+}
+
+static void sp1_saadc_scan_6ch(void) {
+    static const uint32_t k_pselp[6] = {
+        SAADC_CH_PSELP_PSELP_AnalogInput0, /* 0: AIN0 tracks */
+        SAADC_CH_PSELP_PSELP_AnalogInput1, /* 1: AIN1 volume */
+        SAADC_CH_PSELP_PSELP_AnalogInput2, /* 2: AIN2 fader3 */
+        SAADC_CH_PSELP_PSELP_AnalogInput3, /* 3: AIN3 fader1 */
+        SAADC_CH_PSELP_PSELP_AnalogInput6, /* 4: AIN6 fader2 */
+        SAADC_CH_PSELP_PSELP_AnalogInput7, /* 5: AIN7 fader4 */
+    };
+    static const uint32_t k_ch_cfg =
+        (SAADC_CH_CONFIG_RESP_Bypass << SAADC_CH_CONFIG_RESP_Pos) |
+        (SAADC_CH_CONFIG_RESN_Bypass << SAADC_CH_CONFIG_RESN_Pos) |
+        (SAADC_CH_CONFIG_GAIN_Gain1_4 << SAADC_CH_CONFIG_GAIN_Pos) |
+        (SAADC_CH_CONFIG_REFSEL_VDD1_4 << SAADC_CH_CONFIG_REFSEL_Pos) |
+        (SAADC_CH_CONFIG_TACQ_20us << SAADC_CH_CONFIG_TACQ_Pos) |
+        (SAADC_CH_CONFIG_MODE_SE << SAADC_CH_CONFIG_MODE_Pos) |
+        (SAADC_CH_CONFIG_BURST_Disabled << SAADC_CH_CONFIG_BURST_Pos);
+
+    int16_t buf[6] = { 0 };
+
+    NRF_SAADC->ENABLE = 0U;
+    NRF_SAADC->INTENCLR = 0xFFFFFFFFUL;
+    NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit;
+    NRF_SAADC->OVERSAMPLE = SAADC_OVERSAMPLE_OVERSAMPLE_Bypass;
+    NRF_SAADC->SAMPLERATE = 0U;
+
+    for (uint32_t ch = 0U; ch < 6U; ++ch) {
+        NRF_SAADC->CH[ch].PSELP = k_pselp[ch];
+        NRF_SAADC->CH[ch].PSELN = SAADC_CH_PSELN_PSELN_NC;
+        NRF_SAADC->CH[ch].CONFIG = k_ch_cfg;
+    }
+    for (uint32_t ch = 6U; ch < 8U; ++ch) {
+        NRF_SAADC->CH[ch].PSELP = SAADC_CH_PSELP_PSELP_NC;
+        NRF_SAADC->CH[ch].PSELN = SAADC_CH_PSELN_PSELN_NC;
+    }
+
+    NRF_SAADC->RESULT.PTR = (uint32_t)(uintptr_t)buf;
+    NRF_SAADC->RESULT.MAXCNT = 6U;
+    NRF_SAADC->EVENTS_STARTED = 0U;
+    NRF_SAADC->EVENTS_END = 0U;
+    NRF_SAADC->EVENTS_STOPPED = 0U;
+    NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Enabled;
+
+    NRF_SAADC->TASKS_START = 1U;
+    const bool started = sp1_saadc_wait_event(&NRF_SAADC->EVENTS_STARTED, 1000U);
+    bool ended = false;
+    if (started) {
+        NRF_SAADC->TASKS_SAMPLE = 1U;
+        ended = sp1_saadc_wait_event(&NRF_SAADC->EVENTS_END, 1500U);
+    }
+    NRF_SAADC->TASKS_STOP = 1U;
+    (void)sp1_saadc_wait_event(&NRF_SAADC->EVENTS_STOPPED, 500U);
+    NRF_SAADC->ENABLE = 0U;
+
+    if (!ended) {
+        return;
+    }
+
+    /* Update 4 faders: fader0=AIN3(buf[3]), fader1=AIN6(buf[4]), fader2=AIN2(buf[2]), fader3=AIN7(buf[5]) */
+    const int16_t raw_faders[SP1_NUM_FADERS] = { buf[3], buf[4], buf[2], buf[5] };
+    for (uint8_t i = 0U; i < SP1_NUM_FADERS; ++i) {
+        int16_t s = raw_faders[i];
+        if (s < 0) {
+            s = 0;
+        } else if (s > 0x0FF0) {
+            s = 0x0FF0;
+        }
+        __atomic_store_n(&g_fader_raw_latest[i], s, __ATOMIC_RELEASE);
+        sp1_hal_controls_on_fader_raw(i, s);
+    }
+
+    /* Decode AIN0 (tracks + Play) and AIN1 (RWD/Vol-/FWD/Vol+) */
+    const int32_t ain0_mv = (buf[0] <= 0) ? 0 : (((int32_t)buf[0] * 3300) / 4096);
+    const int32_t ain1_mv = (buf[1] <= 0) ? 0 : (((int32_t)buf[1] * 3300) / 4096);
+
+    const int8_t cur_ain0 = sp1_decode_ain0_btn(ain0_mv);
+    if (cur_ain0 != g_prev_ain0_btn) {
+        if (g_prev_ain0_btn >= 0) {
+            sp1_hal_controls_on_button_event((sp1_button_id_t)g_prev_ain0_btn, false);
+        }
+        if (cur_ain0 >= 0) {
+            sp1_hal_controls_on_button_event((sp1_button_id_t)cur_ain0, true);
+        }
+        g_prev_ain0_btn = cur_ain0;
+    }
+
+    const int8_t cur_ain1 = sp1_decode_ain1_btn(ain1_mv);
+    if (cur_ain1 != g_prev_ain1_btn) {
+        if (g_prev_ain1_btn >= 0) {
+            sp1_hal_controls_on_button_event((sp1_button_id_t)g_prev_ain1_btn, false);
+        }
+        if (cur_ain1 >= 0) {
+            sp1_hal_controls_on_button_event((sp1_button_id_t)cur_ain1, true);
+        }
+        g_prev_ain1_btn = cur_ain1;
+    }
+}
+#endif
+
 void sp1_hal_service_background(void) {
+#if defined(NRF_SAADC)
+    sp1_saadc_scan_6ch();
+#endif
     sp1_hal_midi_flush_tx();
 }

@@ -70,63 +70,11 @@ void MidiController::send_mmc(uint8_t command) {
     }
 }
 
-namespace {
-midi::MidiController* g_fader_ctrl = nullptr;
-struct k_work_delayable g_fader_adc_work;
-
-void fader_adc_work_handler(struct k_work* work) {
-    ARG_UNUSED(work);
-    midi::MidiController* ctrl = g_fader_ctrl;
-    if (ctrl != nullptr) {
-        int16_t buf[midi::kNumFaders] = {};
-        uint32_t channels_mask = 0U;
-        for (int i = 0; i < midi::kNumFaders; ++i) {
-            channels_mask |= BIT(ctrl->fader_adc[i].channel_id);
-        }
-
-        struct adc_sequence seq = {};
-        (void)adc_sequence_init_dt(&ctrl->fader_adc[0], &seq);
-        seq.channels = channels_mask;
-        seq.buffer = buf;
-        seq.buffer_size = sizeof(buf);
-
-        const int ret = adc_read(ctrl->fader_adc[0].dev, &seq);
-        if (ret == 0) {
-            for (int i = 0; i < midi::kNumFaders; ++i) {
-                int buf_idx = 0;
-                for (int j = 0; j < midi::kNumFaders; ++j) {
-                    if (ctrl->fader_adc[j].channel_id < ctrl->fader_adc[i].channel_id) {
-                        ++buf_idx;
-                    }
-                }
-                const int16_t sample = static_cast<int16_t>(std::clamp<int>(buf[buf_idx], 0, 0x0FF0));
-                ctrl->latest_fader_raw[i].store(sample, std::memory_order_relaxed);
-            }
-            ctrl->fader_samples_ready.store(true, std::memory_order_release);
-        }
-    }
-    (void)k_work_schedule(&g_fader_adc_work, K_MSEC(20));
-}
-}  // namespace
-
 void MidiController::poll_faders() {
-    if (!fader_work_started_) {
-        fader_work_started_ = true;
-        g_fader_ctrl = this;
-        k_work_init_delayable(&g_fader_adc_work, fader_adc_work_handler);
-        (void)k_work_schedule(&g_fader_adc_work, K_NO_WAIT);
-        return;
-    }
-
-    if (!fader_samples_ready.load(std::memory_order_acquire)) {
-        return;
-    }
-
     for (int i = 0; i < kNumFaders; ++i) {
-        const int16_t sample = latest_fader_raw[i].load(std::memory_order_relaxed);
-        sp1_hal_controls_on_fader_raw(static_cast<uint8_t>(i), sample);
+        const int16_t sample = sp1_hal_controls_get_fader_raw(static_cast<uint8_t>(i));
 
-        if (poll_count_ < 3) {
+        if (poll_count_ == 1) {
             LOG_INF("Fader %d: raw=%d cc=%d", i, sample, sample >> 5);
         }
 

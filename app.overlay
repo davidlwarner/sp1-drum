@@ -24,15 +24,7 @@
 	};
 };
 
-/* Enable button input drivers (disabled by default in board DTS) */
-&adc_keys_transport {
-	status = "okay";
-};
-
-&adc_keys_track {
-	status = "okay";
-};
-
+/* GPIO Function button input driver (AIN0/AIN1/faders are scanned via bounded NRF_SAADC) */
 &buttons {
 	status = "okay";
 };

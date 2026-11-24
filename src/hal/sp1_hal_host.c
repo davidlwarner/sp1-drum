@@ -203,6 +203,13 @@ void sp1_hal_controls_on_fader_raw(uint8_t fader_idx, int16_t raw_sample) {
     }
 }
 
+int16_t sp1_hal_controls_get_fader_raw(uint8_t fader_idx) {
+    if (fader_idx >= SP1_NUM_FADERS) {
+        return 0;
+    }
+    return (int16_t)g_live_controls.fader_raw[fader_idx];
+}
+
 void sp1_hal_controls_poll(sp1_controls_snapshot_t *out_snapshot) {
     sp1_controls_snapshot_t snap;
     sp1_controls_bus_read(&g_controls_bus, &snap);

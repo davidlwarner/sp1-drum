@@ -1,6 +1,5 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/input/input.h>
@@ -81,13 +80,6 @@ static struct usbd_context *init_usb(void) {
 
 #define USB_MIDI_DT_NODE DT_NODELABEL(usb_midi)
 static const struct device *const midi_dev = DEVICE_DT_GET(USB_MIDI_DT_NODE);
-
-// ── Fader ADC channels ──────────────────────────────────────────
-
-static const struct adc_dt_spec fader1_adc = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), fader1);
-static const struct adc_dt_spec fader2_adc = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), fader2);
-static const struct adc_dt_spec fader3_adc = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), fader3);
-static const struct adc_dt_spec fader4_adc = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), fader4);
 
 // ── Globals ─────────────────────────────────────────────────────
 
@@ -379,18 +371,9 @@ int main(void) {
 
     LOG_INF("SP-1 Euclidean Drum Machine Booting...");
 
-    // ── Fader ADC ───────────────────────────────────────────────
-    for (const auto* spec : {&fader1_adc, &fader2_adc, &fader3_adc, &fader4_adc}) {
-        if (adc_is_ready_dt(spec)) {
-            adc_channel_setup_dt(spec);
-        }
-    }
-    core::watchdog::feed(main_wdt);
-
     // ── MIDI controller (register ops before enabling USB) ──────
     g_midi.midi_dev = midi_dev;
     g_midi.track_led_pwm = nullptr;
-    g_midi.fader_adc = {fader1_adc, fader2_adc, fader3_adc, fader4_adc};
 
     if (device_is_ready(midi_dev)) {
         usbd_midi_set_ops(midi_dev, &midi_ops);

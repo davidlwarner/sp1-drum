@@ -1,7 +1,6 @@
 #pragma once
 
 #include <zephyr/device.h>
-#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/usb/class/usbd_midi2.h>
 #include <zephyr/audio/midi.h>
@@ -57,12 +56,6 @@ struct MidiController {
     std::atomic<bool> ready{false};
     int64_t tx_backoff_until_ms_ = 0;
     uint32_t poll_count_ = 0;
-
-    // ADC specs for the 4 faders (sampled on sysworkq to avoid multi-thread SAADC contention)
-    std::array<adc_dt_spec, kNumFaders> fader_adc{};
-    std::array<std::atomic<int16_t>, kNumFaders> latest_fader_raw{};
-    std::atomic<bool> fader_samples_ready{false};
-    bool fader_work_started_ = false;
 
     void send_cc(uint8_t cc, uint8_t value);
     void send_note(uint8_t note, bool on, uint8_t velocity = 127);
