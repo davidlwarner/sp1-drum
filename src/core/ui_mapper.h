@@ -142,6 +142,36 @@ void sp1_ui_mapper_render_leds(sp1_ui_mapper_t *ui,
 sp1_ui_modifier_t sp1_ui_mapper_active_modifier(const sp1_ui_mapper_t *ui);
 uint8_t sp1_ui_mapper_focused_track(const sp1_ui_mapper_t *ui);
 
+/* ── Function (P0.27) Power Hold & Release-Bounce Debounce State ─────────── */
+
+#define SP1_UI_POWER_HOLD_SHUTDOWN_MS       3000U   /* 3.0 s Function hold to power off */
+#define SP1_UI_POWER_HOLD_WAKE_MS           1500U   /* 1.5 s Function hold to power on */
+#define SP1_UI_POWER_RELEASE_DEBOUNCE_MS    40U     /* 40 ms release debounce against P0.27 bounce */
+
+typedef struct {
+    uint32_t hold_elapsed_ms;
+    uint32_t release_bounce_ms;
+    bool holding;
+    bool wait_for_release;
+} sp1_ui_power_hold_t;
+
+void sp1_ui_power_hold_init(sp1_ui_power_hold_t *state, bool wait_for_initial_release);
+
+/**
+ * Advance debounced Function (P0.27) long-press hold detector by dt_ms.
+ *  - When wait_for_release is true (e.g. immediately after powering on while Function is
+ *    still held), requires Function to be continuously released for >= release_debounce_ms
+ *    before a new hold can arm.
+ *  - While holding, contact-bounce dropouts shorter than release_debounce_ms (~40 ms)
+ *    do not reset hold_elapsed_ms.
+ *  - Returns true once hold_elapsed_ms >= target_hold_ms.
+ */
+bool sp1_ui_power_hold_update(sp1_ui_power_hold_t *state,
+                              bool fn_pressed,
+                              uint32_t dt_ms,
+                              uint32_t target_hold_ms,
+                              uint32_t release_debounce_ms);
+
 #ifdef __cplusplus
 }
 #endif

@@ -257,7 +257,7 @@ static bool map_input_key_to_sp1_btn(uint16_t code, sp1_button_id_t *out) {
 }
 
 static void on_input_event(struct input_event *evt, void*) {
-    if (evt == nullptr || evt->type != INPUT_EV_KEY) {
+    if (evt == nullptr || evt->type != INPUT_EV_KEY || evt->code == INPUT_KEY_RESERVED) {
         return;
     }
 

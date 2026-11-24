@@ -257,8 +257,8 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
         }
     }
 
-    /* 1. Play button: transport toggle ONLY (never a modifier; ignored if shift held). */
-    if ((pressed & SP1_BTN_BIT(SP1_BTN_PLAY)) != 0U && !any_valid_shift) {
+    /* 1. Play button: transport toggle ONLY (never a modifier; ignored only if Function held). */
+    if ((pressed & SP1_BTN_BIT(SP1_BTN_PLAY)) != 0U && !fn_held) {
         if (sp1_seq_is_running(seq)) {
             sp1_seq_stop(seq);
         } else {
@@ -270,7 +270,10 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
      *    - RWD / FWD (unshifted tap, no fader/chord used): Fine Master BPM (-2 / +2 BPM, 60..180)
      *    - Function + RWD / FWD:                           Coarse Master BPM (-10 / +10 BPM, 60..180)
      *    - Function + Vol- / Vol+:                         Global Swing (-2% / +2%, 50%..66%)
-     *    - Vol- / Vol+ (unshifted tap):                    Master Output Volume (0..127, step +/-8) */
+     *    - Vol- / Vol+ (unshifted tap):                    Master Output Volume (0..127, step +/-8)
+     *      Note: Vol-/Vol+ share the single-press AIN1 resistor ladder with RWD/FWD, so
+     *      releasing Vol+/Vol- must not be suppressed if the decaying ladder voltage
+     *      briefly transits RWD/FWD (and any such transient RWD/FWD bit is marked consumed). */
     if (ui->active_mod == SP1_UI_MOD_FN) {
         if ((pressed & SP1_BTN_BIT(SP1_BTN_RWD)) != 0U) {
             adjust_bpm_clamped(seq, -(int32_t)SP1_UI_BPM_COARSE_STEP_X100);
@@ -289,6 +292,34 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
             ui->btn_consumed_mask |= SP1_BTN_BIT(SP1_BTN_VOL_UP);
         }
     } else if (!play_held && !fn_held) {
+        const bool vol_up_pressed =
+            (pressed & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U &&
+            (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_VOL_UP)) == 0U;
+        const bool vol_up_released =
+            (released & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U &&
+            (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_VOL_UP)) == 0U;
+        const bool vol_down_released =
+            (released & SP1_BTN_BIT(SP1_BTN_VOL_DOWN)) != 0U &&
+            (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_VOL_DOWN)) == 0U;
+
+        if (((pressed | released) &
+             (SP1_BTN_BIT(SP1_BTN_VOL_UP) | SP1_BTN_BIT(SP1_BTN_VOL_DOWN))) != 0U) {
+            /* Suppress any transient RWD/FWD sample on the shared AIN1 ladder during Vol+/Vol- rise/fall. */
+            ui->btn_consumed_mask |= (uint16_t)(SP1_BTN_BIT(SP1_BTN_RWD) |
+                                                SP1_BTN_BIT(SP1_BTN_FWD));
+        }
+
+        if (vol_up_pressed) {
+            adjust_volume_clamped(ui, (int32_t)SP1_UI_VOLUME_STEP);
+            ui->btn_consumed_mask |= SP1_BTN_BIT(SP1_BTN_VOL_UP);
+        } else if (vol_up_released) {
+            adjust_volume_clamped(ui, (int32_t)SP1_UI_VOLUME_STEP);
+        }
+
+        if (vol_down_released) {
+            adjust_volume_clamped(ui, -(int32_t)SP1_UI_VOLUME_STEP);
+        }
+
         if ((released & SP1_BTN_BIT(SP1_BTN_RWD)) != 0U &&
             (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_RWD)) == 0U) {
             adjust_bpm_clamped(seq, -(int32_t)SP1_UI_BPM_FINE_STEP_X100);
@@ -296,16 +327,6 @@ void sp1_ui_mapper_update(sp1_ui_mapper_t *ui,
         if ((released & SP1_BTN_BIT(SP1_BTN_FWD)) != 0U &&
             (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_FWD)) == 0U) {
             adjust_bpm_clamped(seq, (int32_t)SP1_UI_BPM_FINE_STEP_X100);
-        }
-        if (ui->active_mod == SP1_UI_MOD_NONE) {
-            if ((released & SP1_BTN_BIT(SP1_BTN_VOL_DOWN)) != 0U &&
-                (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_VOL_DOWN)) == 0U) {
-                adjust_volume_clamped(ui, -(int32_t)SP1_UI_VOLUME_STEP);
-            }
-            if ((released & SP1_BTN_BIT(SP1_BTN_VOL_UP)) != 0U &&
-                (ui->btn_consumed_mask & SP1_BTN_BIT(SP1_BTN_VOL_UP)) == 0U) {
-                adjust_volume_clamped(ui, (int32_t)SP1_UI_VOLUME_STEP);
-            }
         }
     }
 
@@ -629,4 +650,66 @@ sp1_ui_modifier_t sp1_ui_mapper_active_modifier(const sp1_ui_mapper_t *ui) {
 
 uint8_t sp1_ui_mapper_focused_track(const sp1_ui_mapper_t *ui) {
     return (ui != NULL) ? ui->focused_track : 0U;
+}
+
+void sp1_ui_power_hold_init(sp1_ui_power_hold_t *state, bool wait_for_initial_release) {
+    if (state == NULL) {
+        return;
+    }
+    state->hold_elapsed_ms = 0U;
+    state->release_bounce_ms = 0U;
+    state->holding = false;
+    state->wait_for_release = wait_for_initial_release;
+}
+
+bool sp1_ui_power_hold_update(sp1_ui_power_hold_t *state,
+                              bool fn_pressed,
+                              uint32_t dt_ms,
+                              uint32_t target_hold_ms,
+                              uint32_t release_debounce_ms) {
+    if (state == NULL) {
+        return false;
+    }
+
+    if (state->wait_for_release) {
+        if (fn_pressed) {
+            state->release_bounce_ms = 0U;
+        } else {
+            state->release_bounce_ms += dt_ms;
+            if (state->release_bounce_ms >= release_debounce_ms) {
+                state->wait_for_release = false;
+                state->holding = false;
+                state->hold_elapsed_ms = 0U;
+                state->release_bounce_ms = 0U;
+            }
+        }
+        return false;
+    }
+
+    if (fn_pressed) {
+        if (!state->holding) {
+            state->holding = true;
+            state->hold_elapsed_ms = 0U;
+            state->release_bounce_ms = 0U;
+        } else {
+            if (state->release_bounce_ms > 0U) {
+                /* Contact bounce recovered before release_debounce_ms expired:
+                 * credit the elapsed time rather than resetting the hold counter. */
+                state->hold_elapsed_ms += state->release_bounce_ms;
+                state->release_bounce_ms = 0U;
+            }
+            state->hold_elapsed_ms += dt_ms;
+        }
+        return (state->hold_elapsed_ms >= target_hold_ms);
+    }
+
+    if (state->holding) {
+        state->release_bounce_ms += dt_ms;
+        if (state->release_bounce_ms >= release_debounce_ms) {
+            state->holding = false;
+            state->hold_elapsed_ms = 0U;
+            state->release_bounce_ms = 0U;
+        }
+    }
+    return false;
 }

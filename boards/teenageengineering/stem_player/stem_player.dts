@@ -163,23 +163,31 @@
 		keyup-threshold-mv = <0>;
 
 		rocker_rwd {
-			press-thresholds-mv = <355 441>;
+			press-thresholds-mv = <365>;
 			zephyr,code = <INPUT_KEY_BACK>;
 		};
 
 		volume_down {
-			press-thresholds-mv = <638 793>;
+			press-thresholds-mv = <665>;
 			zephyr,code = <INPUT_KEY_VOLUMEDOWN>;
 		};
 
 		rocker_fwd {
-			press-thresholds-mv = <1064 1321>;
+			press-thresholds-mv = <1110>;
 			zephyr,code = <INPUT_KEY_FASTFORWARD>;
 		};
 
 		volume_up {
-			press-thresholds-mv = <1598 1984>;
+			press-thresholds-mv = <1650>;
 			zephyr,code = <INPUT_KEY_VOLUMEUP>;
+		};
+
+		/* Absorb negative SAADC zero-offset samples (-1..-2048 -> 0xFFFF..0xF800
+		 * in Zephyr input_adc_keys uint16_t sample_raw -> 51150..52799 mV) so 0 V
+		 * idle noise never falsely matches the highest threshold (volume_up). */
+		idle_guard {
+			press-thresholds-mv = <52799>;
+			zephyr,code = <INPUT_KEY_RESERVED>;
 		};
 	};
 
@@ -191,28 +199,36 @@
 		keyup-threshold-mv = <0>;
 
 		track_1 {
-			press-thresholds-mv = <179 517 779 996 1178 1334 1467>;
+			press-thresholds-mv = <179 1178>;
 			zephyr,code = <INPUT_KEY_1>;
 		};
 
 		track_2 {
-			press-thresholds-mv = <364 517 893 996 1259 1334 1528>;
+			press-thresholds-mv = <364>;
 			zephyr,code = <INPUT_KEY_2>;
 		};
 
 		track_3 {
-			press-thresholds-mv = <655 779 893 996 1403 1467 1528>;
+			press-thresholds-mv = <655>;
 			zephyr,code = <INPUT_KEY_3>;
 		};
 
 		track_4 {
-			press-thresholds-mv = <1091 1178 1259 1334 1403 1467 1528>;
+			press-thresholds-mv = <1091 1178>;
 			zephyr,code = <INPUT_KEY_4>;
 		};
 
 		play_key {
-			press-thresholds-mv = <1587 1589 1591 1592>;
+			press-thresholds-mv = <1587>;
 			zephyr,code = <INPUT_KEY_PLAY>;
+		};
+
+		/* Absorb negative SAADC zero-offset samples (-1..-2048 -> 0xFFFF..0xF800
+		 * in Zephyr input_adc_keys uint16_t sample_raw -> 51150..52799 mV) so 0 V
+		 * idle noise never falsely matches the highest threshold (play_key). */
+		idle_guard {
+			press-thresholds-mv = <52799>;
+			zephyr,code = <INPUT_KEY_RESERVED>;
 		};
 	};
 
@@ -322,7 +338,7 @@ zephyr_udc0: &usbd {
 		zephyr,gain = "ADC_GAIN_1_4";
 		zephyr,reference = "ADC_REF_VDD_1_4";
 		zephyr,vref-mv = <825>;
-		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 3)>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
 		zephyr,input-positive = <NRF_SAADC_AIN0>;
 		zephyr,resolution = <12>;
 	};
@@ -332,7 +348,7 @@ zephyr_udc0: &usbd {
 		zephyr,gain = "ADC_GAIN_1_4";
 		zephyr,reference = "ADC_REF_VDD_1_4";
 		zephyr,vref-mv = <825>;
-		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 3)>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
 		zephyr,input-positive = <NRF_SAADC_AIN1>;
 		zephyr,resolution = <12>;
 	};
@@ -341,7 +357,7 @@ zephyr_udc0: &usbd {
 		reg = <2>;
 		zephyr,gain = "ADC_GAIN_1_4";
 		zephyr,reference = "ADC_REF_VDD_1_4";
-		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 3)>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
 		zephyr,input-positive = <NRF_SAADC_AIN2>;
 		zephyr,resolution = <12>;
 
@@ -351,7 +367,7 @@ zephyr_udc0: &usbd {
 		reg = <3>;
 		zephyr,gain = "ADC_GAIN_1_4";
 		zephyr,reference = "ADC_REF_VDD_1_4";
-		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 3)>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
 		zephyr,input-positive = <NRF_SAADC_AIN3>;
 		zephyr,resolution = <12>;
 
@@ -361,7 +377,7 @@ zephyr_udc0: &usbd {
 		reg = <4>;
 		zephyr,gain = "ADC_GAIN_1_4";
 		zephyr,reference = "ADC_REF_VDD_1_4";
-		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 3)>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
 		zephyr,input-positive = <NRF_SAADC_AIN4>;
 		zephyr,resolution = <12>;
 
@@ -371,7 +387,7 @@ zephyr_udc0: &usbd {
 		reg = <6>;
 		zephyr,gain = "ADC_GAIN_1_4";
 		zephyr,reference = "ADC_REF_VDD_1_4";
-		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 3)>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
 		zephyr,input-positive = <NRF_SAADC_AIN6>;
 		zephyr,resolution = <12>;
 
@@ -381,7 +397,7 @@ zephyr_udc0: &usbd {
 		reg = <7>;
 		zephyr,gain = "ADC_GAIN_1_4";
 		zephyr,reference = "ADC_REF_VDD_1_4";
-		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 3)>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 20)>;
 		zephyr,input-positive = <NRF_SAADC_AIN7>;
 		zephyr,resolution = <12>;
 

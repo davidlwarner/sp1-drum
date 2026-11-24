@@ -67,10 +67,37 @@ namespace power {
 void PowerManager::init() {
     LOG_INF("Initializing Power Monitor (BQ24232)");
 
-    const uint32_t resetreas = NRF_POWER->RESETREAS;
-    const bool woke_gpio = (resetreas & POWER_RESETREAS_OFF_Msk) != 0U;
+    uint32_t resetreas = NRF_POWER->RESETREAS;
     if (resetreas != 0U) {
         NRF_POWER->RESETREAS = resetreas;
+    } else {
+        resetreas = core::reset_breadcrumbs::snapshot().resetreas;
+    }
+
+    const bool reset_pin = (resetreas & POWER_RESETREAS_RESETPIN_Msk) != 0U;
+    const bool dog_wdt   = (resetreas & POWER_RESETREAS_DOG_Msk) != 0U;
+    const bool sreq_soft = (resetreas & POWER_RESETREAS_SREQ_Msk) != 0U;
+    const bool lockup    = (resetreas & POWER_RESETREAS_LOCKUP_Msk) != 0U;
+    const bool woke_gpio = (resetreas & POWER_RESETREAS_OFF_Msk) != 0U;
+    const bool woke_vbus = (resetreas & POWER_RESETREAS_VBUS_Msk) != 0U;
+
+    LOG_INF("Boot RESETREAS=0x%08x [DOG=%u(0x02:wdt) SREQ=%u(0x04:sys_reboot/fault) LOCKUP=%u(0x08:lockup) OFF=%u(0x10000:gpio) VBUS=%u RESETPIN=%u]",
+            static_cast<unsigned int>(resetreas),
+            dog_wdt ? 1U : 0U,
+            sreq_soft ? 1U : 0U,
+            lockup ? 1U : 0U,
+            woke_gpio ? 1U : 0U,
+            woke_vbus ? 1U : 0U,
+            reset_pin ? 1U : 0U);
+
+    if (dog_wdt) {
+        LOG_WRN("Reset cause: DOG (0x00000002 = hardware watchdog timeout)");
+    }
+    if (sreq_soft) {
+        LOG_WRN("Reset cause: SREQ (0x00000004 = sys_reboot / fault handler)");
+    }
+    if (lockup) {
+        LOG_WRN("Reset cause: LOCKUP (0x00000008 = CPU hardfault lockup)");
     }
     woke_from_system_off_.store(woke_gpio, std::memory_order_relaxed);
     if (woke_gpio) {
@@ -122,9 +149,15 @@ bool PowerManager::is_external_power_present() const {
 }
 
 void PowerManager::refresh_usb_power_state() {
-    external_power_state_.store(
-        nrf_power_usbregstatus_vbusdet_get(NRF_POWER),
-        std::memory_order_relaxed);
+    const bool vbus_det = nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
+    bool charger_online = false;
+    if (charger_ready()) {
+        union charger_propval val = {};
+        if (charger_get_prop(kChargerDev, CHARGER_PROP_ONLINE, &val) == 0) {
+            charger_online = (val.online != CHARGER_ONLINE_OFFLINE);
+        }
+    }
+    external_power_state_.store(vbus_det || charger_online, std::memory_order_relaxed);
 }
 
 void PowerManager::service_tick() {
@@ -172,24 +205,39 @@ bool PowerManager::function_button_pressed() const {
     return value > 0;
 }
 
+static void drive_pin_low(NRF_GPIO_Type* port, uint32_t pin) {
+    port->OUTCLR = (1UL << pin);
+    port->PIN_CNF[pin] =
+        (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
+        (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos);
+    port->OUTCLR = (1UL << pin);
+}
+
 void PowerManager::prepare_for_system_off() {
     k_sleep(K_MSEC(2));
 
+    // Hold external audio codecs in reset, cut 3.072 MHz osc, eMMC VCCQ, and BTN_COM ladder rail,
+    // and keep BQ24232 nCE low so battery charging works in SYSTEM_OFF.
+    drive_pin_low(NRF_P0, 9U);   // TAS2505 reset (active-low)
+    drive_pin_low(NRF_P0, 15U);  // CS42L42 reset (active-low)
+    drive_pin_low(NRF_P0, 13U);  // 3.072 MHz audio oscillator enable
+    drive_pin_low(NRF_P0, 14U);  // eMMC VCCQ supply rail
+    drive_pin_low(NRF_P0, 21U);  // BQ24232 nCE (low = charging enabled)
+    drive_pin_low(NRF_P1, 10U);  // BTN_COM ladder & fader supply rail
+
     // Clear RESETREAS immediately before entering SYSTEM_OFF so stale flags never accumulate.
-    const uint32_t resetreas = NRF_POWER->RESETREAS;
-    if (resetreas != 0U) {
-        NRF_POWER->RESETREAS = resetreas;
-    }
+    NRF_POWER->RESETREAS = 0xFFFFFFFFU;
 
-    // Release all GPIO to minimize leakage current
-    NRF_P0->DIR = 0;
-    NRF_P1->DIR = 0;
-
-    // Arm function button as wake source (level-active interrupt)
+    // Arm Function button (P0.27 active-low with pull-up) as SENSE_Low SYSTEM_OFF wake source.
     if (gpio_is_ready_dt(&function_button_)) {
-        gpio_pin_configure_dt(&function_button_, GPIO_INPUT);
-        gpio_pin_interrupt_configure_dt(&function_button_, GPIO_INT_LEVEL_ACTIVE);
+        (void)gpio_pin_configure_dt(&function_button_, GPIO_INPUT);
+        (void)gpio_pin_interrupt_configure_dt(&function_button_, GPIO_INT_LEVEL_ACTIVE);
     }
+    NRF_P0->PIN_CNF[27U] =
+        (GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos) |
+        (GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
+        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+        (GPIO_PIN_CNF_SENSE_Low << GPIO_PIN_CNF_SENSE_Pos);
 }
 
 } // namespace power

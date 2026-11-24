@@ -148,6 +148,9 @@ void sp1_hal_host_get_stats(sp1_hal_host_stats_t *out_stats) {
 
 /* ── HAL Controls & LEDs ─────────────────────────────────────────────────── */
 
+static uint16_t g_latched_pressed_buttons = 0U;
+static uint16_t g_latched_released_buttons = 0U;
+
 int sp1_hal_controls_init(void) {
     for (uint32_t i = 0U; i < SP1_NUM_FADERS; ++i) {
         sp1_fader_filter_init(&g_fader_filters[i]);
@@ -156,6 +159,8 @@ int sp1_hal_controls_init(void) {
     sp1_controls_bus_init(&g_controls_bus);
     memset(&g_led_frame, 0, sizeof(g_led_frame));
     g_prev_polled_buttons_down = 0U;
+    g_latched_pressed_buttons = 0U;
+    g_latched_released_buttons = 0U;
     return 0;
 }
 
@@ -165,9 +170,16 @@ void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
     }
 
     const uint16_t bit = SP1_BTN_BIT(btn);
+    const uint16_t prev_down = g_live_controls.buttons_down;
     if (pressed) {
+        if ((prev_down & bit) == 0U) {
+            g_latched_pressed_buttons |= bit;
+        }
         g_live_controls.buttons_down |= bit;
     } else {
+        if ((prev_down & bit) != 0U) {
+            g_latched_released_buttons |= bit;
+        }
         g_live_controls.buttons_down &= (uint16_t)(~bit);
     }
 
@@ -195,13 +207,17 @@ void sp1_hal_controls_poll(sp1_controls_snapshot_t *out_snapshot) {
     sp1_controls_snapshot_t snap;
     sp1_controls_bus_read(&g_controls_bus, &snap);
 
-    /* Derive one-shot rising/falling edge masks purely on the consumer side
-     * so the producer remains the sole writer to g_live_controls / g_controls_bus. */
+    /* Derive one-shot rising/falling edge masks merged with latched edges so
+     * brief taps between 20 ms polls are never dropped. */
     const uint16_t cur_down = snap.buttons_down;
     const uint16_t prev_down = g_prev_polled_buttons_down;
-    snap.buttons_pressed = (uint16_t)(cur_down & (uint16_t)(~prev_down));
-    snap.buttons_released = (uint16_t)((uint16_t)(~cur_down) & prev_down);
+    snap.buttons_pressed =
+        (uint16_t)((cur_down & (uint16_t)(~prev_down)) | g_latched_pressed_buttons);
+    snap.buttons_released =
+        (uint16_t)(((uint16_t)(~cur_down) & prev_down) | g_latched_released_buttons);
     g_prev_polled_buttons_down = cur_down;
+    g_latched_pressed_buttons = 0U;
+    g_latched_released_buttons = 0U;
 
     if (out_snapshot != NULL) {
         *out_snapshot = snap;

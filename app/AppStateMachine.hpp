@@ -46,9 +46,12 @@ struct AppMachine {
     bool wake_hold_required = false;
     int64_t wake_hold_start_ms = 0;
 
-    // Function-button hold detection (for shutdown)
+    // Function-button hold detection (for shutdown and USB soft-off standby wake)
     int64_t fn_hold_start_ms = 0;
     bool fn_was_pressed = false;
+    sp1_ui_power_hold_t power_hold{};
+    sp1_ui_power_hold_t standby_wake_hold{};
+    bool soft_off_standby = false;
 
     // Shutdown button-release debounce
     int64_t fn_released_ms = 0;

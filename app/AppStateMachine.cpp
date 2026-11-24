@@ -13,11 +13,11 @@ namespace app {
 namespace {
 
 constexpr int kPollCadenceMs = 20;
-constexpr int64_t kFnHoldPowerOnMs = 1500;    // 1.5 second hold to power on from SYSTEM_OFF
+constexpr int64_t kFnHoldPowerOnMs = 1500;    // 1.5 second hold to power on from SYSTEM_OFF / standby
 constexpr int64_t kWakeHoldGraceMs = 60;      // 60 ms GPIO startup grace/debounce window
 constexpr int64_t kFnHoldShutdownMs = 3000;   // 3 second hold to shut down
-constexpr int64_t kFnReleaseStableMs = 30;    // debounce before sys_poweroff
-constexpr int64_t kBootReportDelayMs = 2500;  // delay in STATE_RUNNING for USB-C CDC ACM enum
+constexpr int64_t kFnReleaseStableMs = 40;    // 40 ms release debounce before sys_poweroff / standby
+constexpr int64_t kBootReportDelayMs = 2000;  // ~2 s delay in STATE_RUNNING for USB-C CDC ACM enum
 constexpr uint8_t kRoutingPollDividerTicks = 10U;  // 10 * 20 ms = 200 ms jack-detect poll
 
 void feed(AppMachine& m) {
@@ -64,32 +64,20 @@ void abort_wake_to_system_off(AppMachine& m) {
     k_sleep(K_FOREVER);
 }
 
-/// Returns true if function button has been held long enough for shutdown.
+/// Returns true if Function button (P0.27) has been held for 3.0 s (with 40 ms release-bounce immunity).
 bool check_fn_hold_shutdown(AppMachine& m) {
     if (m.power == nullptr) {
         return false;
     }
 
     const bool pressed = m.power->function_button_pressed();
-    const int64_t now = k_uptime_get();
-
-    if (pressed && !m.fn_was_pressed) {
-        // Rising edge — start hold timer
-        m.fn_hold_start_ms = now;
-    }
-
     m.fn_was_pressed = pressed;
 
-    if (pressed && m.fn_hold_start_ms != 0 &&
-        (now - m.fn_hold_start_ms) >= kFnHoldShutdownMs) {
-        return true;
-    }
-
-    if (!pressed) {
-        m.fn_hold_start_ms = 0;
-    }
-
-    return false;
+    return sp1_ui_power_hold_update(&m.power_hold,
+                                    pressed,
+                                    static_cast<uint32_t>(kPollCadenceMs),
+                                    static_cast<uint32_t>(kFnHoldShutdownMs),
+                                    SP1_UI_POWER_RELEASE_DEBOUNCE_MS);
 }
 
 }  // namespace
@@ -109,6 +97,7 @@ static void idle_entry(void* o) {
         if (woke_from_off && !vbus_present) {
             m.wake_hold_required = true;
             m.wake_hold_start_ms = k_uptime_get();
+            sp1_ui_power_hold_init(&m.standby_wake_hold, false);
             // Immediately light Play 1 LED so user sees confirmation that Function woke the MCU.
             render_wake_hold_progress(m.leds, 0);
             LOG_INF("SP-1 Drum Machine: SYSTEM_OFF GPIO wake — hold Function 1.5 s to power on");
@@ -137,12 +126,18 @@ static smf_state_result idle_run(void* o) {
                 m.wake_hold_required = false;
                 m.fn_was_pressed = m.power->function_button_pressed();
                 m.fn_hold_start_ms = 0;
+                sp1_ui_power_hold_init(&m.power_hold, m.fn_was_pressed);
                 smf::set_state(m.ctx, app_states[STATE_RUNNING]);
                 return SMF_EVENT_HANDLED;
             }
 
-            const bool gpio_fn_pressed = m.power->function_button_pressed();
-            if (elapsed_ms >= kWakeHoldGraceMs && !gpio_fn_pressed && !hal_fn_pressed) {
+            const bool gpio_fn_pressed = m.power->function_button_pressed() || hal_fn_pressed;
+            (void)sp1_ui_power_hold_update(&m.standby_wake_hold,
+                                           gpio_fn_pressed,
+                                           static_cast<uint32_t>(kPollCadenceMs),
+                                           static_cast<uint32_t>(kFnHoldPowerOnMs),
+                                           SP1_UI_POWER_RELEASE_DEBOUNCE_MS);
+            if (elapsed_ms >= kWakeHoldGraceMs && !m.standby_wake_hold.holding) {
                 abort_wake_to_system_off(m);
                 return SMF_EVENT_HANDLED;
             }
@@ -152,9 +147,10 @@ static smf_state_result idle_run(void* o) {
 
         if (elapsed_ms >= kFnHoldPowerOnMs) {
             m.wake_hold_required = false;
-            // Require a fresh release + press before the 3 s shutdown timer can arm.
+            // Require a fresh 40 ms release before the 3 s shutdown timer can arm.
             m.fn_was_pressed = true;
             m.fn_hold_start_ms = 0;
+            sp1_ui_power_hold_init(&m.power_hold, true);
             smf::set_state(m.ctx, app_states[STATE_RUNNING]);
             return SMF_EVENT_HANDLED;
         }
@@ -164,6 +160,10 @@ static smf_state_result idle_run(void* o) {
     }
 
     // Cold boot / reset / USB-C VBUS present: enter STATE_RUNNING immediately.
+    if (m.power != nullptr) {
+        m.fn_was_pressed = m.power->function_button_pressed();
+    }
+    sp1_ui_power_hold_init(&m.power_hold, m.fn_was_pressed);
     smf::set_state(m.ctx, app_states[STATE_RUNNING]);
     return SMF_EVENT_HANDLED;
 }
@@ -172,6 +172,10 @@ static smf_state_result idle_run(void* o) {
 
 static void running_entry(void* o) {
     auto& m = smf::ctx<AppMachine>(o);
+    const bool initial_fn_down =
+        m.fn_was_pressed || (m.power != nullptr && m.power->function_button_pressed());
+    sp1_ui_power_hold_init(&m.power_hold, initial_fn_down);
+
     if (!m.runtime_started && m.start_runtime != nullptr) {
         m.audio_active = m.start_runtime();
         m.runtime_started = true;
@@ -180,8 +184,9 @@ static void running_entry(void* o) {
         m.routing_poll_ticks = 0U;
         feed(m);
     }
-    if (!m.boot_report_printed && m.boot_report_due_ms == 0 &&
-        core::reset_breadcrumbs::has_boot_report()) {
+    /* Always schedule the boot RESETREAS + ResetBreadcrumbs report ~2 s after entering
+     * STATE_RUNNING so USB-C CDC ACM has enumerated before the report is printed. */
+    if (!m.boot_report_printed && m.boot_report_due_ms == 0) {
         m.boot_report_due_ms = k_uptime_get() + kBootReportDelayMs;
     }
     LOG_INF("SP-1 Drum Machine: Running (48 kHz I2S0 audio=%s + 50 Hz control loop)",
@@ -211,8 +216,12 @@ static smf_state_result running_run(void* o) {
         if (!m.routing_initialized) {
             m.routing_initialized = true;
             m.routing_poll_ticks = 0U;
-            sp1_hal_audio_set_volume(SP1_UI_VOLUME_DEFAULT);
-            m.applied_volume = SP1_UI_VOLUME_DEFAULT;
+            const uint8_t init_vol =
+                (m.target_volume != nullptr)
+                    ? static_cast<uint8_t>(__atomic_load_n(m.target_volume, __ATOMIC_ACQUIRE) & 0x7FU)
+                    : SP1_UI_VOLUME_DEFAULT;
+            sp1_hal_audio_set_volume(init_vol);
+            m.applied_volume = init_vol;
             sp1_hal_audio_service_routing();
         } else {
             m.routing_poll_ticks++;
@@ -301,12 +310,17 @@ static smf_state_result running_run(void* o) {
     return SMF_EVENT_HANDLED;
 }
 
-// ── ShuttingDown: stop audio cleanly, fade LEDs, then deep sleep ─
+// ── ShuttingDown: stop sequencer & audio cleanly, fade LEDs, then deep sleep ─
 
 static void shutting_down_entry(void* o) {
     auto& m = smf::ctx<AppMachine>(o);
     LOG_INF("SP-1 Drum Machine: Shutting down");
 
+    if (m.seq != nullptr) {
+        sp1_seq_stop(m.seq);
+        m.prev_seq_running = false;
+    }
+    sp1_hal_audio_set_mute(true);
     (void)sp1_hal_audio_stop();
 
     if (m.leds != nullptr) {
@@ -330,52 +344,131 @@ static smf_state_result shutting_down_run(void* o) {
     return SMF_EVENT_HANDLED;
 }
 
-// ── DeepSleep: GPIO teardown → wait for fn release → sys_poweroff
+// ── DeepSleep: wait for fn release → sys_poweroff (battery) or soft-off standby (USB-C) ─
 
 static void deep_sleep_entry(void* o) {
     auto& m = smf::ctx<AppMachine>(o);
-    LOG_INF("MIDI Controller: DeepSleep — powering off");
+    LOG_INF("SP-1 Drum Machine: DeepSleep — muting codecs and blanking LEDs");
 
+    if (m.seq != nullptr) {
+        sp1_seq_stop(m.seq);
+        m.prev_seq_running = false;
+    }
+    sp1_hal_audio_set_mute(true);
+    (void)sp1_hal_audio_stop();
     if (m.leds != nullptr) {
         m.leds->all_off();
     }
-    sp1_hal_shutdown();
+    sp1_hal_leds_all_off();
 
-    if (m.power != nullptr) {
-        m.power->prepare_for_system_off();
-    }
     m.fn_released_ms = 0;
+    m.soft_off_standby = false;
+    sp1_ui_power_hold_init(&m.standby_wake_hold, true);
 }
 
 static smf_state_result deep_sleep_run(void* o) {
     auto& m = smf::ctx<AppMachine>(o);
     feed(m);
 
-    // Wait for function button release before calling sys_poweroff,
-    // so the wake-on-press doesn't fire immediately.
-    if (m.power != nullptr && m.power->function_button_pressed()) {
-        m.fn_released_ms = 0;
-        k_sleep(K_MSEC(10));
+    /* Phase 1: Wait for the user to release Function (P0.27) for >= 40 ms so the
+     * power-off hold itself cannot immediately re-trigger a wake edge. */
+    if (!m.soft_off_standby) {
+        if (m.power != nullptr && m.power->function_button_pressed()) {
+            m.fn_released_ms = 0;
+            k_sleep(K_MSEC(10));
+            return SMF_EVENT_HANDLED;
+        }
+
+        const int64_t now = k_uptime_get();
+        if (m.fn_released_ms == 0) {
+            m.fn_released_ms = now;
+            k_sleep(K_MSEC(10));
+            return SMF_EVENT_HANDLED;
+        }
+
+        if (now - m.fn_released_ms < kFnReleaseStableMs) {
+            k_sleep(K_MSEC(10));
+            return SMF_EVENT_HANDLED;
+        }
+
+        if (m.power != nullptr) {
+            m.power->refresh_usb_power_state();
+        }
+        const bool vbus_present =
+            (m.power != nullptr) && m.power->is_external_power_present();
+
+        if (!vbus_present) {
+            LOG_INF("SP-1 Drum Machine: Battery power — entering hardware SYSTEM_OFF");
+            if (m.leds != nullptr) {
+                m.leds->all_off();
+            }
+            sp1_hal_shutdown();
+            if (m.power != nullptr) {
+                m.power->prepare_for_system_off();
+            }
+            sys_poweroff();
+            LOG_ERR("sys_poweroff() returned");
+            k_sleep(K_FOREVER);
+            return SMF_EVENT_HANDLED;
+        }
+
+        /* USB-C VBUS is present: nRF52840 cannot enter hardware SYSTEM_OFF cleanly
+         * while VBUS is high, so remain in a silent soft-off standby state (all LEDs off,
+         * codecs muted, sequencer stopped) waiting for a new 1.5 s Function hold. */
+        m.soft_off_standby = true;
+        sp1_ui_power_hold_init(&m.standby_wake_hold, false);
+        LOG_INF("SP-1 Drum Machine: USB-C VBUS present — entered soft-off standby (hold Function 1.5 s to power on)");
+    }
+
+    /* Phase 2: USB-C Soft-Off Standby loop */
+    if (m.power != nullptr) {
+        m.power->service_tick();
+        if (!m.power->is_external_power_present()) {
+            LOG_INF("SP-1 Drum Machine: USB-C unplugged in standby — entering hardware SYSTEM_OFF");
+            if (m.leds != nullptr) {
+                m.leds->all_off();
+            }
+            sp1_hal_shutdown();
+            m.power->prepare_for_system_off();
+            sys_poweroff();
+            LOG_ERR("sys_poweroff() returned");
+            k_sleep(K_FOREVER);
+            return SMF_EVENT_HANDLED;
+        }
+    }
+
+    const bool fn_pressed = (m.power != nullptr) && m.power->function_button_pressed();
+    const bool wake_ready = sp1_ui_power_hold_update(&m.standby_wake_hold,
+                                                     fn_pressed,
+                                                     static_cast<uint32_t>(kPollCadenceMs),
+                                                     static_cast<uint32_t>(kFnHoldPowerOnMs),
+                                                     SP1_UI_POWER_RELEASE_DEBOUNCE_MS);
+
+    if (wake_ready) {
+        LOG_INF("SP-1 Drum Machine: Function held 1.5 s — waking from soft-off standby");
+        (void)sp1_hal_controls_init();
+        sp1_hal_audio_set_mute(false);
+        m.soft_off_standby = false;
+        m.runtime_started = false;
+        m.routing_initialized = false;
+        m.fn_was_pressed = true;
+        m.fn_hold_start_ms = 0;
+        sp1_ui_power_hold_init(&m.power_hold, true);
+        smf::set_state(m.ctx, app_states[STATE_RUNNING]);
         return SMF_EVENT_HANDLED;
     }
 
-    const int64_t now = k_uptime_get();
-    if (m.fn_released_ms == 0) {
-        m.fn_released_ms = now;
-        k_sleep(K_MSEC(10));
-        return SMF_EVENT_HANDLED;
+    if (m.standby_wake_hold.holding) {
+        render_wake_hold_progress(
+            m.leds, static_cast<int64_t>(m.standby_wake_hold.hold_elapsed_ms));
+    } else {
+        if (m.leds != nullptr) {
+            m.leds->all_off();
+        }
+        sp1_hal_leds_all_off();
     }
 
-    if (now - m.fn_released_ms < kFnReleaseStableMs) {
-        k_sleep(K_MSEC(10));
-        return SMF_EVENT_HANDLED;
-    }
-
-    sys_poweroff();
-
-    // Should never reach here
-    LOG_ERR("sys_poweroff() returned");
-    k_sleep(K_FOREVER);
+    k_sleep(K_MSEC(kPollCadenceMs));
     return SMF_EVENT_HANDLED;
 }
 

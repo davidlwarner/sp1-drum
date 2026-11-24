@@ -66,6 +66,18 @@ bool g_captured = false;
 RetainedBreadcrumb g_retained __noinit;
 volatile bool g_in_fatal_handler = false;
 
+/* High-SRAM mirror (252 KB mark, above ~98 KB app BSS and below bootloader stack at 256 KB)
+ * so crash breadcrumbs survive even if the SP-1 bootloader zeroes low SRAM on cold reset. */
+constexpr uint32_t kHighSramBreadcrumbAddr = 0x2003F000UL;
+
+RetainedBreadcrumb* high_sram_retained() {
+    return reinterpret_cast<RetainedBreadcrumb*>(kHighSramBreadcrumbAddr);
+}
+
+void sync_high_sram_mirror() {
+    *high_sram_retained() = g_retained;
+}
+
 uint32_t compute_crash_crc32(const RetainedCrash& c) {
     const auto* bytes = reinterpret_cast<const uint8_t*>(&c);
     const std::size_t len = offsetof(RetainedCrash, crc32);
@@ -157,11 +169,45 @@ void handle_fatal_error(unsigned int reason, const struct arch_esf* esf) {
         g_retained.crash.crc32 = compute_crash_crc32(g_retained.crash);
         g_retained.flags |= kFlagCrashValid;
         ++g_retained.sequence;
+        sync_high_sram_mirror();
         __DSB();
     }
 
     sys_reboot(SYS_REBOOT_COLD);
     for (;;) {
+    }
+}
+
+void capture_from_record(const RetainedBreadcrumb& rec) {
+    if (rec.magic != kRetainedMagic) {
+        return;
+    }
+    if (!g_snapshot.retained_valid && (rec.flags & kFlagProgressValid) != 0U) {
+        g_snapshot.retained_code = rec.code;
+        g_snapshot.retained_valid = true;
+    }
+    if (!g_snapshot.retained_watchdog_valid && (rec.flags & kFlagWatchdogValid) != 0U) {
+        g_snapshot.retained_watchdog_channel = rec.watchdog_channel;
+        g_snapshot.retained_watchdog_valid = true;
+    }
+    if (!g_snapshot.retained_control_phase_valid &&
+        (rec.flags & kFlagControlPhaseValid) != 0U) {
+        g_snapshot.retained_control_phase = rec.control_phase;
+        g_snapshot.retained_control_phase_valid = true;
+    }
+    if (!g_snapshot.retained_crash_valid &&
+        (rec.flags & kFlagCrashValid) != 0U &&
+        rec.crash.magic == kCrashMagic &&
+        rec.crash.crc32 == compute_crash_crc32(rec.crash)) {
+        g_snapshot.retained_crash_valid = true;
+        g_snapshot.crash_reason = rec.crash.reason;
+        g_snapshot.crash_pc = rec.crash.pc;
+        g_snapshot.crash_lr = rec.crash.lr;
+        g_snapshot.crash_xpsr = rec.crash.xpsr;
+        g_snapshot.crash_cfsr = rec.crash.cfsr;
+        g_snapshot.crash_hfsr = rec.crash.hfsr;
+        g_snapshot.crash_mmfar = rec.crash.mmfar;
+        g_snapshot.crash_bfar = rec.crash.bfar;
     }
 }
 
@@ -177,29 +223,10 @@ void capture_early() {
     g_snapshot.gpregret2 = static_cast<uint8_t>(NRF_POWER->GPREGRET2 & 0xFFU);
     g_snapshot.reset_cause_valid =
         hwinfo_get_reset_cause(&g_snapshot.reset_cause) == 0;
-    if (g_retained.magic == kRetainedMagic) {
-        g_snapshot.retained_code = g_retained.code;
-        g_snapshot.retained_valid = (g_retained.flags & kFlagProgressValid) != 0U;
-        g_snapshot.retained_watchdog_channel = g_retained.watchdog_channel;
-        g_snapshot.retained_watchdog_valid = (g_retained.flags & kFlagWatchdogValid) != 0U;
-        g_snapshot.retained_control_phase = g_retained.control_phase;
-        g_snapshot.retained_control_phase_valid =
-            (g_retained.flags & kFlagControlPhaseValid) != 0U;
 
-        if ((g_retained.flags & kFlagCrashValid) != 0U &&
-            g_retained.crash.magic == kCrashMagic &&
-            g_retained.crash.crc32 == compute_crash_crc32(g_retained.crash)) {
-            g_snapshot.retained_crash_valid = true;
-            g_snapshot.crash_reason = g_retained.crash.reason;
-            g_snapshot.crash_pc = g_retained.crash.pc;
-            g_snapshot.crash_lr = g_retained.crash.lr;
-            g_snapshot.crash_xpsr = g_retained.crash.xpsr;
-            g_snapshot.crash_cfsr = g_retained.crash.cfsr;
-            g_snapshot.crash_hfsr = g_retained.crash.hfsr;
-            g_snapshot.crash_mmfar = g_retained.crash.mmfar;
-            g_snapshot.crash_bfar = g_retained.crash.bfar;
-        }
-    }
+    capture_from_record(g_retained);
+    capture_from_record(*high_sram_retained());
+
     g_captured = true;
 }
 
@@ -215,6 +242,7 @@ void clear_live_markers() {
     g_retained.control_phase = 0U;
     std::memset(&g_retained.crash, 0, sizeof(g_retained.crash));
     ++g_retained.sequence;
+    sync_high_sram_mirror();
 }
 
 void mark(uint8_t code) {
@@ -222,6 +250,7 @@ void mark(uint8_t code) {
     g_retained.code = code;
     g_retained.flags |= kFlagProgressValid;
     ++g_retained.sequence;
+    sync_high_sram_mirror();
 }
 
 void mark_watchdog_expiry(uint8_t channel) {
@@ -229,6 +258,7 @@ void mark_watchdog_expiry(uint8_t channel) {
     g_retained.watchdog_channel = channel;
     g_retained.flags |= kFlagWatchdogValid;
     ++g_retained.sequence;
+    sync_high_sram_mirror();
 }
 
 void mark_control_phase(uint8_t code) {
@@ -236,6 +266,7 @@ void mark_control_phase(uint8_t code) {
     g_retained.control_phase = code;
     g_retained.flags |= kFlagControlPhaseValid;
     ++g_retained.sequence;
+    sync_high_sram_mirror();
 }
 
 void mark_software_reboot(int type) {
@@ -243,26 +274,48 @@ void mark_software_reboot(int type) {
     g_retained.code = static_cast<uint8_t>(type & 0xFF);
     g_retained.flags |= kFlagSoftRebootValid;
     ++g_retained.sequence;
+    sync_high_sram_mirror();
 }
 
 bool has_boot_report() {
     const Snapshot& s = g_snapshot;
-    const bool hw_dog_or_lockup =
-        (s.resetreas & (POWER_RESETREAS_DOG_Msk | POWER_RESETREAS_LOCKUP_Msk)) != 0U;
-    return s.retained_crash_valid || s.retained_watchdog_valid || hw_dog_or_lockup;
+    const bool abnormal_reset =
+        (s.resetreas & (POWER_RESETREAS_DOG_Msk |
+                        POWER_RESETREAS_SREQ_Msk |
+                        POWER_RESETREAS_LOCKUP_Msk)) != 0U;
+    return s.retained_crash_valid || s.retained_watchdog_valid || abnormal_reset;
 }
 
 void print_boot_report() {
-    if (!has_boot_report()) {
-        return;
-    }
-
     const Snapshot& s = g_snapshot;
+    const uint32_t r = s.resetreas;
+    const bool dog    = (r & POWER_RESETREAS_DOG_Msk) != 0U;
+    const bool sreq   = (r & POWER_RESETREAS_SREQ_Msk) != 0U;
+    const bool lockup = (r & POWER_RESETREAS_LOCKUP_Msk) != 0U;
+    const bool off    = (r & POWER_RESETREAS_OFF_Msk) != 0U;
+    const bool vbus   = (r & POWER_RESETREAS_VBUS_Msk) != 0U;
+    const bool pin    = (r & POWER_RESETREAS_RESETPIN_Msk) != 0U;
 
-    LOG_ERR("Previous-boot abnormal reset detected: RESETREAS=0x%08x GPREGRET=0x%02x code=0x%02x",
-            static_cast<unsigned int>(s.resetreas),
+    LOG_INF("Boot diagnostics: RESETREAS=0x%08x [DOG=%u(0x02:wdt) SREQ=%u(0x04:sys_reboot/fault) LOCKUP=%u(0x08:lockup) OFF=%u(0x10000:gpio) VBUS=%u RESETPIN=%u] GPREGRET=0x%02x/0x%02x",
+            static_cast<unsigned int>(r),
+            dog ? 1U : 0U,
+            sreq ? 1U : 0U,
+            lockup ? 1U : 0U,
+            off ? 1U : 0U,
+            vbus ? 1U : 0U,
+            pin ? 1U : 0U,
             static_cast<unsigned int>(s.gpregret),
-            static_cast<unsigned int>(s.retained_code));
+            static_cast<unsigned int>(s.gpregret2));
+
+    if (has_boot_report()) {
+        LOG_ERR("Previous-boot abnormal reset detected: RESETREAS=0x%08x (DOG=%u SREQ=%u LOCKUP=%u) code=0x%02x phase=0x%02x",
+                static_cast<unsigned int>(r),
+                dog ? 1U : 0U,
+                sreq ? 1U : 0U,
+                lockup ? 1U : 0U,
+                static_cast<unsigned int>(s.retained_code),
+                static_cast<unsigned int>(s.retained_control_phase));
+    }
 
     if (s.retained_watchdog_valid) {
         LOG_ERR("Previous-boot software watchdog expired on channel %u (phase=0x%02x)",
@@ -279,6 +332,8 @@ void print_boot_report() {
                 static_cast<unsigned int>(s.crash_cfsr),
                 static_cast<unsigned int>(s.crash_hfsr));
         print_crash_details(s);
+    } else {
+        LOG_INF("ResetBreadcrumbs: no fatal fault breadcrumb from previous boot (PC=0x00000000 LR=0x00000000 CFSR=0x00000000)");
     }
 }
 

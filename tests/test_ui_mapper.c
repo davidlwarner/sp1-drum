@@ -465,11 +465,177 @@ static void test_performance_fx_mode_and_voice_morph_gestures(void) {
     sp1_hal_shutdown();
 }
 
+static void test_play_start_stop_and_ain1_ladder_volume_resilience(void) {
+    init_silent_hal();
+
+    sp1_sequencer_t seq;
+    sp1_ui_mapper_t ui;
+    sp1_seq_init(&seq);
+    sp1_ui_mapper_init(&ui);
+    poll_and_update(&ui, &seq);
+
+    /* 1. Play start/stop toggling across multi-poll and intra-poll taps,
+     *    including when transient AIN1 transport noise is present. */
+    TEST_ASSERT(!sp1_seq_is_running(&seq));
+    sp1_hal_controls_on_button_event(SP1_BTN_PLAY, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(sp1_seq_is_running(&seq));
+    sp1_hal_controls_on_button_event(SP1_BTN_PLAY, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(sp1_seq_is_running(&seq));
+
+    /* Press Play again while running -> must stop cleanly */
+    sp1_hal_controls_on_button_event(SP1_BTN_PLAY, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(!sp1_seq_is_running(&seq));
+    sp1_hal_controls_on_button_event(SP1_BTN_PLAY, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(!sp1_seq_is_running(&seq));
+
+    /* Intra-poll fast tap (DOWN + UP before 20 ms poll) starts and stops cleanly */
+    sp1_hal_controls_on_button_event(SP1_BTN_PLAY, true);
+    sp1_hal_controls_on_button_event(SP1_BTN_PLAY, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(sp1_seq_is_running(&seq));
+
+    /* Even if a transient AIN1 bit (e.g. Vol+) is active when Play is pressed,
+     * Play still stops playback reliably. */
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, true);
+    poll_and_update(&ui, &seq);
+    sp1_hal_controls_on_button_event(SP1_BTN_PLAY, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT(!sp1_seq_is_running(&seq));
+    sp1_hal_controls_on_button_event(SP1_BTN_PLAY, false);
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, false);
+    poll_and_update(&ui, &seq);
+
+    /* 2. Vol+ / Vol- stepping when AIN1 resistor-ladder release voltage passes
+     *    through FWD (1110 mV) or RWD (365 mV) on the same scan:
+     *    volume must step by +/-8 and BPM must NOT change! */
+    sp1_ui_mapper_init(&ui);
+    sp1_seq_set_bpm_x100(&seq, 12000U);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(64, sp1_ui_mapper_get_master_volume(&ui));
+
+    /* Press Vol- (665 mV), then on release AIN1 transits RWD (365 mV) before 0 mV */
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_DOWN, true);
+    poll_and_update(&ui, &seq);
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_DOWN, false);
+    sp1_hal_controls_on_button_event(SP1_BTN_RWD, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(56, sp1_ui_mapper_get_master_volume(&ui));
+    sp1_hal_controls_on_button_event(SP1_BTN_RWD, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_U32(12000U, sp1_seq_get_bpm_x100(&seq));
+
+    /* Press Vol+ (1650 mV), then on release AIN1 transits FWD (1110 mV) before 0 mV */
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(64, sp1_ui_mapper_get_master_volume(&ui));
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, false);
+    sp1_hal_controls_on_button_event(SP1_BTN_FWD, true);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(64, sp1_ui_mapper_get_master_volume(&ui)); /* No double step on release */
+    sp1_hal_controls_on_button_event(SP1_BTN_FWD, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_U32(12000U, sp1_seq_get_bpm_x100(&seq));
+
+    /* Intra-poll Vol+ and Vol- taps (DOWN + UP between 20 ms polls) */
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, true);
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_UP, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(72, sp1_ui_mapper_get_master_volume(&ui));
+
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_DOWN, true);
+    sp1_hal_controls_on_button_event(SP1_BTN_VOL_DOWN, false);
+    poll_and_update(&ui, &seq);
+    TEST_ASSERT_EQ_INT(64, sp1_ui_mapper_get_master_volume(&ui));
+
+    sp1_hal_shutdown();
+}
+
+static void test_function_power_hold_release_bounce_debounce(void) {
+    sp1_ui_power_hold_t hold;
+
+    /* 1. When initialized with wait_for_initial_release=true (e.g. just powered on while
+     *    Function is still held), holding Function must NOT arm shutdown until released
+     *    for >= 40 ms. */
+    sp1_ui_power_hold_init(&hold, true);
+    for (uint32_t t = 0U; t < 200U; ++t) {
+        TEST_ASSERT(!sp1_ui_power_hold_update(&hold,
+                                              true,
+                                              20U,
+                                              SP1_UI_POWER_HOLD_SHUTDOWN_MS,
+                                              SP1_UI_POWER_RELEASE_DEBOUNCE_MS));
+    }
+    /* Single 20 ms release glitch (< 40 ms) does not clear wait_for_release */
+    TEST_ASSERT(!sp1_ui_power_hold_update(
+        &hold, false, 20U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS));
+    TEST_ASSERT(hold.wait_for_release);
+    TEST_ASSERT(!sp1_ui_power_hold_update(
+        &hold, true, 20U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS));
+    TEST_ASSERT(hold.wait_for_release);
+
+    /* Two consecutive 20 ms released ticks (40 ms) arm the detector cleanly */
+    TEST_ASSERT(!sp1_ui_power_hold_update(
+        &hold, false, 20U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS));
+    TEST_ASSERT(!sp1_ui_power_hold_update(
+        &hold, false, 20U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS));
+    TEST_ASSERT(!hold.wait_for_release);
+
+    /* 2. Start 3000 ms shutdown hold with periodic 20 ms contact-bounce dropouts (< 40 ms).
+     *    First pressed tick arms holding=true at 0 ms; 150 subsequent 20 ms ticks (including
+     *    contact-bounce dropouts that recover on the next 20 ms tick) must reach 3000 ms. */
+    TEST_ASSERT(!sp1_ui_power_hold_update(
+        &hold, true, 20U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS));
+    TEST_ASSERT(hold.holding);
+    TEST_ASSERT_EQ_U32(0U, hold.hold_elapsed_ms);
+
+    for (uint32_t tick = 1U; tick <= 149U; ++tick) {
+        /* Inject a 20 ms contact-bounce false release every 30 ticks (600 ms) */
+        const bool bouncy_pressed = ((tick % 30U) != 0U);
+        const bool triggered = sp1_ui_power_hold_update(&hold,
+                                                        bouncy_pressed,
+                                                        20U,
+                                                        SP1_UI_POWER_HOLD_SHUTDOWN_MS,
+                                                        SP1_UI_POWER_RELEASE_DEBOUNCE_MS);
+        TEST_ASSERT(!triggered);
+        TEST_ASSERT(hold.holding);
+    }
+
+    /* Tick 150 (3000 ms total despite five 20 ms contact bounces) triggers shutdown! */
+    TEST_ASSERT(sp1_ui_power_hold_update(
+        &hold, true, 20U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS));
+    TEST_ASSERT_EQ_U32(3000U, hold.hold_elapsed_ms);
+
+    /* 3. A genuine release (>= 40 ms = two 20 ms ticks) resets the hold timer to 0. */
+    sp1_ui_power_hold_init(&hold, false);
+    (void)sp1_ui_power_hold_update(
+        &hold, true, 20U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS);
+    (void)sp1_ui_power_hold_update(
+        &hold, true, 1000U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS);
+    TEST_ASSERT_EQ_U32(1000U, hold.hold_elapsed_ms);
+
+    /* 20 ms release: still holding at 1000 ms */
+    (void)sp1_ui_power_hold_update(
+        &hold, false, 20U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS);
+    TEST_ASSERT(hold.holding);
+    TEST_ASSERT_EQ_U32(1000U, hold.hold_elapsed_ms);
+
+    /* Second 20 ms release (40 ms total): hold resets to 0 */
+    (void)sp1_ui_power_hold_update(
+        &hold, false, 20U, SP1_UI_POWER_HOLD_SHUTDOWN_MS, SP1_UI_POWER_RELEASE_DEBOUNCE_MS);
+    TEST_ASSERT(!hold.holding);
+    TEST_ASSERT_EQ_U32(0U, hold.hold_elapsed_ms);
+}
+
 int main(void) {
     RUN_TEST(test_normal_mode_faders_mutes_transport_bpm_and_volume);
     RUN_TEST(test_shift_combos_dilla_detent_coarse_bpm_swing_and_anti_clobber);
     RUN_TEST(test_play_shift_chord_hardware_safety);
     RUN_TEST(test_8ch_pwm_led_renderer_pulse_mute_beat_and_nudge_polarity);
     RUN_TEST(test_performance_fx_mode_and_voice_morph_gestures);
+    RUN_TEST(test_play_start_stop_and_ain1_ladder_volume_resilience);
+    RUN_TEST(test_function_power_hold_release_bounce_debounce);
     return sp1_test_summary();
 }

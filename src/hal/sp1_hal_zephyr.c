@@ -49,6 +49,8 @@ static const struct pwm_dt_spec g_play_leds[SP1_NUM_PLAY_LEDS] = {
 
 /* External 3.072 MHz audio oscillator enable pin (P0.13, active high) */
 #define SP1_OSC_EN_PIN              13U
+/* BTN_COM resistor-ladder & fader supply rail enable pin (P1.10, active high) */
+#define SP1_BTN_COM_PIN             10U
 
 /* ── Static RAM Allocations (Explicit Byte Budgets) ──────────────────────── */
 
@@ -62,10 +64,10 @@ static const struct pwm_dt_spec g_play_leds[SP1_NUM_PLAY_LEDS] = {
 #define SP1_I2S_DMA_BLOCK_COUNT     8U  /* 8 * 5.0 ms = 40 ms total DMA ring headroom */
 #define SP1_I2S_PRIME_BLOCKS        4U  /* 4 * 5.0 ms = 20 ms pre-queued before START */
 #define SP1_AUDIO_THREAD_STACK_SIZE 4096U
-/* High cooperative priority so USB CDC ACM logging, I2C0, and ADC keys cannot preempt a
- * 5 ms audio block render; blocks in i2s_write()/k_mem_slab_alloc() every 5 ms and yields
- * via k_msleep(2) on error so main()/NRF_WDT0 are never starved. */
-#define SP1_AUDIO_THREAD_PRIO       K_PRIO_COOP(2)
+/* Preemptive priority 0 (above main at priority 1 and shell_uart at priority 7) so
+ * 5 ms audio block rendering preempts control/logging work without starving cooperative
+ * kernel driver threads (udc_nrf, usbd, sysworkq). */
+#define SP1_AUDIO_THREAD_PRIO       K_PRIO_PREEMPT(0)
 
 /* Static RAM: 8 * 1920 B = 15360 B I2S EasyDMA TX slab */
 K_MEM_SLAB_DEFINE_STATIC(g_i2s_tx_slab, SP1_I2S_DMA_BLOCK_BYTES, SP1_I2S_DMA_BLOCK_COUNT, 4);
@@ -106,6 +108,9 @@ static bool g_tas2505_ready = false;
 static uint8_t g_audio_volume = 64U;
 static bool g_audio_global_muted = false;
 static int8_t g_hp_routed_state = -1; /* -1 = unapplied, 0 = speaker, 1 = headphones */
+static int8_t g_pending_hp_state = -1;
+static uint8_t g_plug_read_fail_count = 0U;
+static uint8_t g_plug_poll_backoff_ticks = 0U;
 static int16_t g_last_plug_status = -1;
 
 /* ── Hardware Watchdog Reload Helper (Safe Across Slow I2C Bring-Up) ─────── */
@@ -218,15 +223,15 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
 
             consecutive_write_fails += 1U;
             if (write_err == -EIO) {
-                /* In Zephyr i2s_nrfx, I2S_TRIGGER_DROP transitions ERROR (4) -> READY (1).
-                 * Never call I2S_TRIGGER_PREPARE in ERROR, and never sleep AFTER START. */
+                /* In Zephyr i2s_nrfx, I2S_TRIGGER_DROP transitions ERROR (4) -> READY (1)
+                 * and triggers NRF_I2S->TASKS_STOP. Always wait 5 ms for the asynchronous
+                 * EVENTS_STOPPED ISR (nrfx_i2s_uninit + last_tx_buffer free) to complete
+                 * before re-priming and re-starting I2S0. */
                 const int drop_err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
-                if (consecutive_write_fails > 1U) {
-                    /* Yield while I2S is safely stopped in READY so main/WDT are never starved. */
-                    k_msleep(2);
-                }
+                k_msleep(5);
                 int start_err = drop_err;
-                if (drop_err == 0) {
+                if (drop_err == 0 &&
+                    __atomic_load_n(&g_audio_running_flag, __ATOMIC_ACQUIRE) != 0U) {
                     sp1_i2s_prime_silent(SP1_I2S_PRIME_BLOCKS);
                     start_err = i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
                 }
@@ -242,8 +247,8 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
                                 drop_err, start_err, (unsigned)recovery_count);
                     }
                 }
-                if (drop_err < 0 || start_err < 0) {
-                    k_msleep(2);
+                if (drop_err < 0 || start_err < 0 || consecutive_write_fails > 1U) {
+                    k_msleep(5);
                 }
             } else {
                 k_msleep(2);
@@ -257,7 +262,32 @@ static void sp1_audio_thread_entry(void *p1, void *p2, void *p3) {
 
 /* ── HAL Controls & 8-Channel PWM LEDs ───────────────────────────────────── */
 
+static const char *sp1_button_name(sp1_button_id_t btn) {
+    switch (btn) {
+    case SP1_BTN_TRACK_1:  return "T1";
+    case SP1_BTN_TRACK_2:  return "T2";
+    case SP1_BTN_TRACK_3:  return "T3";
+    case SP1_BTN_TRACK_4:  return "T4";
+    case SP1_BTN_PLAY:     return "PLAY";
+    case SP1_BTN_RWD:      return "RWD";
+    case SP1_BTN_VOL_DOWN: return "VOL-";
+    case SP1_BTN_FWD:      return "FWD";
+    case SP1_BTN_VOL_UP:   return "VOL+";
+    case SP1_BTN_FN:       return "FN";
+    default:               return "?";
+    }
+}
+
 int sp1_hal_controls_init(void) {
+#if defined(NRF_P1)
+    /* Ensure P1.10 (BTN_COM) rail powering both resistor ladders and 4 faders is driven high. */
+    NRF_P1->OUTSET = (1UL << SP1_BTN_COM_PIN);
+    NRF_P1->PIN_CNF[SP1_BTN_COM_PIN] =
+        (GPIO_PIN_CNF_DIR_Output << GPIO_PIN_CNF_DIR_Pos) |
+        (GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
+        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos);
+    NRF_P1->OUTSET = (1UL << SP1_BTN_COM_PIN);
+#endif
     k_spinlock_key_t key = k_spin_lock(&g_controls_lock);
     for (uint32_t i = 0U; i < SP1_NUM_FADERS; ++i) {
         sp1_fader_filter_init(&g_fader_filters[i]);
@@ -280,11 +310,15 @@ void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
     k_spinlock_key_t key = k_spin_lock(&g_controls_lock);
     const uint16_t prev_down = g_live_controls.buttons_down;
     if (pressed) {
+        if ((prev_down & bit) == 0U) {
+            g_latched_pressed_buttons |= bit;
+        }
         g_live_controls.buttons_down |= bit;
-        g_latched_pressed_buttons |= bit;
     } else {
+        if ((prev_down & bit) != 0U) {
+            g_latched_released_buttons |= bit;
+        }
         g_live_controls.buttons_down &= (uint16_t)(~bit);
-        g_latched_released_buttons |= bit;
     }
     const uint16_t next_down = g_live_controls.buttons_down;
 
@@ -293,8 +327,11 @@ void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
     k_spin_unlock(&g_controls_lock, key);
 
     if (next_down != prev_down && !k_is_in_isr()) {
-        LOG_INF("Buttons: buttons=0x%04x (btn=%u %s)",
-                (unsigned)next_down, (unsigned)btn, pressed ? "DOWN" : "UP");
+        LOG_INF("Buttons: buttons=0x%04x (btn=%u %s %s)",
+                (unsigned)next_down,
+                (unsigned)btn,
+                sp1_button_name(btn),
+                pressed ? "DOWN" : "UP");
     }
 }
 
@@ -434,6 +471,9 @@ int sp1_hal_audio_init(sp1_audio_render_cb_t render_cb, void *user_ctx) {
     g_audio_volume = 64U;
     g_audio_global_muted = false;
     g_hp_routed_state = -1;
+    g_pending_hp_state = -1;
+    g_plug_read_fail_count = 0U;
+    g_plug_poll_backoff_ticks = 0U;
     g_last_plug_status = -1;
     sp1_hal_audio_reset_cycle_stats();
 
@@ -516,6 +556,7 @@ static void sp1_audio_apply_routing(bool hp_connected, uint8_t plug_status) {
     mute_off.mute = false;
     vol_val.vol = (int)g_audio_volume;
 
+    sp1_wdt_feed_all();
     if (g_audio_global_muted) {
         if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
             (void)audio_codec_set_property(
@@ -525,6 +566,7 @@ static void sp1_audio_apply_routing(bool hp_connected, uint8_t plug_status) {
             (void)audio_codec_set_property(
                 g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_on);
         }
+        sp1_wdt_feed_all();
         return;
     }
 
@@ -539,6 +581,7 @@ static void sp1_audio_apply_routing(bool hp_connected, uint8_t plug_status) {
                 g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_VOLUME, AUDIO_CHANNEL_ALL, vol_val);
             (void)audio_codec_set_property(
                 g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_MUTE, AUDIO_CHANNEL_ALL, mute_off);
+            cs42l42_codec_log_state(g_cs42l42_dev, "hp_route");
         }
         LOG_INF("Audio route -> Headphones (CS42L42, vol=%u/127, 0x130F=0x%02x)",
                 (unsigned)g_audio_volume, (unsigned)plug_status);
@@ -557,6 +600,7 @@ static void sp1_audio_apply_routing(bool hp_connected, uint8_t plug_status) {
         LOG_INF("Audio route -> Speaker (TAS2505, vol=%u/127, 0x130F=0x%02x)",
                 (unsigned)g_audio_volume, (unsigned)plug_status);
     }
+    sp1_wdt_feed_all();
 }
 
 int sp1_hal_audio_start(void) {
@@ -602,6 +646,7 @@ int sp1_hal_audio_stop(void) {
         audio_codec_stop_output(g_cs42l42_dev);
     }
     g_hp_routed_state = -1;
+    g_pending_hp_state = -1;
     if (g_audio_configured && device_is_ready(g_i2s_dev)) {
         (void)i2s_trigger(g_i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
     }
@@ -636,6 +681,7 @@ int sp1_hal_audio_submit_block(const int16_t *interleaved_stereo, uint32_t num_f
 
 void sp1_hal_audio_set_volume(uint8_t volume_0_to_127) {
     const uint8_t clamped = (volume_0_to_127 > 127U) ? 127U : volume_0_to_127;
+    const bool changed = (clamped != g_audio_volume);
     g_audio_volume = clamped;
 
     /* Both CS42L42 and TAS2505 map logical 0..127 perceptually (0 = mute,
@@ -643,6 +689,7 @@ void sp1_hal_audio_set_volume(uint8_t volume_0_to_127) {
     audio_property_value_t val;
     val.vol = (int)clamped;
 
+    sp1_wdt_feed_all();
     if (g_cs42l42_ready && device_is_ready(g_cs42l42_dev)) {
         (void)audio_codec_set_property(
             g_cs42l42_dev, AUDIO_PROPERTY_OUTPUT_VOLUME, AUDIO_CHANNEL_ALL, val);
@@ -650,6 +697,13 @@ void sp1_hal_audio_set_volume(uint8_t volume_0_to_127) {
     if (g_tas2505_ready && device_is_ready(g_tas2505_dev)) {
         (void)audio_codec_set_property(
             g_tas2505_dev, AUDIO_PROPERTY_OUTPUT_VOLUME, AUDIO_CHANNEL_ALL, val);
+    }
+    sp1_wdt_feed_all();
+
+    if (changed && !k_is_in_isr()) {
+        LOG_INF("Master volume: vol=%u/127 (route=%s)",
+                (unsigned)clamped,
+                (g_hp_routed_state == 1) ? "Headphones" : "Speaker");
     }
 }
 
@@ -669,6 +723,7 @@ void sp1_hal_audio_set_mute(bool muted) {
         }
     } else {
         g_hp_routed_state = -1;
+        g_pending_hp_state = -1;
         sp1_hal_audio_service_routing();
     }
 }
@@ -678,11 +733,35 @@ void sp1_hal_audio_service_routing(void) {
         return;
     }
 
+    if (g_plug_poll_backoff_ticks > 0U) {
+        g_plug_poll_backoff_ticks--;
+        return;
+    }
+
+    sp1_wdt_feed_all();
     uint8_t plug_status = 0U;
     const bool read_ok = cs42l42_codec_read_plug_status(g_cs42l42_dev, &plug_status);
-    const bool hp_connected = read_ok && cs42l42_codec_plug_status_is_connected(plug_status);
+    sp1_wdt_feed_all();
 
-    if (read_ok && (int16_t)plug_status != g_last_plug_status) {
+    if (!read_ok) {
+        /* Never treat a transient I2C read error as an unplug event or hammer I2C0. */
+        if (g_plug_read_fail_count < 255U) {
+            g_plug_read_fail_count++;
+        }
+        if (g_plug_read_fail_count >= 3U) {
+            g_plug_poll_backoff_ticks = 10U; /* 2 s backoff */
+        }
+        if (g_hp_routed_state < 0) {
+            g_hp_routed_state = 0;
+            sp1_audio_apply_routing(false, 0x0CU);
+        }
+        return;
+    }
+    g_plug_read_fail_count = 0U;
+
+    const bool hp_connected = cs42l42_codec_plug_status_is_connected(plug_status);
+
+    if ((int16_t)plug_status != g_last_plug_status) {
         if (g_last_plug_status >= 0) {
             LOG_INF("CS42L42 TSRS_PLUG_STATUS (0x130F): 0x%02x -> 0x%02x (hp=%u)",
                     (unsigned)g_last_plug_status, (unsigned)plug_status,
@@ -693,9 +772,18 @@ void sp1_hal_audio_service_routing(void) {
 
     const int8_t desired = hp_connected ? 1 : 0;
     if (desired == g_hp_routed_state) {
+        g_pending_hp_state = desired;
         return;
     }
 
+    /* Apply initial boot route immediately; debounce subsequent plug/unplug transitions
+     * across 2 consecutive 200 ms polls to avoid contact-scrape I2C chatter. */
+    if (g_hp_routed_state >= 0 && g_pending_hp_state != desired) {
+        g_pending_hp_state = desired;
+        return;
+    }
+
+    g_pending_hp_state = desired;
     g_hp_routed_state = desired;
     sp1_audio_apply_routing(hp_connected, plug_status);
 }

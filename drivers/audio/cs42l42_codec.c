@@ -23,7 +23,9 @@ enum {
 	CS42L42_REG_CLOCK_CTL = 0x1007,
 	CS42L42_REG_MCLK_CTL = 0x1009,
 	CS42L42_REG_PWR_CTL1 = 0x1101,
+	CS42L42_REG_PWR_CTL2 = 0x1102,
 	CS42L42_REG_PWR_CTL7 = 0x1107,
+	CS42L42_REG_OSC_SWITCH_STATUS = 0x1109,
 	CS42L42_REG_CODEC_CTL = 0x1121,
 	CS42L42_REG_MISC_DET_CTL = 0x1B74,
 	CS42L42_REG_MIC_DET_CTL1 = 0x1B75,
@@ -51,20 +53,22 @@ enum {
 	CS42L42_REG_PLL_CTL4 = 0x151B,
 	CS42L42_REG_TIPSENSE_CTL = 0x1B73,
 	CS42L42_REG_HS_BIAS_CTL = 0x1C03,
+	CS42L42_REG_DAC_CTL1 = 0x1F01,
+	CS42L42_REG_DAC_CTL2 = 0x1F06,
 	CS42L42_REG_HP_CTL = 0x2001,
 	CS42L42_REG_MIXER_CHA_VOL = 0x2301,
+	CS42L42_REG_MIXER_ADC_VOL = 0x2302,
 	CS42L42_REG_MIXER_CHB_VOL = 0x2303,
-	CS42L42_REG_DAC_CTL = 0x240E,
+	CS42L42_REG_EQ_MUTE_CTL = 0x240E,
 	CS42L42_REG_SP_RX_CH_SEL = 0x2501,
-	CS42L42_REG_HP_VOL_A = 0x2601,
-	CS42L42_REG_HP_VOL_B = 0x2609,
+	CS42L42_REG_SRC_SDIN_FS = 0x2601,
+	CS42L42_REG_SRC_SDOUT_FS = 0x2609,
 	CS42L42_REG_ASP_TX_SIZE_ENABLE = 0x2901,
 	CS42L42_REG_ASP_TX_CHANNEL_ENABLE = 0x2902,
 	CS42L42_REG_ASP_TX_CHANNEL_AP_RES = 0x2903,
 	CS42L42_REG_ASP_RX_ENABLE = 0x2A01,
 	CS42L42_REG_ASP_RX_CH1_AP_RES = 0x2A02,
 	CS42L42_REG_ASP_RX_CH2_AP_RES = 0x2A05,
-	CS42L42_REG_FINAL_HEADPHONE_VOL = 0x1F06,
 };
 
 enum {
@@ -134,13 +138,16 @@ enum {
 	CS42L42_PLL_DIV_OUT_3072 = 0x10,
 	CS42L42_PLL_CAL_RATIO_3072 = 0x7D,
 	CS42L42_PLL_MODE_3072 = 0x03,
-	CS42L42_MUTED_HP_CTL_VALUE = 0x0E,
-	CS42L42_UNMUTED_HP_CTL_VALUE = 0x02,
+	CS42L42_MUTED_HP_CTL_VALUE = 0x0D,
+	CS42L42_UNMUTED_HP_CTL_VALUE = 0x01,
+	CS42L42_MIXER_VOL_MUTE = 0x3F,
+	CS42L42_MIXER_VOL_DEFAULT = 0x15, /* -21 dB at default volume 64/127 */
+	CS42L42_SRC_FS_48K = 0x4C,
+	CS42L42_DAC_CTL2_UNMUTED = 0x02,
 	CS42L42_TS_PLUG_STATE = 0x03,
 	CS42L42_DETECT_OVERRIDE_VALUE = 0x03,
 	CS42L42_DETECT_ENABLE_VALUE = 0x8F,
 	CS42L42_DETECT_STATUS_LATCH_VALUE = 0xC2,
-	CS42L42_FINAL_HP_VOL_DEFAULT = 0x86,
 };
 
 struct cs42l42_script_reg_write {
@@ -170,27 +177,34 @@ static const struct cs42l42_script_reg_write setup_script_post_power[] = {
 
 static const struct cs42l42_script_reg_write setup_script_route[] = {
 	{CS42L42_REG_CLOCK_CTL, 0x13},
-	{CS42L42_REG_FSYNC_PW_LOWER, 0x1F},
-	{CS42L42_REG_FSYNC_PERIOD_LOWER, 0x3F},
+	{CS42L42_REG_FSYNC_PW_LOWER, CS42L42_FSYNC_PW_LOWER_48K},
+	{CS42L42_REG_FSYNC_PW_UPPER, CS42L42_FSYNC_PW_UPPER_48K},
+	{CS42L42_REG_FSYNC_PERIOD_LOWER, CS42L42_FSYNC_PERIOD_LOWER_48K},
+	{CS42L42_REG_FSYNC_PERIOD_UPPER, CS42L42_FSYNC_PERIOD_UPPER_48K},
 	{CS42L42_REG_ASP_CLK_CFG, 0x34},
 	{CS42L42_REG_ASP_FRM_CFG, 0x1A},
-	{CS42L42_REG_ASP_RX_CH1_AP_RES, 0x02},
-	{CS42L42_REG_ASP_RX_CH2_AP_RES, 0x42},
-	{CS42L42_REG_HP_VOL_A, 0x2A},
-	{CS42L42_REG_HP_VOL_B, 0x2A},
-	{CS42L42_REG_ASP_RX_ENABLE, 0x0C},
-	{CS42L42_REG_DAC_CTL, 0x01},
-	{CS42L42_REG_MIXER_CHA_VOL, 0x00},
-	{CS42L42_REG_MIXER_CHB_VOL, 0x00},
+	{CS42L42_REG_SP_RX_CH_SEL, CS42L42_SP_RX_CH_B_SECOND_SLOT},
+	{CS42L42_REG_ASP_RX_CH1_AP_RES, CS42L42_ASP_RX_CH1_AP_RES_24},
+	{CS42L42_REG_ASP_RX_CH2_AP_RES, CS42L42_ASP_RX_CH2_AP_RES_24},
+	{CS42L42_REG_SRC_SDIN_FS, CS42L42_SRC_FS_48K},
+	{CS42L42_REG_SRC_SDOUT_FS, CS42L42_SRC_FS_48K},
+	{CS42L42_REG_ASP_RX_ENABLE, CS42L42_ASP_RX_ENABLE_STEREO},
+	{CS42L42_REG_EQ_MUTE_CTL, 0x01},
+	{CS42L42_REG_MIXER_CHA_VOL, CS42L42_MIXER_VOL_DEFAULT},
+	{CS42L42_REG_MIXER_ADC_VOL, CS42L42_MIXER_VOL_MUTE},
+	{CS42L42_REG_MIXER_CHB_VOL, CS42L42_MIXER_VOL_DEFAULT},
+	{CS42L42_REG_DAC_CTL1, 0x00},
+	{CS42L42_REG_PWR_CTL2, 0x84},
 	{CS42L42_REG_PWR_CTL1, 0x96},
-	{CS42L42_REG_CODEC_CTL, 0x41},
-	{CS42L42_REG_MIC_DET_CTL1, CS42L42_DETECT_ENABLE_VALUE},
-	{CS42L42_REG_HS_CLAMP_DISABLE, 0x01},
-	{CS42L42_REG_HP_CTL, CS42L42_MUTED_HP_CTL_VALUE},
 };
 
 static const struct cs42l42_script_reg_write setup_script_final[] = {
-	{CS42L42_REG_FINAL_HEADPHONE_VOL, CS42L42_FINAL_HP_VOL_DEFAULT},
+	{CS42L42_REG_CODEC_CTL, 0x41},
+	{CS42L42_REG_MISC_DET_CTL, CS42L42_DETECT_OVERRIDE_VALUE},
+	{CS42L42_REG_MIC_DET_CTL1, CS42L42_DETECT_ENABLE_VALUE},
+	{CS42L42_REG_HS_CLAMP_DISABLE, 0x01},
+	{CS42L42_REG_DAC_CTL2, CS42L42_DAC_CTL2_UNMUTED},
+	{CS42L42_REG_HP_CTL, CS42L42_MUTED_HP_CTL_VALUE},
 	{CS42L42_REG_TIPSENSE_CTL, CS42L42_DETECT_STATUS_LATCH_VALUE},
 };
 
@@ -375,7 +389,20 @@ static bool cs42l42_init_stage(const struct device *dev)
 	}
 	cs42l42_delay_ms(1);
 
-	return cs42l42_run_script(dev, setup_script_post_power, ARRAY_SIZE(setup_script_post_power));
+	if (!cs42l42_run_script(dev, setup_script_post_power, ARRAY_SIZE(setup_script_post_power))) {
+		return false;
+	}
+
+	/* Poll OSC_SWITCH_STATUS (0x1109) up to 10 ms for SCLK handoff (0x02). */
+	for (int i = 0; i < 10; ++i) {
+		uint8_t osc_status = 0U;
+		if (cs42l42_read_reg(dev, CS42L42_REG_OSC_SWITCH_STATUS, &osc_status) &&
+		    (osc_status & 0x02U) != 0U) {
+			break;
+		}
+		cs42l42_delay_ms(1);
+	}
+	return true;
 }
 
 static bool cs42l42_start_stream_script(const struct device *dev)
@@ -388,11 +415,13 @@ static bool cs42l42_start_stream_script(const struct device *dev)
 		return false;
 	}
 
-	cs42l42_delay_ms(22);
+	/* Allow headphone charge pump and DAC references to settle after PWR_CTL1=0x96. */
+	cs42l42_delay_ms(10);
 	if (!cs42l42_run_script(dev, setup_script_final, ARRAY_SIZE(setup_script_final))) {
 		return false;
 	}
 
+	cs42l42_delay_ms(15);
 	if (!cs42l42_read_reg(dev, CS42L42_REG_PLL_LOCK_STATUS, &pll_lock)) {
 		return false;
 	}
@@ -401,34 +430,46 @@ static bool cs42l42_start_stream_script(const struct device *dev)
 	return true;
 }
 
-/* Map logical volume 0..127 -> CS42L42 HP_VOL (0.5 dB/step attenuation):
- *   0       -> 0xFF (digital mute)
- *   1..127  -> 84..0 (0x54 = -42.0 dB .. 0x00 = 0.0 dB); 64 -> 42 (0x2A = -21.0 dB). */
+/* Map logical volume 0..127 -> CS42L42 MIXER_CHA_VOL / MIXER_CHB_VOL (0x2301 / 0x2303):
+ *   6-bit attenuation register (1.0 dB/step, 0x00 = 0 dB .. 0x3E = -62 dB, 0x3F = mute):
+ *   0       -> 0x3F (digital mixer mute)
+ *   1..127  -> 42..0 (0x2A = -42 dB .. 0x00 = 0 dB); 64 -> 21 (0x15 = -21 dB). */
 static uint8_t cs42l42_volume_to_reg(int vol_0_to_127)
 {
 	if (vol_0_to_127 <= 0) {
-		return 0xFFU;
+		return CS42L42_MIXER_VOL_MUTE;
 	}
 	const uint32_t clamped = (vol_0_to_127 >= 127) ? 127U : (uint32_t)vol_0_to_127;
-	const uint32_t atten_half_db = ((127U - clamped) * 84U + 63U) / 126U;
-	return (uint8_t)atten_half_db;
+	const uint32_t atten_db = ((127U - clamped) * 42U + 63U) / 126U;
+	return (uint8_t)(atten_db & CS42L42_MASK_MIXER_VOL);
 }
 
 static bool cs42l42_set_volume_raw(const struct device *dev, uint8_t volume)
 {
 	struct cs42l42_data *const data = dev->data;
+	const uint8_t mixer_vol = (uint8_t)(volume & CS42L42_MASK_MIXER_VOL);
 
 	cs42l42_reset_page_cache(data);
-	return cs42l42_write_reg(dev, CS42L42_REG_HP_VOL_A, volume) &&
-	       cs42l42_write_reg(dev, CS42L42_REG_HP_VOL_B, volume);
+	return cs42l42_write_reg(dev, CS42L42_REG_MIXER_CHA_VOL, mixer_vol) &&
+	       cs42l42_write_reg(dev, CS42L42_REG_MIXER_ADC_VOL, CS42L42_MIXER_VOL_MUTE) &&
+	       cs42l42_write_reg(dev, CS42L42_REG_MIXER_CHB_VOL, mixer_vol);
 }
 
 static bool cs42l42_set_mute_raw(const struct device *dev, bool mute)
 {
 	struct cs42l42_data *const data = dev->data;
-	const bool effective_mute = mute || (data->volume == 0xFFU);
+	const bool effective_mute = mute || (data->volume >= CS42L42_MIXER_VOL_MUTE);
 
 	cs42l42_reset_page_cache(data);
+	if (!effective_mute) {
+		const uint8_t mixer_vol = (uint8_t)(data->volume & CS42L42_MASK_MIXER_VOL);
+		if (!cs42l42_write_reg(dev, CS42L42_REG_HS_CLAMP_DISABLE, 0x01) ||
+		    !cs42l42_write_reg(dev, CS42L42_REG_DAC_CTL2, CS42L42_DAC_CTL2_UNMUTED) ||
+		    !cs42l42_write_reg(dev, CS42L42_REG_MIXER_CHA_VOL, mixer_vol) ||
+		    !cs42l42_write_reg(dev, CS42L42_REG_MIXER_CHB_VOL, mixer_vol)) {
+			return false;
+		}
+	}
 	return cs42l42_write_reg(dev, CS42L42_REG_HP_CTL,
 				 effective_mute ? CS42L42_MUTED_HP_CTL_VALUE
 						: CS42L42_UNMUTED_HP_CTL_VALUE);
@@ -533,11 +574,11 @@ static int cs42l42_set_property(const struct device *dev,
 		}
 		data->volume = reg;
 		if (!data->muted) {
-			if (reg == 0xFFU) {
+			if (reg >= CS42L42_MIXER_VOL_MUTE) {
 				if (!cs42l42_set_mute_raw(dev, true)) {
 					return -EIO;
 				}
-			} else if (prev_vol == 0xFFU) {
+			} else if (prev_vol >= CS42L42_MIXER_VOL_MUTE) {
 				if (!cs42l42_set_mute_raw(dev, false)) {
 					return -EIO;
 				}
@@ -628,35 +669,35 @@ void cs42l42_codec_log_state(const struct device *dev, const char *tag)
 {
 	struct cs42l42_data *const data = dev->data;
 	uint8_t clock_ctl = 0U;
-	uint8_t mclk_ctl = 0U;
-	uint8_t mclk_src = 0U;
 	uint8_t asp_clk_cfg = 0U;
 	uint8_t asp_frm_cfg = 0U;
-	uint8_t fs_rate_en = 0U;
-	uint8_t pll_ctl1 = 0U;
-	uint8_t pll_ctl3 = 0U;
-	uint8_t pll_ctl4 = 0U;
 	uint8_t pll_lock = 0U;
 	uint8_t pwr_ctl1 = 0U;
+	uint8_t pwr_ctl2 = 0U;
 	uint8_t codec_ctl = 0U;
 	uint8_t asp_rx_enable = 0U;
+	uint8_t sp_rx_sel = 0U;
+	uint8_t src_sdin_fs = 0U;
+	uint8_t mixer_a = 0U;
+	uint8_t mixer_b = 0U;
+	uint8_t dac_ctl2 = 0U;
 	uint8_t hp_ctl = 0U;
 
 	cs42l42_reset_page_cache(data);
 	const bool ok =
 		cs42l42_read_reg(dev, CS42L42_REG_CLOCK_CTL, &clock_ctl) &&
-		cs42l42_read_reg(dev, CS42L42_REG_MCLK_CTL, &mclk_ctl) &&
-		cs42l42_read_reg(dev, CS42L42_REG_MCLK_SRC_SEL, &mclk_src) &&
 		cs42l42_read_reg(dev, CS42L42_REG_ASP_CLK_CFG, &asp_clk_cfg) &&
 		cs42l42_read_reg(dev, CS42L42_REG_ASP_FRM_CFG, &asp_frm_cfg) &&
-		cs42l42_read_reg(dev, CS42L42_REG_FS_RATE_EN, &fs_rate_en) &&
-		cs42l42_read_reg(dev, CS42L42_REG_PLL_CTL1, &pll_ctl1) &&
-		cs42l42_read_reg(dev, CS42L42_REG_PLL_CTL3, &pll_ctl3) &&
-		cs42l42_read_reg(dev, CS42L42_REG_PLL_CTL4, &pll_ctl4) &&
 		cs42l42_read_reg(dev, CS42L42_REG_PLL_LOCK_STATUS, &pll_lock) &&
 		cs42l42_read_reg(dev, CS42L42_REG_PWR_CTL1, &pwr_ctl1) &&
+		cs42l42_read_reg(dev, CS42L42_REG_PWR_CTL2, &pwr_ctl2) &&
 		cs42l42_read_reg(dev, CS42L42_REG_CODEC_CTL, &codec_ctl) &&
 		cs42l42_read_reg(dev, CS42L42_REG_ASP_RX_ENABLE, &asp_rx_enable) &&
+		cs42l42_read_reg(dev, CS42L42_REG_SP_RX_CH_SEL, &sp_rx_sel) &&
+		cs42l42_read_reg(dev, CS42L42_REG_SRC_SDIN_FS, &src_sdin_fs) &&
+		cs42l42_read_reg(dev, CS42L42_REG_MIXER_CHA_VOL, &mixer_a) &&
+		cs42l42_read_reg(dev, CS42L42_REG_MIXER_CHB_VOL, &mixer_b) &&
+		cs42l42_read_reg(dev, CS42L42_REG_DAC_CTL2, &dac_ctl2) &&
 		cs42l42_read_reg(dev, CS42L42_REG_HP_CTL, &hp_ctl);
 
 	if (!ok) {
@@ -664,11 +705,11 @@ void cs42l42_codec_log_state(const struct device *dev, const char *tag)
 		return;
 	}
 
-	LOG_INF("CS42L42[%s]: CLK=0x%02x MCLK=0x%02x SRC=0x%02x ASPCLK=0x%02x ASPFRM=0x%02x FS=0x%02x PLL1=0x%02x PLL3=0x%02x PLL4=0x%02x LOCK=0x%02x PWR1=0x%02x CODEC=0x%02x ASPRX=0x%02x HP=0x%02x",
+	LOG_INF("CS42L42[%s]: CLK=0x%02x ASP=0x%02x/0x%02x LOCK=0x%02x PWR=0x%02x/0x%02x CODEC=0x%02x ASPRX=0x%02x CHSEL=0x%02x SRCFS=0x%02x MIX=0x%02x/0x%02x DAC2=0x%02x HP=0x%02x",
 		tag ? tag : "?",
-		clock_ctl, mclk_ctl, mclk_src, asp_clk_cfg, asp_frm_cfg, fs_rate_en,
-		pll_ctl1, pll_ctl3, pll_ctl4, pll_lock, pwr_ctl1, codec_ctl, asp_rx_enable,
-		hp_ctl);
+		clock_ctl, asp_clk_cfg, asp_frm_cfg, pll_lock, pwr_ctl1, pwr_ctl2,
+		codec_ctl, asp_rx_enable, sp_rx_sel, src_sdin_fs, mixer_a, mixer_b,
+		dac_ctl2, hp_ctl);
 }
 
 static int cs42l42_init(const struct device *dev)
