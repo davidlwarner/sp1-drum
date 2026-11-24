@@ -251,28 +251,30 @@ static inline float render_snare_sample(sp1_snare_voice_t *v) {
 
     const float m = v->tone_morph;
 
-    /* Dual detuned resonators:
-     * 1. ~185 Hz shell body + fast pitch-transient knock
-     * 2. ~330-480 Hz woody rim overtone + sharp pitch-transient knock */
-    const float body_hz = 185.0f + (135.0f * v->knock_env);
-    const float rim_hz = v->rim_freq_hz + (245.0f * v->knock_env);
+    float osc_rim = 0.0f;
+    float resonator = 0.0f;
+    if (v->body_env > 0.0f) {
+        /* Dual detuned resonators:
+         * 1. ~185 Hz shell body + fast pitch-transient knock
+         * 2. ~330-480 Hz woody rim overtone + sharp pitch-transient knock */
+        const float body_hz = 185.0f + (135.0f * v->knock_env);
+        const float rim_hz = v->rim_freq_hz + (245.0f * v->knock_env);
 
-    v->phase_body += sp1_hz_to_phase_inc(body_hz);
-    v->phase_rim += sp1_hz_to_phase_inc(rim_hz);
+        v->phase_body += sp1_hz_to_phase_inc(body_hz);
+        v->phase_rim += sp1_hz_to_phase_inc(rim_hz);
 
-    const float osc_body =
-        (0.65f * sp1_sine_lut(v->phase_body)) + (0.35f * sp1_triangle_osc(v->phase_body));
-    const float osc_rim =
-        (0.55f * sp1_triangle_osc(v->phase_rim)) + (0.45f * sp1_sine_lut(v->phase_rim));
+        const float osc_body =
+            (0.65f * sp1_sine_lut(v->phase_body)) + (0.35f * sp1_triangle_osc(v->phase_body));
+        osc_rim =
+            (0.55f * sp1_triangle_osc(v->phase_rim)) + (0.45f * sp1_sine_lut(v->phase_rim));
 
-    /* In Rimshot region (m -> 0.0f), woody rim overtone and transient knock dominate.
-     * In Snare region   (m -> 1.0f), 185 Hz shell body balances with snappy wire noise. */
-    const float body_weight = 0.45f + (0.30f * m);
-    const float rim_weight = 0.85f - (0.50f * m);
-    const float knock_boost = 1.0f + ((1.0f - m) * 0.85f * v->knock_env);
-    const float resonator_raw =
-        ((osc_body * body_weight) + (osc_rim * rim_weight)) * knock_boost;
-    const float resonator = sp1_soft_clip(resonator_raw * 1.25f) * v->body_env;
+        const float body_weight = 0.45f + (0.30f * m);
+        const float rim_weight = 0.85f - (0.50f * m);
+        const float knock_boost = 1.0f + ((1.0f - m) * 0.85f * v->knock_env);
+        const float resonator_raw =
+            ((osc_body * body_weight) + (osc_rim * rim_weight)) * knock_boost;
+        resonator = sp1_soft_clip(resonator_raw * 1.25f) * v->body_env;
+    }
 
     /* Signed xorshift32 noise filtered through Cytomic TPT SVF bandpass + highpass */
     const float raw_noise = sp1_xorshift32_noise(&v->rng);
@@ -286,6 +288,9 @@ static inline float render_snare_sample(sp1_snare_voice_t *v) {
     const float out = sp1_soft_clip(resonator + wire_sig) * v->velocity_gain;
 
     v->body_env *= v->body_decay_coeff;
+    if (v->body_env < SP1_DSP_ENV_FLOOR) {
+        v->body_env = 0.0f;
+    }
     v->noise_env *= v->noise_decay_coeff;
     v->knock_env *= v->knock_decay_coeff;
     if (v->knock_env < SP1_DSP_ENV_FLOOR) {

@@ -135,8 +135,10 @@ int cmd_crash_report(const struct shell* sh, size_t argc, char** argv) {
                 static_cast<unsigned int>(s.gpregret),
                 static_cast<unsigned int>(s.gpregret2));
     if (s.retained_watchdog_valid) {
-        shell_warn(sh, "Previous boot watchdog expiry on channel %u",
-                   static_cast<unsigned int>(s.retained_watchdog_channel));
+        shell_warn(sh, "Previous boot watchdog expiry on channel %u (phase=0x%02x code=0x%02x)",
+                   static_cast<unsigned int>(s.retained_watchdog_channel),
+                   static_cast<unsigned int>(s.retained_control_phase),
+                   static_cast<unsigned int>(s.retained_code));
     }
     if (s.retained_crash_valid) {
         print_crash_details(s);
