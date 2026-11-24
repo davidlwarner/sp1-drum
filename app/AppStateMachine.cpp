@@ -128,6 +128,7 @@ static void idle_entry(void* o) {
 
 static smf_state_result idle_run(void* o) {
     auto& m = smf::ctx<AppMachine>(o);
+    core::reset_breadcrumbs::mark_control_phase(0x10U);
     feed(m);
 
     if (m.wake_hold_required) {
@@ -213,6 +214,7 @@ static void running_entry(void* o) {
 
 static smf_state_result running_run(void* o) {
     auto& m = smf::ctx<AppMachine>(o);
+    core::reset_breadcrumbs::mark_control_phase(0x01U);
     feed(m);
 
     if (!m.boot_report_printed && m.boot_report_due_ms != 0 &&
@@ -226,11 +228,13 @@ static smf_state_result running_run(void* o) {
         return SMF_EVENT_HANDLED;
     }
 
+    core::reset_breadcrumbs::mark_control_phase(0x02U);
     if (m.midi != nullptr) {
         m.midi->poll_faders();
     }
 
     if (m.audio_active) {
+        core::reset_breadcrumbs::mark_control_phase(0x03U);
         if (!m.routing_initialized) {
             m.routing_initialized = true;
             m.routing_poll_ticks = 0U;
@@ -316,13 +320,16 @@ static smf_state_result running_run(void* o) {
         }
     }
 
+    core::reset_breadcrumbs::mark_control_phase(0x04U);
     if (m.power != nullptr) {
         m.power->service_tick();
     }
     sp1_audio_cycle_stats_t cyc_stats{};
     sp1_hal_audio_get_cycle_stats(&cyc_stats);
+    core::reset_breadcrumbs::mark_control_phase(0x05U);
     sp1_hal_service_background();
 
+    core::reset_breadcrumbs::mark_control_phase(0x06U);
     static int64_t s_last_heartbeat_ms = 0;
     const int64_t now_hb_ms = k_uptime_get();
     if (s_last_heartbeat_ms == 0 || (now_hb_ms - s_last_heartbeat_ms) >= kHeartbeatIntervalMs) {
@@ -342,6 +349,7 @@ static smf_state_result running_run(void* o) {
                 static_cast<unsigned int>(workq_free));
     }
 
+    core::reset_breadcrumbs::mark_control_phase(0x07U);
     k_sleep(K_MSEC(kPollCadenceMs));
     return SMF_EVENT_HANDLED;
 }
