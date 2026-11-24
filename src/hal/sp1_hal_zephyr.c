@@ -7,6 +7,7 @@
 #include <zephyr/audio/codec.h>
 #include <zephyr/audio/midi.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/pwm.h>
@@ -32,6 +33,11 @@ static const struct gpio_dt_spec g_cs42l42_rst =
     GPIO_DT_SPEC_GET(DT_NODELABEL(cs42l42), reset_gpios);
 static const struct gpio_dt_spec g_tas2505_rst =
     GPIO_DT_SPEC_GET(DT_NODELABEL(tas2505), reset_gpios);
+
+static const struct adc_dt_spec g_tracks_adc =
+    ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), tracks);
+static const struct adc_dt_spec g_volume_adc =
+    ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), volume);
 
 static const struct pwm_dt_spec g_track_leds[SP1_NUM_TRACK_LEDS] = {
     PWM_DT_SPEC_GET(DT_NODELABEL(led_track_1)),
@@ -812,6 +818,17 @@ void sp1_hal_audio_reset_cycle_stats(void) {
     k_spin_unlock(&g_cycle_stats_lock, key);
 }
 
+size_t sp1_hal_audio_get_thread_free_stack(void) {
+    if (!g_audio_thread_created) {
+        return 0U;
+    }
+    size_t unused = 0U;
+    if (k_thread_stack_space_get(&g_audio_thread_data, &unused) == 0) {
+        return unused;
+    }
+    return 0U;
+}
+
 void sp1_hal_audio_shutdown(void) {
     (void)sp1_hal_audio_stop();
     sp1_hal_audio_set_mute(true);
@@ -867,6 +884,61 @@ uint32_t sp1_hal_time_ms(void) {
     return k_uptime_get_32();
 }
 
+static bool sp1_read_adc_mv(const struct adc_dt_spec *spec, int32_t *out_mv, int16_t *out_raw) {
+    if (spec == NULL || !adc_is_ready_dt(spec)) {
+        return false;
+    }
+    int16_t raw = 0;
+    struct adc_sequence seq = {
+        .buffer = &raw,
+        .buffer_size = sizeof(raw),
+    };
+    (void)adc_sequence_init_dt(spec, &seq);
+    if (adc_read_dt(spec, &seq) < 0) {
+        return false;
+    }
+    int32_t mv = (int32_t)raw;
+    if (adc_raw_to_millivolts_dt(spec, &mv) < 0) {
+        return false;
+    }
+    *out_mv = mv;
+    *out_raw = raw;
+    return true;
+}
+
+static void sp1_hal_diag_poll_adc_keys(void) {
+    static int64_t last_sample_ms = 0;
+    static int64_t last_log_ms = 0;
+    static bool was_active = false;
+
+    const int64_t now_ms = k_uptime_get();
+    if ((now_ms - last_sample_ms) < 60) {
+        return;
+    }
+    last_sample_ms = now_ms;
+
+    int32_t ain0_mv = 0;
+    int32_t ain1_mv = 0;
+    int16_t ain0_raw = 0;
+    int16_t ain1_raw = 0;
+    const bool ok0 = sp1_read_adc_mv(&g_tracks_adc, &ain0_mv, &ain0_raw);
+    const bool ok1 = sp1_read_adc_mv(&g_volume_adc, &ain1_mv, &ain1_raw);
+    if (!ok0 && !ok1) {
+        return;
+    }
+
+    const bool active = (ok0 && ain0_mv > 100) || (ok1 && ain1_mv > 100);
+    if (active) {
+        if (!was_active || (now_ms - last_log_ms) >= 120) {
+            last_log_ms = now_ms;
+            LOG_INF("ADC raw: AIN0=%d mV (raw=%d), AIN1=%d mV (raw=%d)",
+                    (int)ain0_mv, (int)ain0_raw, (int)ain1_mv, (int)ain1_raw);
+        }
+    }
+    was_active = active;
+}
+
 void sp1_hal_service_background(void) {
     sp1_hal_midi_flush_tx();
+    sp1_hal_diag_poll_adc_keys();
 }

@@ -67,11 +67,12 @@ namespace power {
 void PowerManager::init() {
     LOG_INF("Initializing Power Monitor (BQ24232)");
 
-    uint32_t resetreas = NRF_POWER->RESETREAS;
-    if (resetreas != 0U) {
-        NRF_POWER->RESETREAS = resetreas;
-    } else {
-        resetreas = core::reset_breadcrumbs::snapshot().resetreas;
+    core::reset_breadcrumbs::capture_early();
+    uint32_t resetreas = core::reset_breadcrumbs::snapshot().resetreas;
+    const uint32_t live_resetreas = NRF_POWER->RESETREAS;
+    if (live_resetreas != 0U) {
+        resetreas |= live_resetreas;
+        NRF_POWER->RESETREAS = live_resetreas;
     }
 
     const bool reset_pin = (resetreas & POWER_RESETREAS_RESETPIN_Msk) != 0U;

@@ -14,6 +14,7 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -112,6 +113,7 @@ void sp1_hal_audio_service_routing(void);
 void sp1_hal_audio_record_cycles(uint32_t elapsed_cycles);
 void sp1_hal_audio_get_cycle_stats(sp1_audio_cycle_stats_t *out_stats);
 void sp1_hal_audio_reset_cycle_stats(void);
+size_t sp1_hal_audio_get_thread_free_stack(void);
 
 /**
  * Safe teardown prior to sys_poweroff() (Zephyr) or WAV header finalization (Host):

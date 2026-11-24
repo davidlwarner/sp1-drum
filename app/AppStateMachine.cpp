@@ -18,6 +18,8 @@ constexpr int64_t kWakeHoldGraceMs = 60;      // 60 ms GPIO startup grace/deboun
 constexpr int64_t kFnHoldShutdownMs = 3000;   // 3 second hold to shut down
 constexpr int64_t kFnReleaseStableMs = 40;    // 40 ms release debounce before sys_poweroff / standby
 constexpr int64_t kBootReportDelayMs = 2000;  // ~2 s delay in STATE_RUNNING for USB-C CDC ACM enum
+constexpr int64_t kHeartbeatIntervalMs = 5000; // 5 s stack-watermark & audio-health heartbeat
+constexpr uint32_t kShutdownReleaseDebounceMs = 100U; // 100 ms bounce immunity on P0.27 during 3 s hold
 constexpr uint8_t kRoutingPollDividerTicks = 10U;  // 10 * 20 ms = 200 ms jack-detect poll
 
 void feed(AppMachine& m) {
@@ -64,20 +66,36 @@ void abort_wake_to_system_off(AppMachine& m) {
     k_sleep(K_FOREVER);
 }
 
-/// Returns true if Function button (P0.27) has been held for 3.0 s (with 40 ms release-bounce immunity).
+/// Returns true if Function button (P0.27) has been held for 3.0 s (with 100 ms release-bounce immunity).
 bool check_fn_hold_shutdown(AppMachine& m) {
     if (m.power == nullptr) {
         return false;
     }
 
+    static bool s_prev_logged_pressed = false;
+    static int64_t s_edge_down_ms = 0;
+
     const bool pressed = m.power->function_button_pressed();
+    const int64_t now_ms = k_uptime_get();
+    if (pressed != s_prev_logged_pressed) {
+        s_prev_logged_pressed = pressed;
+        if (pressed) {
+            s_edge_down_ms = now_ms;
+            LOG_INF("Function (P0.27): DOWN (wait_rel=%u)",
+                    m.power_hold.wait_for_release ? 1U : 0U);
+        } else {
+            LOG_INF("Function (P0.27): UP (held=%lld ms, hold_acc=%u ms)",
+                    static_cast<long long>(now_ms - s_edge_down_ms),
+                    static_cast<unsigned int>(m.power_hold.hold_elapsed_ms));
+        }
+    }
     m.fn_was_pressed = pressed;
 
     return sp1_ui_power_hold_update(&m.power_hold,
                                     pressed,
                                     static_cast<uint32_t>(kPollCadenceMs),
                                     static_cast<uint32_t>(kFnHoldShutdownMs),
-                                    SP1_UI_POWER_RELEASE_DEBOUNCE_MS);
+                                    kShutdownReleaseDebounceMs);
 }
 
 }  // namespace
@@ -303,8 +321,26 @@ static smf_state_result running_run(void* o) {
     }
     sp1_audio_cycle_stats_t cyc_stats{};
     sp1_hal_audio_get_cycle_stats(&cyc_stats);
-    (void)cyc_stats;
     sp1_hal_service_background();
+
+    static int64_t s_last_heartbeat_ms = 0;
+    const int64_t now_hb_ms = k_uptime_get();
+    if (s_last_heartbeat_ms == 0 || (now_hb_ms - s_last_heartbeat_ms) >= kHeartbeatIntervalMs) {
+        s_last_heartbeat_ms = now_hb_ms;
+        size_t main_free = 0U;
+        size_t workq_free = 0U;
+        (void)k_thread_stack_space_get(k_current_get(), &main_free);
+        (void)k_thread_stack_space_get(&k_sys_work_q.thread, &workq_free);
+        const size_t audio_free = sp1_hal_audio_get_thread_free_stack();
+        LOG_INF("Heartbeat: up=%lld s seq=%s underruns=%u max_cyc=%u stack_free(main=%u audio=%u workq=%u)",
+                static_cast<long long>(now_hb_ms / 1000),
+                (m.seq != nullptr && sp1_seq_is_running(m.seq)) ? "PLAY" : "STOP",
+                static_cast<unsigned int>(cyc_stats.underrun_count),
+                static_cast<unsigned int>(cyc_stats.max_cycles),
+                static_cast<unsigned int>(main_free),
+                static_cast<unsigned int>(audio_free),
+                static_cast<unsigned int>(workq_free));
+    }
 
     k_sleep(K_MSEC(kPollCadenceMs));
     return SMF_EVENT_HANDLED;

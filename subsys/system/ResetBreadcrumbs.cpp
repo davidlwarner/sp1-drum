@@ -7,6 +7,7 @@
 #include <zephyr/arch/exception.h>
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/fatal.h>
+#include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/linker/section_tags.h>
 #include <zephyr/logging/log.h>
@@ -221,14 +222,20 @@ void capture_early() {
     g_snapshot.resetreas = NRF_POWER->RESETREAS;
     g_snapshot.gpregret = static_cast<uint8_t>(NRF_POWER->GPREGRET & 0xFFU);
     g_snapshot.gpregret2 = static_cast<uint8_t>(NRF_POWER->GPREGRET2 & 0xFFU);
-    g_snapshot.reset_cause_valid =
-        hwinfo_get_reset_cause(&g_snapshot.reset_cause) == 0;
+    g_snapshot.reset_cause_valid = false;
 
     capture_from_record(g_retained);
     capture_from_record(*high_sram_retained());
 
     g_captured = true;
 }
+
+static int early_capture_sys_init(void) {
+    capture_early();
+    return 0;
+}
+
+SYS_INIT(early_capture_sys_init, PRE_KERNEL_1, 0);
 
 Snapshot snapshot() {
     return g_snapshot;

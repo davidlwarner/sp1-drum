@@ -444,6 +444,10 @@ void sp1_hal_audio_reset_cycle_stats(void) {
     host_cycle_spin_unlock();
 }
 
+size_t sp1_hal_audio_get_thread_free_stack(void) {
+    return 0U;
+}
+
 void sp1_hal_audio_shutdown(void) {
     g_audio_running = false;
 

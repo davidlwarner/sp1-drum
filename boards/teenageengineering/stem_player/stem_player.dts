@@ -160,7 +160,7 @@
 			status = "disabled";
 			io-channels = <&adc 1>;
 		sample-period-ms = <20>;
-		keyup-threshold-mv = <0>;
+		keyup-threshold-mv = <150>;
 
 		rocker_rwd {
 			press-thresholds-mv = <365>;
@@ -196,7 +196,7 @@
 			status = "disabled";
 			io-channels = <&adc 0>;
 		sample-period-ms = <20>;
-		keyup-threshold-mv = <0>;
+		keyup-threshold-mv = <80>;
 
 		track_1 {
 			press-thresholds-mv = <179 1178>;
