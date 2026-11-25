@@ -339,10 +339,13 @@ static smf_state_result running_run(void* o) {
         (void)k_thread_stack_space_get(k_current_get(), &main_free);
         (void)k_thread_stack_space_get(&k_sys_work_q.thread, &workq_free);
         const size_t audio_free = sp1_hal_audio_get_thread_free_stack();
-        LOG_INF("Heartbeat: up=%lld s seq=%s underruns=%u max_cyc=%u stack_free(main=%u audio=%u workq=%u)",
+        const uint32_t avg_cyc = sp1_audio_cycle_stats_avg(&cyc_stats);
+        LOG_INF("Heartbeat: up=%lld s seq=%s underruns=%u cyc(last=%u avg=%u max=%u) stack_free(main=%u audio=%u workq=%u)",
                 static_cast<long long>(now_hb_ms / 1000),
                 (m.seq != nullptr && sp1_seq_is_running(m.seq)) ? "PLAY" : "STOP",
                 static_cast<unsigned int>(cyc_stats.underrun_count),
+                static_cast<unsigned int>(cyc_stats.last_cycles),
+                static_cast<unsigned int>(avg_cyc),
                 static_cast<unsigned int>(cyc_stats.max_cycles),
                 static_cast<unsigned int>(main_free),
                 static_cast<unsigned int>(audio_free),

@@ -211,6 +211,112 @@ void sp1_master_fx_set_dub_delay(sp1_master_fx_t *fx,
     fx->delay_feedback = fb;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+#define SP1_FX_NOINLINE __attribute__((noinline))
+#else
+#define SP1_FX_NOINLINE
+#endif
+
+static inline float fast_round_nearest(float x) {
+    /* Bitcrusher inputs are bounded within ~[-65536, +65536], safe for int32_t. */
+    return (float)((int32_t)(x + ((x >= 0.0f) ? 0.5f : -0.5f)));
+}
+
+/* Register-resident fast path for normal playback (DJ filter centered, crush off, stutter off).
+ * Keeps all Dub Delay + Stutter record state in local registers with zero stack spills and
+ * fits completely inside the nRF52840 2 KB Flash ICACHE. */
+static SP1_FX_NOINLINE void process_block_normal_fast(sp1_master_fx_t *fx,
+                                                      const float *in_main_l,
+                                                      const float *in_main_r,
+                                                      const float *in_send_l,
+                                                      const float *in_send_r,
+                                                      int16_t *out_interleaved_pcm,
+                                                      uint32_t num_frames) {
+    int16_t *const delay_buf_l = fx->delay_buf_l;
+    int16_t *const delay_buf_r = fx->delay_buf_r;
+    int16_t *const stutter_buf = fx->stutter_buf;
+
+    uint32_t delay_wpos = fx->delay_write_pos;
+    const uint32_t delay_tap = fx->delay_tap_len;
+    uint32_t decim_cnt = fx->delay_decim_cnt;
+    float prev_l = fx->delay_prev_l;
+    float prev_r = fx->delay_prev_r;
+    float curr_l = fx->delay_curr_l;
+    float curr_r = fx->delay_curr_r;
+    float lp_l = fx->delay_lp_l;
+    float lp_r = fx->delay_lp_r;
+    const float delay_wet = fx->delay_wet;
+    const float delay_fb = fx->delay_feedback;
+
+    uint32_t stut_wpos = fx->stutter_write_pos;
+    const float master_drive = fx->master_drive;
+    const bool has_send = (in_send_l != NULL && in_send_r != NULL);
+
+    for (uint32_t i = 0U; i < num_frames; ++i) {
+        float sig_l = in_main_l[i];
+        float sig_r = in_main_r[i];
+
+        if (decim_cnt == 0U) {
+            const float send_l = has_send ? in_send_l[i] : 0.0f;
+            const float send_r = has_send ? in_send_r[i] : 0.0f;
+            const uint32_t read_idx = (delay_wpos - delay_tap) & SP1_FX_DELAY_TAP_MASK;
+
+            prev_l = curr_l;
+            prev_r = curr_r;
+            curr_l = (float)delay_buf_l[read_idx] * SP1_FX_INV_S16_SCALE;
+            curr_r = (float)delay_buf_r[read_idx] * SP1_FX_INV_S16_SCALE;
+
+            lp_l += 0.36f * (curr_l - lp_l);
+            lp_r += 0.36f * (curr_r - lp_r);
+#if !defined(__ARM_FP) || (__ARM_FP == 0)
+            if (fabsf(lp_l) < SP1_DSP_DENORMAL_FLOOR) {
+                lp_l = 0.0f;
+            }
+            if (fabsf(lp_r) < SP1_DSP_DENORMAL_FLOOR) {
+                lp_r = 0.0f;
+            }
+#endif
+
+            const float in_bbd_l = sp1_soft_clip((send_l * 0.80f) + (lp_r * delay_fb));
+            const float in_bbd_r = sp1_soft_clip((send_r * 0.35f) + (lp_l * delay_fb));
+
+            delay_buf_l[delay_wpos] = float_to_s16_clamped(in_bbd_l);
+            delay_buf_r[delay_wpos] = float_to_s16_clamped(in_bbd_r);
+            delay_wpos = (delay_wpos + 1U) & SP1_FX_DELAY_TAP_MASK;
+        }
+
+        const float bbd_t = k_bbd_interp_frac[decim_cnt];
+        sig_l += (prev_l + ((curr_l - prev_l) * bbd_t)) * delay_wet;
+        sig_r += (prev_r + ((curr_r - prev_r) * bbd_t)) * delay_wet;
+
+        decim_cnt++;
+        if (decim_cnt >= SP1_FX_DELAY_DECIM_FACTOR) {
+            decim_cnt = 0U;
+        }
+
+        /* Continuously record dry+delay stereo stream so stutter engages click-free */
+        const uint32_t w_idx = stut_wpos << 1U;
+        stutter_buf[w_idx] = float_to_s16_clamped(sig_l);
+        stutter_buf[w_idx + 1U] = float_to_s16_clamped(sig_r);
+        stut_wpos = (stut_wpos + 1U) & SP1_FX_STUTTER_MASK;
+
+        const float out_l = sp1_soft_clip(sig_l * master_drive);
+        const float out_r = sp1_soft_clip(sig_r * master_drive);
+        out_interleaved_pcm[i << 1U] = float_to_s16_clamped(out_l);
+        out_interleaved_pcm[(i << 1U) + 1U] = float_to_s16_clamped(out_r);
+    }
+
+    fx->delay_write_pos = delay_wpos;
+    fx->delay_decim_cnt = decim_cnt;
+    fx->delay_prev_l = prev_l;
+    fx->delay_prev_r = prev_r;
+    fx->delay_curr_l = curr_l;
+    fx->delay_curr_r = curr_r;
+    fx->delay_lp_l = lp_l;
+    fx->delay_lp_r = lp_r;
+    fx->stutter_write_pos = stut_wpos;
+}
+
 void sp1_master_fx_process_block(sp1_master_fx_t *fx,
                                  uint32_t step_16th_frames,
                                  const float *in_main_l,
@@ -271,15 +377,21 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
         sp1_svf_set_params(&fx->dj_svf_r, cutoff_hz, fx->dj_resonance_q);
         dj_mode = 1;
     } else {
-        /* Center deadzone [0.45..0.55]: keep SVFs warm at wide open bandwidth */
-        sp1_svf_set_params(&fx->dj_svf_l, 19500.0f, 0.707f);
-        sp1_svf_set_params(&fx->dj_svf_r, 19500.0f, 0.707f);
+        /* Center deadzone [0.45..0.55]: SVF bypassed; skip coefficient recomputation */
         dj_mode = 0;
     }
 
     const bool crush_enabled = (fx->crush_amount > 0.005f);
 
-    /* ── Division-Free Per-Sample Master FX Inner Loop ───────────────────── */
+    if (dj_mode == 0 && !crush_enabled &&
+        fx->stutter_target_div == SP1_STUTTER_OFF &&
+        fx->stutter_active_div == SP1_STUTTER_OFF) {
+        process_block_normal_fast(fx, in_main_l, in_main_r, in_send_l, in_send_r,
+                                  out_interleaved_pcm, num_frames);
+        return;
+    }
+
+    /* ── Division-Free Per-Sample Master FX Inner Loop (Active Performance FX) ── */
 
     for (uint32_t i = 0U; i < num_frames; ++i) {
         float sig_l = in_main_l[i];
@@ -300,12 +412,14 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
             /* Warm one-pole low-pass damper (~3.2 kHz) inside the ping-pong feedback loop */
             fx->delay_lp_l += 0.36f * (fx->delay_curr_l - fx->delay_lp_l);
             fx->delay_lp_r += 0.36f * (fx->delay_curr_r - fx->delay_lp_r);
+#if !defined(__ARM_FP) || (__ARM_FP == 0)
             if (fabsf(fx->delay_lp_l) < SP1_DSP_DENORMAL_FLOOR) {
                 fx->delay_lp_l = 0.0f;
             }
             if (fabsf(fx->delay_lp_r) < SP1_DSP_DENORMAL_FLOOR) {
                 fx->delay_lp_r = 0.0f;
             }
+#endif
 
             /* Ping-Pong topology:
              * - Left tap receives selective send + feedback from Right tap
@@ -410,8 +524,8 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
             if (fx->crush_hold_cnt == 0U) {
                 const float q_scale = fx->crush_quant_scale;
                 const float inv_q = fx->crush_inv_quant_scale;
-                fx->crush_hold_l = floorf((sig_l * q_scale) + 0.5f) * inv_q;
-                fx->crush_hold_r = floorf((sig_r * q_scale) + 0.5f) * inv_q;
+                fx->crush_hold_l = fast_round_nearest(sig_l * q_scale) * inv_q;
+                fx->crush_hold_r = fast_round_nearest(sig_r * q_scale) * inv_q;
             }
             sig_l = fx->crush_hold_l;
             sig_r = fx->crush_hold_r;

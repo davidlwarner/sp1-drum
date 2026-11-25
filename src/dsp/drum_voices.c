@@ -192,209 +192,425 @@ static void update_perc_coeffs(sp1_perc_voice_t *p) {
     p->fb_phase_scale = fb_scale;
 }
 
-/* ── Division-Free Per-Sample Voice Renderers ────────────────────────────── */
+/* ── Division-Free Register-Resident Voice Segment Renderers ─────────────── *
+ * Rendering one voice at a time across a contiguous [start, end) segment keeps
+ * each voice's inner loop well inside the nRF52840 2 KB Flash ICACHE and keeps
+ * hot phase/envelope/SVF state in Cortex-M4F registers with zero stack spills. */
 
-static inline float render_kick_sample(sp1_kick_voice_t *v) {
-    if (!v->active) {
-        return 0.0f;
+#if defined(__GNUC__) || defined(__clang__)
+#define SP1_DSP_NOINLINE __attribute__((noinline))
+#else
+#define SP1_DSP_NOINLINE
+#endif
+
+static SP1_DSP_NOINLINE void render_kick_segment(sp1_kick_voice_t *v,
+                                                 float *out_main_l,
+                                                 float *out_main_r,
+                                                 uint32_t start,
+                                                 uint32_t end) {
+    if (!v->active || start >= end) {
+        return;
     }
 
-    if (v->pitch_env > 0.0f) {
-        const float freq_hz = v->base_freq_hz + (v->pitch_span_hz * v->pitch_env);
-        v->phase += sp1_hz_to_phase_inc(freq_hz);
-    } else {
-        /* 45.0 Hz * (2^32 / 48000) = 4,026,532 */
-        v->phase += 4026532U;
+    uint32_t phase = v->phase;
+    float amp_env = v->amp_env;
+    float pitch_env = v->pitch_env;
+    float click_env = v->click_env;
+
+    const float amp_decay = v->amp_decay_coeff;
+    const float pitch_decay = v->pitch_decay_coeff;
+    const float click_decay = v->click_decay_coeff;
+    const uint32_t base_inc = sp1_hz_to_phase_inc(v->base_freq_hz);
+    const float pitch_span_inc_f = v->pitch_span_hz * SP1_DSP_PHASE_SCALE;
+    const float pd_depth_scale = v->pd_depth_scale;
+    const float drive_param = v->drive_param;
+    const float drive_gain = 1.15f + (drive_param * 1.15f);
+    const float fold_mix = drive_param * 0.30f;
+    const bool use_fold = (drive_param > 0.01f);
+    const float vel_gain = v->velocity_gain;
+    bool active = true;
+
+    for (uint32_t i = start; i < end; ++i) {
+        if (pitch_env > 0.0f) {
+            phase += base_inc + (uint32_t)(pitch_span_inc_f * pitch_env);
+            pitch_env *= pitch_decay;
+            if (pitch_env < SP1_DSP_ENV_FLOOR) {
+                pitch_env = 0.0f;
+            }
+        } else {
+            phase += base_inc;
+        }
+
+        uint32_t pd_offset = 0U;
+        float click_chirp = 0.0f;
+        if (click_env > 0.0f) {
+            pd_offset = (uint32_t)((int32_t)(click_env * pd_depth_scale));
+            click_chirp = sp1_sine_lut((phase << 2U) + pd_offset) * click_env * 0.26f;
+            click_env *= click_decay;
+            if (click_env < SP1_DSP_ENV_FLOOR) {
+                click_env = 0.0f;
+            }
+        }
+
+        const float sub_sine = sp1_sine_lut(phase + pd_offset);
+        const float sub_tri = sp1_triangle_osc(phase);
+        const float core = (sub_sine * 0.85f) + (sub_tri * 0.15f) + click_chirp;
+        const float pre_drive = core * drive_gain;
+
+        const float sat = sp1_soft_clip(pre_drive);
+        float shaped = sat;
+        if (use_fold) {
+            const float folded = sp1_wavefold_lut(pre_drive * 0.75f);
+            shaped = sat + ((folded - sat) * fold_mix);
+        }
+
+        const float out = shaped * amp_env * vel_gain;
+        out_main_l[i] += out;
+        out_main_r[i] += out;
+
+        amp_env *= amp_decay;
+        if (amp_env < SP1_DSP_ENV_FLOOR) {
+            amp_env = 0.0f;
+            pitch_env = 0.0f;
+            click_env = 0.0f;
+            active = false;
+            break;
+        }
     }
 
-    /* Transient phase-distortion punch (clamped < INT32_MAX) */
-    uint32_t pd_offset = 0U;
-    float click_chirp = 0.0f;
-    if (v->click_env > 0.0f) {
-        pd_offset = (uint32_t)((int32_t)(v->click_env * v->pd_depth_scale));
-        click_chirp = sp1_sine_lut((v->phase << 2U) + pd_offset) * v->click_env * 0.26f;
-    }
-    const float sub_sine = sp1_sine_lut(v->phase + pd_offset);
-    const float sub_tri = sp1_triangle_osc(v->phase);
-
-    const float core = (sub_sine * 0.85f) + (sub_tri * 0.15f) + click_chirp;
-    const float pre_drive = core * (1.15f + (v->drive_param * 1.15f));
-
-    /* Blend division-free cubic tanh soft-clipper with West-Coast wavefolder LUT */
-    const float sat = sp1_soft_clip(pre_drive);
-    float shaped = sat;
-    if (v->drive_param > 0.01f) {
-        const float folded = sp1_wavefold_lut(pre_drive * 0.75f);
-        shaped = sat + ((folded - sat) * (v->drive_param * 0.30f));
-    }
-
-    const float out = shaped * v->amp_env * v->velocity_gain;
-
-    v->amp_env *= v->amp_decay_coeff;
-    v->pitch_env *= v->pitch_decay_coeff;
-    v->click_env *= v->click_decay_coeff;
-    if (v->click_env < SP1_DSP_ENV_FLOOR) {
-        v->click_env = 0.0f;
-    }
-    if (v->pitch_env < SP1_DSP_ENV_FLOOR) {
-        v->pitch_env = 0.0f;
-    }
-
-    if (v->amp_env < SP1_DSP_ENV_FLOOR) {
-        v->amp_env = 0.0f;
-        v->pitch_env = 0.0f;
-        v->click_env = 0.0f;
-        v->active = false;
-    }
-    return out;
+    v->phase = phase;
+    v->amp_env = amp_env;
+    v->pitch_env = pitch_env;
+    v->click_env = click_env;
+    v->active = active;
 }
 
-static inline float render_snare_sample(sp1_snare_voice_t *v) {
-    if (!v->active) {
-        return 0.0f;
+static SP1_DSP_NOINLINE void render_snare_segment(sp1_snare_voice_t *v,
+                                                  float *out_main_l,
+                                                  float *out_main_r,
+                                                  float *out_send_l,
+                                                  float *out_send_r,
+                                                  uint32_t start,
+                                                  uint32_t end) {
+    if (!v->active || start >= end) {
+        return;
     }
 
+    uint32_t phase_body = v->phase_body;
+    uint32_t phase_rim = v->phase_rim;
+    uint32_t rng = v->rng;
+    float ic1 = v->wire_svf.ic1eq;
+    float ic2 = v->wire_svf.ic2eq;
+    const float a1 = v->wire_svf.a1;
+    const float a2 = v->wire_svf.a2;
+    const float a3 = v->wire_svf.a3;
+    const float svf_k = v->wire_svf.k;
+
+    float body_env = v->body_env;
+    float noise_env = v->noise_env;
+    float knock_env = v->knock_env;
+
+    const float body_decay = v->body_decay_coeff;
+    const float noise_decay = v->noise_decay_coeff;
+    const float knock_decay = v->knock_decay_coeff;
     const float m = v->tone_morph;
+    const float body_weight = 0.45f + (0.30f * m);
+    const float rim_weight = 0.85f - (0.50f * m);
+    const float knock_m = (1.0f - m) * 0.85f;
+    const float rim_leak = 0.12f * (1.0f - m);
+    const float wire_gain = 0.05f + (0.75f * m);
+    const float vel_gain = v->velocity_gain;
 
-    float osc_rim = 0.0f;
-    float resonator = 0.0f;
-    if (v->body_env > 0.0f) {
-        /* Dual detuned resonators:
-         * 1. ~185 Hz shell body + fast pitch-transient knock
-         * 2. ~330-480 Hz woody rim overtone + sharp pitch-transient knock */
-        const float body_hz = 185.0f + (135.0f * v->knock_env);
-        const float rim_hz = v->rim_freq_hz + (245.0f * v->knock_env);
+    const uint32_t body_base_inc = sp1_hz_to_phase_inc(185.0f);
+    const uint32_t rim_base_inc = sp1_hz_to_phase_inc(v->rim_freq_hz);
+    const float body_knock_inc_f = 135.0f * SP1_DSP_PHASE_SCALE;
+    const float rim_knock_inc_f = 245.0f * SP1_DSP_PHASE_SCALE;
 
-        v->phase_body += sp1_hz_to_phase_inc(body_hz);
-        v->phase_rim += sp1_hz_to_phase_inc(rim_hz);
+    bool active = true;
+    uint32_t i = start;
+
+    /* Phase 1: Dual-resonator body + wire noise (active only during initial 22..55 ms) */
+    while (i < end && body_env > 0.0f) {
+        if (knock_env > 0.0f) {
+            phase_body += body_base_inc + (uint32_t)(body_knock_inc_f * knock_env);
+            phase_rim += rim_base_inc + (uint32_t)(rim_knock_inc_f * knock_env);
+        } else {
+            phase_body += body_base_inc;
+            phase_rim += rim_base_inc;
+        }
 
         const float osc_body =
-            (0.65f * sp1_sine_lut(v->phase_body)) + (0.35f * sp1_triangle_osc(v->phase_body));
-        osc_rim =
-            (0.55f * sp1_triangle_osc(v->phase_rim)) + (0.45f * sp1_sine_lut(v->phase_rim));
+            (0.65f * sp1_sine_lut(phase_body)) + (0.35f * sp1_triangle_osc(phase_body));
+        const float osc_rim =
+            (0.55f * sp1_triangle_osc(phase_rim)) + (0.45f * sp1_sine_lut(phase_rim));
 
-        const float body_weight = 0.45f + (0.30f * m);
-        const float rim_weight = 0.85f - (0.50f * m);
-        const float knock_boost = 1.0f + ((1.0f - m) * 0.85f * v->knock_env);
+        const float knock_boost = 1.0f + (knock_m * knock_env);
         const float resonator_raw =
             ((osc_body * body_weight) + (osc_rim * rim_weight)) * knock_boost;
-        resonator = sp1_soft_clip(resonator_raw * 1.25f) * v->body_env;
+        const float resonator = sp1_soft_clip(resonator_raw * 1.25f) * body_env;
+
+        const float v0 = sp1_xorshift32_noise(&rng) + (osc_rim * rim_leak);
+        const float v3 = v0 - ic2;
+        const float v1 = (a1 * ic1) + (a2 * v3);
+        const float v2 = ic2 + (a2 * ic1) + (a3 * v3);
+        ic1 = (2.0f * v1) - ic1;
+        ic2 = (2.0f * v2) - ic2;
+        const float svf_hp = v0 - (svf_k * v1) - v2;
+
+        const float wire_sig = ((v1 * 0.62f) + (svf_hp * 0.52f)) * noise_env * wire_gain;
+        const float out = sp1_soft_clip(resonator + wire_sig) * vel_gain;
+
+        out_main_l[i] += out * 0.96f;
+        out_main_r[i] += out * 1.02f;
+        if (out_send_l != NULL) {
+            out_send_l[i] += out * 0.55f;
+        }
+        if (out_send_r != NULL) {
+            out_send_r[i] += out * 0.55f;
+        }
+
+        body_env *= body_decay;
+        if (body_env < SP1_DSP_ENV_FLOOR) {
+            body_env = 0.0f;
+        }
+        noise_env *= noise_decay;
+        if (knock_env > 0.0f) {
+            knock_env *= knock_decay;
+            if (knock_env < SP1_DSP_ENV_FLOOR) {
+                knock_env = 0.0f;
+            }
+        }
+
+        ++i;
+        if (body_env == 0.0f && noise_env < SP1_DSP_ENV_FLOOR) {
+            noise_env = 0.0f;
+            knock_env = 0.0f;
+            active = false;
+            break;
+        }
     }
 
-    /* Signed xorshift32 noise filtered through Cytomic TPT SVF bandpass + highpass */
-    const float raw_noise = sp1_xorshift32_noise(&v->rng);
-    float svf_bp = 0.0f;
-    float svf_hp = 0.0f;
-    sp1_svf_process(&v->wire_svf, raw_noise + (osc_rim * 0.12f * (1.0f - m)), NULL, &svf_bp, &svf_hp);
+    /* Phase 2: Noise-only wire tail (tight register-only loop, zero oscillator work) */
+    if (active) {
+        const float wire_scale = wire_gain;
+        for (; i < end; ++i) {
+            const float v0 = sp1_xorshift32_noise(&rng);
+            const float v3 = v0 - ic2;
+            const float v1 = (a1 * ic1) + (a2 * v3);
+            const float v2 = ic2 + (a2 * ic1) + (a3 * v3);
+            ic1 = (2.0f * v1) - ic1;
+            ic2 = (2.0f * v2) - ic2;
+            const float svf_hp = v0 - (svf_k * v1) - v2;
 
-    const float wire_gain = 0.05f + (0.75f * m);
-    const float wire_sig = ((svf_bp * 0.62f) + (svf_hp * 0.52f)) * v->noise_env * wire_gain;
+            const float wire_sig = ((v1 * 0.62f) + (svf_hp * 0.52f)) * noise_env * wire_scale;
+            const float out = sp1_soft_clip(wire_sig) * vel_gain;
 
-    const float out = sp1_soft_clip(resonator + wire_sig) * v->velocity_gain;
+            out_main_l[i] += out * 0.96f;
+            out_main_r[i] += out * 1.02f;
+            if (out_send_l != NULL) {
+                out_send_l[i] += out * 0.55f;
+            }
+            if (out_send_r != NULL) {
+                out_send_r[i] += out * 0.55f;
+            }
 
-    v->body_env *= v->body_decay_coeff;
-    if (v->body_env < SP1_DSP_ENV_FLOOR) {
-        v->body_env = 0.0f;
+            noise_env *= noise_decay;
+            if (noise_env < SP1_DSP_ENV_FLOOR) {
+                noise_env = 0.0f;
+                knock_env = 0.0f;
+                active = false;
+                break;
+            }
+        }
     }
-    v->noise_env *= v->noise_decay_coeff;
-    v->knock_env *= v->knock_decay_coeff;
-    if (v->knock_env < SP1_DSP_ENV_FLOOR) {
-        v->knock_env = 0.0f;
-    }
 
-    if (v->body_env < SP1_DSP_ENV_FLOOR && v->noise_env < SP1_DSP_ENV_FLOOR) {
-        v->body_env = 0.0f;
-        v->noise_env = 0.0f;
-        v->knock_env = 0.0f;
-        v->active = false;
+#if !defined(__ARM_FP) || (__ARM_FP == 0)
+    if (fabsf(ic1) < SP1_DSP_DENORMAL_FLOOR) {
+        ic1 = 0.0f;
     }
-    return out;
+    if (fabsf(ic2) < SP1_DSP_DENORMAL_FLOOR) {
+        ic2 = 0.0f;
+    }
+#endif
+
+    v->phase_body = phase_body;
+    v->phase_rim = phase_rim;
+    v->rng = rng;
+    v->wire_svf.ic1eq = ic1;
+    v->wire_svf.ic2eq = ic2;
+    v->body_env = body_env;
+    v->noise_env = noise_env;
+    v->knock_env = knock_env;
+    v->active = active;
 }
 
-static inline float render_hat_sample(sp1_hat_voice_t *v) {
-    if (!v->active) {
-        return 0.0f;
+static SP1_DSP_NOINLINE void render_hat_segment(sp1_hat_voice_t *v,
+                                                float *out_main_l,
+                                                float *out_main_r,
+                                                uint32_t start,
+                                                uint32_t end) {
+    if (!v->active || start >= end) {
+        return;
     }
 
-    /* Sum 3 inharmonic metallic square-wave oscillators (205, 522, 800 Hz)
-     * with upper harmonic edge tap (8x) for crisp metallic shimmer. */
-    int32_t metal_sum_i = 0;
-    for (uint32_t i = 0U; i < 3U; ++i) {
-        const uint32_t idx = (i == 0U) ? 0U : ((i == 1U) ? 3U : 5U);
-        const uint32_t p = v->phase[idx] + v->phase_inc[idx];
-        v->phase[idx] = p;
-        const int32_t sq_fund = ((int32_t)(p >> 31U) * 2) - 1;
-        const int32_t sq_oct3 = ((int32_t)((p >> 28U) & 1U) * 2) - 1;
-        metal_sum_i += (sq_fund * 4) + (sq_oct3 * 6);
+    uint32_t p0 = v->phase[0];
+    uint32_t p1 = v->phase[3];
+    uint32_t p2 = v->phase[5];
+    const uint32_t inc0 = v->phase_inc[0];
+    const uint32_t inc1 = v->phase_inc[3];
+    const uint32_t inc2 = v->phase_inc[5];
+
+    uint32_t rng = v->rng;
+    float ic1 = v->hp_svf.ic1eq;
+    float ic2 = v->hp_svf.ic2eq;
+    const float a1 = v->hp_svf.a1;
+    const float a2 = v->hp_svf.a2;
+    const float a3 = v->hp_svf.a3;
+    const float svf_k = v->hp_svf.k;
+
+    float amp_env = v->amp_env;
+    const float amp_decay = v->amp_decay_coeff;
+    const float vel_gain = v->velocity_gain;
+    bool active = true;
+
+    for (uint32_t i = start; i < end; ++i) {
+        /* 3 inharmonic metallic square oscillators (205, 522, 800 Hz) + 8x harmonic tap */
+        p0 += inc0;
+        p1 += inc1;
+        p2 += inc2;
+
+        int32_t metal_i = (((int32_t)(p0 >> 31U) * 2) - 1) * 4 +
+                          (((int32_t)((p0 >> 28U) & 1U) * 2) - 1) * 6;
+        metal_i += (((int32_t)(p1 >> 31U) * 2) - 1) * 4 +
+                   (((int32_t)((p1 >> 28U) & 1U) * 2) - 1) * 6;
+        metal_i += (((int32_t)(p2 >> 31U) * 2) - 1) * 4 +
+                   (((int32_t)((p2 >> 28U) & 1U) * 2) - 1) * 6;
+
+        /* 0.20f * 0.18f = 0.036f combined metallic mix gain */
+        const float v0 = ((float)metal_i * 0.036f) + (sp1_xorshift32_noise(&rng) * 0.35f);
+
+        const float v3 = v0 - ic2;
+        const float v1 = (a1 * ic1) + (a2 * v3);
+        const float v2 = ic2 + (a2 * ic1) + (a3 * v3);
+        ic1 = (2.0f * v1) - ic1;
+        ic2 = (2.0f * v2) - ic2;
+        const float hp_out = v0 - (svf_k * v1) - v2;
+
+        const float out = sp1_soft_clip((hp_out * 0.82f) + (v1 * 0.32f)) * amp_env * vel_gain;
+        out_main_l[i] += out * 0.76f;
+        out_main_r[i] += out * 1.06f;
+
+        amp_env *= amp_decay;
+        if (amp_env < SP1_DSP_ENV_FLOOR) {
+            amp_env = 0.0f;
+            active = false;
+            break;
+        }
     }
-    const float metal_sum = (float)metal_sum_i * 0.20f;
 
-    const float air_noise = sp1_xorshift32_noise(&v->rng) * 0.35f;
-    const float raw_mix = (metal_sum * 0.18f) + air_noise;
-
-    float hp_out = 0.0f;
-    float bp_out = 0.0f;
-    sp1_svf_process(&v->hp_svf, raw_mix, NULL, &bp_out, &hp_out);
-
-    const float out = sp1_soft_clip((hp_out * 0.82f) + (bp_out * 0.32f)) *
-                      v->amp_env * v->velocity_gain;
-
-    v->amp_env *= v->amp_decay_coeff;
-    if (v->amp_env < SP1_DSP_ENV_FLOOR) {
-        v->amp_env = 0.0f;
-        v->active = false;
+#if !defined(__ARM_FP) || (__ARM_FP == 0)
+    if (fabsf(ic1) < SP1_DSP_DENORMAL_FLOOR) {
+        ic1 = 0.0f;
     }
-    return out;
+    if (fabsf(ic2) < SP1_DSP_DENORMAL_FLOOR) {
+        ic2 = 0.0f;
+    }
+#endif
+
+    v->phase[0] = p0;
+    v->phase[3] = p1;
+    v->phase[5] = p2;
+    v->rng = rng;
+    v->hp_svf.ic1eq = ic1;
+    v->hp_svf.ic2eq = ic2;
+    v->amp_env = amp_env;
+    v->active = active;
 }
 
-static inline float render_perc_sample(sp1_perc_voice_t *v) {
-    if (!v->active) {
-        return 0.0f;
+static SP1_DSP_NOINLINE void render_perc_segment(sp1_perc_voice_t *v,
+                                                 float *out_main_l,
+                                                 float *out_main_r,
+                                                 float *out_send_l,
+                                                 float *out_send_r,
+                                                 uint32_t start,
+                                                 uint32_t end) {
+    if (!v->active || start >= end) {
+        return;
     }
 
-    const float carrier_hz = v->carrier_base_hz + (v->pitch_span_hz * v->pitch_env);
-    const float mod_hz = carrier_hz * v->mod_ratio;
+    uint32_t carrier_phase = v->carrier_phase;
+    uint32_t mod_phase = v->mod_phase;
+    float prev_mod = v->prev_mod;
+    float amp_env = v->amp_env;
+    float pitch_env = v->pitch_env;
+    float index_env = v->index_env;
 
-    v->carrier_phase += sp1_hz_to_phase_inc(carrier_hz);
-    v->mod_phase += sp1_hz_to_phase_inc(mod_hz);
+    const float amp_decay = v->amp_decay_coeff;
+    const float pitch_decay = v->pitch_decay_coeff;
+    const float index_decay = v->index_decay_coeff;
+    const uint32_t carrier_base_inc = sp1_hz_to_phase_inc(v->carrier_base_hz);
+    const float carrier_span_inc_f = v->pitch_span_hz * SP1_DSP_PHASE_SCALE;
+    const uint32_t mod_base_inc = sp1_hz_to_phase_inc(v->carrier_base_hz * v->mod_ratio);
+    const float mod_span_inc_f = (v->pitch_span_hz * v->mod_ratio) * SP1_DSP_PHASE_SCALE;
 
-    /* Modulator self-feedback with clamped fb_phase_scale <= 5.0e8f */
-    float fb_scaled = v->prev_mod * v->fb_phase_scale * v->index_env;
-    if (fb_scaled > SP1_DSP_MAX_FB_PHASE_SCALE) {
-        fb_scaled = SP1_DSP_MAX_FB_PHASE_SCALE;
-    } else if (fb_scaled < -SP1_DSP_MAX_FB_PHASE_SCALE) {
-        fb_scaled = -SP1_DSP_MAX_FB_PHASE_SCALE;
+    const float fb_scale = v->fb_phase_scale;
+    const float mod_scale = v->mod_phase_scale;
+    const float timbre_scale = v->timbre_morph * 2.10f;
+    const float vel_gain = v->velocity_gain;
+    bool active = true;
+
+    for (uint32_t i = start; i < end; ++i) {
+        if (pitch_env > 0.0f) {
+            carrier_phase += carrier_base_inc + (uint32_t)(carrier_span_inc_f * pitch_env);
+            mod_phase += mod_base_inc + (uint32_t)(mod_span_inc_f * pitch_env);
+            pitch_env *= pitch_decay;
+            if (pitch_env < SP1_DSP_ENV_FLOOR) {
+                pitch_env = 0.0f;
+            }
+        } else {
+            carrier_phase += carrier_base_inc;
+            mod_phase += mod_base_inc;
+        }
+
+        /* |prev_mod| <= 1.0f, 0 <= index_env <= 1.0f, fb_scale <= 5e8f (< INT32_MAX) */
+        const uint32_t fb_offset = (uint32_t)((int32_t)(prev_mod * fb_scale * index_env));
+        const float mod_sample = sp1_sine_lut(mod_phase + fb_offset);
+        prev_mod = mod_sample;
+
+        /* |mod_sample| <= 1.0f, 0 <= index_env <= 1.0f, mod_scale <= 2e9f (< INT32_MAX) */
+        const uint32_t pm_offset = (uint32_t)((int32_t)(mod_sample * mod_scale * index_env));
+        const float carrier = sp1_sine_lut(carrier_phase + pm_offset);
+
+        const float fold_drive = 1.10f + (timbre_scale * index_env);
+        const float out = sp1_wavefold_lut(carrier * fold_drive) * amp_env * vel_gain;
+
+        out_main_l[i] += out * 1.05f;
+        out_main_r[i] += out * 0.78f;
+        if (out_send_l != NULL) {
+            out_send_l[i] += out * 0.70f;
+        }
+        if (out_send_r != NULL) {
+            out_send_r[i] += out * 0.50f;
+        }
+
+        amp_env *= amp_decay;
+        index_env *= index_decay;
+        if (amp_env < SP1_DSP_ENV_FLOOR) {
+            amp_env = 0.0f;
+            pitch_env = 0.0f;
+            index_env = 0.0f;
+            active = false;
+            break;
+        }
     }
-    const uint32_t fb_offset = (uint32_t)((int32_t)fb_scaled);
-    const float mod_sample = sp1_sine_lut(v->mod_phase + fb_offset);
-    v->prev_mod = mod_sample;
 
-    /* Clamped mod_phase_scale <= 2.0e9f (< INT32_MAX) avoids float-to-int32 UB */
-    float pm_scaled = mod_sample * v->mod_phase_scale * v->index_env;
-    if (pm_scaled > SP1_DSP_MAX_MOD_PHASE_SCALE) {
-        pm_scaled = SP1_DSP_MAX_MOD_PHASE_SCALE;
-    } else if (pm_scaled < -SP1_DSP_MAX_MOD_PHASE_SCALE) {
-        pm_scaled = -SP1_DSP_MAX_MOD_PHASE_SCALE;
-    }
-    const uint32_t pm_offset = (uint32_t)((int32_t)pm_scaled);
-
-    const float carrier = sp1_sine_lut(v->carrier_phase + pm_offset);
-    const float fold_drive = 1.10f + (v->timbre_morph * 2.10f * v->index_env);
-    const float folded = sp1_wavefold_lut(carrier * fold_drive);
-
-    const float out = folded * v->amp_env * v->velocity_gain;
-
-    v->amp_env *= v->amp_decay_coeff;
-    v->pitch_env *= v->pitch_decay_coeff;
-    v->index_env *= v->index_decay_coeff;
-
-    if (v->amp_env < SP1_DSP_ENV_FLOOR) {
-        v->amp_env = 0.0f;
-        v->pitch_env = 0.0f;
-        v->index_env = 0.0f;
-        v->active = false;
-    }
-    return out;
+    v->carrier_phase = carrier_phase;
+    v->mod_phase = mod_phase;
+    v->prev_mod = prev_mod;
+    v->amp_env = amp_env;
+    v->pitch_env = pitch_env;
+    v->index_env = index_env;
+    v->active = active;
 }
 
 /* ── Public API Implementation ───────────────────────────────────────────── */
@@ -541,53 +757,59 @@ void sp1_drum_voices_render_block(sp1_drum_synth_t *synth,
         return;
     }
 
+    const size_t bytes = (size_t)num_frames * sizeof(float);
+    memset(out_main_l, 0, bytes);
+    memset(out_main_r, 0, bytes);
+    if (out_send_l != NULL) {
+        memset(out_send_l, 0, bytes);
+    }
+    if (out_send_r != NULL) {
+        memset(out_send_r, 0, bytes);
+    }
+
     if (num_triggers == 0U &&
         !synth->kick.active && !synth->snare.active &&
         !synth->hat.active && !synth->perc.active) {
-        const size_t bytes = (size_t)num_frames * sizeof(float);
-        memset(out_main_l, 0, bytes);
-        memset(out_main_r, 0, bytes);
-        if (out_send_l != NULL) {
-            memset(out_send_l, 0, bytes);
-        }
-        if (out_send_r != NULL) {
-            memset(out_send_r, 0, bytes);
-        }
         return;
     }
 
     uint32_t next_trig = 0U;
+    uint32_t cursor = 0U;
 
-    for (uint32_t i = 0U; i < num_frames; ++i) {
-        /* Dispatch all triggers scheduled at or before intra-block sample offset i */
+    while (cursor < num_frames) {
+        /* Dispatch all triggers scheduled at or before cursor */
         while (triggers != NULL && next_trig < num_triggers &&
-               triggers[next_trig].block_offset <= i) {
+               triggers[next_trig].block_offset <= cursor) {
             const sp1_seq_trigger_event_t *ev = &triggers[next_trig];
             sp1_drum_voices_trigger(synth, ev->track, ev->velocity, ev->accent);
             next_trig++;
         }
 
-        const float v_kick = render_kick_sample(&synth->kick);
-        const float v_snare = render_snare_sample(&synth->snare);
-        const float v_hat = render_hat_sample(&synth->hat);
-        const float v_perc = render_perc_sample(&synth->perc);
-
-        /* Stereo image placement:
-         * - Kick: dead-center mono anchor
-         * - Snare/Rimshot: centered with subtle stereo width
-         * - Hi-Hat: panned slightly right
-         * - 2-Op FM Perc: panned slightly left */
-        out_main_l[i] = v_kick + (v_snare * 0.96f) + (v_hat * 0.76f) + (v_perc * 1.05f);
-        out_main_r[i] = v_kick + (v_snare * 1.02f) + (v_hat * 1.06f) + (v_perc * 0.78f);
-
-        /* Selective Dub Ping-Pong Delay send:
-         * Fed exclusively by Track 2 (Snare/Rimshot) and Track 4 (2-Op FM Perc),
-         * keeping Track 1 (Kick) low-end 100% dry and tight. */
-        if (out_send_l != NULL) {
-            out_send_l[i] = (v_snare * 0.55f) + (v_perc * 0.70f);
+        uint32_t seg_end = num_frames;
+        if (triggers != NULL && next_trig < num_triggers) {
+            const uint32_t next_off = (uint32_t)triggers[next_trig].block_offset;
+            if (next_off < seg_end) {
+                seg_end = next_off;
+            }
         }
-        if (out_send_r != NULL) {
-            out_send_r[i] = (v_snare * 0.55f) + (v_perc * 0.50f);
+
+        if (seg_end > cursor) {
+            /* Render each active voice across [cursor, seg_end) with full ICACHE residency */
+            if (synth->kick.active) {
+                render_kick_segment(&synth->kick, out_main_l, out_main_r, cursor, seg_end);
+            }
+            if (synth->snare.active) {
+                render_snare_segment(&synth->snare, out_main_l, out_main_r,
+                                     out_send_l, out_send_r, cursor, seg_end);
+            }
+            if (synth->hat.active) {
+                render_hat_segment(&synth->hat, out_main_l, out_main_r, cursor, seg_end);
+            }
+            if (synth->perc.active) {
+                render_perc_segment(&synth->perc, out_main_l, out_main_r,
+                                    out_send_l, out_send_r, cursor, seg_end);
+            }
+            cursor = seg_end;
         }
     }
 
