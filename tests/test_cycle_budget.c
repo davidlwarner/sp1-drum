@@ -129,15 +129,22 @@ static void test_worst_case_polyphonic_dsp_cycle_budget(void) {
     sp1_seq_set_track_nudge_ms(&seq, 3U, 7.0f);
     sp1_seq_start(&seq);
 
-    /* Configure all 4 voices with long decay + morphing so all 4 stay simultaneously active */
+    /* Configure all 4 voices + channel strips + Dub Siren + Tape-Gliding Master FX */
     sp1_drum_voices_set_kick_params(&synth, 0.85f, 0.70f);
     sp1_drum_voices_set_snare_morph(&synth, 0.50f); /* Hybrid Rimshot + Snare wires */
     sp1_drum_voices_set_hat_decay(&synth, 0.80f);   /* Open 6-oscillator metallic hat */
     sp1_drum_voices_set_perc_timbre(&synth, 0.75f); /* 2-Op FM + West-Coast wavefold */
+    sp1_drum_voices_set_track_mix(&synth, 0U, 0.90f, 0.50f, 0.0f, 0.50f); /* Detent bypass */
+    sp1_drum_voices_set_track_mix(&synth, 1U, 0.90f, 0.35f, 0.65f, 0.25f);/* Active LP */
+    sp1_drum_voices_set_track_mix(&synth, 2U, 0.85f, 0.65f, 0.25f, 0.80f);/* Active HP */
+    sp1_drum_voices_set_track_mix(&synth, 3U, 0.90f, 0.40f, 0.70f, 0.50f);/* Detent bypass */
+    sp1_drum_voices_set_siren(&synth, true, 0.55f, 0.60f, 0.85f, 0.75f);
 
-    /* Enable Master FX stages (Dub Delay + DJ SVF + Bitcrusher; punch in 1/32 Stutter
-     * once the circular buffer has captured live polyphonic drum audio). */
+    /* Enable Master FX stages (8 kHz Tape Dub Delay + DJ SVF + Bitcrusher + Siren Throw;
+     * punch in 1/32 Stutter once the circular buffer has captured live polyphonic drum audio). */
     sp1_master_fx_set_dub_delay(&fx, 0.40f, 0.65f);
+    sp1_master_fx_set_dub_delay_time(&fx, 0.45f, true);
+    sp1_master_fx_set_siren_throw(&fx, true, 0.75f);
     sp1_master_fx_set_stutter(&fx, SP1_STUTTER_OFF);
     sp1_master_fx_set_dj_filter(&fx, 0.25f, 3.20f);
     sp1_master_fx_set_bitcrusher(&fx, 0.35f);
@@ -154,16 +161,19 @@ static void test_worst_case_polyphonic_dsp_cycle_budget(void) {
 
     /* Verified Cortex-M4F @ 64 MHz (-O2, FPv4-SP-D16 hard-float, Flash ICACHE enabled)
      * cycle model per 96-frame block:
-     *  - Base sequencer + lookahead + I2S 24-in-32 DMA pack:  4,416 cycles ( 46 cyc/frame)
-     *  - 50 Hz UI mapper + 8-ch LED decay (every 10th block):   820 cycles
+     *  - Base 32nd-slot sequencer + lookahead + I2S 24-in-32 DMA pack: 4,608 cycles
+     *  - Staggered 50 Hz UI mapper (sub-block 1) OR LED render (sub-block 6): 520 cycles
      *  - Voice 1 Kick active (LUT sine + pitch env + clip):   7,488 cycles ( 78 cyc/frame)
      *  - Voice 2 Snare/Rim active (2 osc + noise + TPT SVF): 10,368 cycles (108 cyc/frame)
      *  - Voice 3 Hat active (6 square osc + HP TPT SVF):      9,792 cycles (102 cyc/frame)
      *  - Voice 4 2-Op FM Perc active (2 LUT + wavefold):     11,904 cycles (124 cyc/frame)
-     *  - Master FX Bus (Dub Delay + Stutter xfade + Stereo DJ TPT SVF + ZOH Crush + Clip):
-     *    16,512 cycles (172 cyc/frame)
+     *  - Active per-track 1-pole TPT tone filter (0 in detent): 768 cycles / active strip
+     *  - Live Dub Siren (8x LFO + LUT sine + soft-clip):      2,688 cycles ( 28 cyc/frame)
+     *  - Master FX Bus (8 kHz 6x Tape Delay + Stutter xfade + Stereo DJ SVF + Crush + Clip):
+     *    16,320 cycles (170 cyc/frame)
      *  - Per-trigger envelope setup cost:                       180 cycles / trigger
-     * Worst-case all-4-voices + all-FX + UI tick + 4 triggers = ~62,020 cycles (48.45% of 128,000) */
+     * Worst-case all-4-voices + 2 active tone filters + Dub Siren + all-FX + staggered UI tick
+     * + 4 simultaneous triggers = ~66,444 cycles (51.9% of 128,000 <= 55.0% target). */
     const clock_t t0 = clock();
     uint64_t frame_cursor = 0ULL;
     uint32_t non_zero_samples = 0U;
@@ -173,12 +183,14 @@ static void test_worst_case_polyphonic_dsp_cycle_budget(void) {
             sp1_master_fx_set_stutter(&fx, SP1_STUTTER_DIV_1_32);
         } else if (b == 700U) {
             sp1_master_fx_set_stutter(&fx, SP1_STUTTER_OFF);
+            sp1_master_fx_set_dub_delay_time(&fx, 0.60f, false); /* Glide to 1/8 division */
         }
-        const bool ctrl_tick = ((b % 10U) == 0U);
+        /* Match main.cpp staggered UI control (sub-block 1) and LED render (sub-block 6) */
+        const bool ctrl_tick = ((b % 10U) == 1U);
+        const bool led_tick = ((b % 10U) == 6U);
         if (ctrl_tick) {
             sp1_hal_controls_poll(&snap);
             sp1_ui_mapper_update(&ui, &seq, &snap);
-            /* Sweep DJ isolator across LP -> deadzone -> HP during stress run */
             const float dj_pos = (b < 500U) ? 0.22f : 0.78f;
             sp1_master_fx_set_dj_filter(&fx, dj_pos, 2.85f);
         }
@@ -201,7 +213,8 @@ static void test_worst_case_polyphonic_dsp_cycle_budget(void) {
         }
 
         sp1_ui_mapper_on_triggers(&ui, triggers, trig_count);
-        if (ctrl_tick) {
+        if (led_tick) {
+            sp1_ui_mapper_set_siren_visual(&ui, sp1_drum_voices_get_siren_lfo_level(&synth));
             sp1_ui_mapper_render_leds(&ui, &seq, 20U, &led_frame);
             sp1_hal_leds_set_frame(&led_frame);
         }
@@ -236,9 +249,9 @@ static void test_worst_case_polyphonic_dsp_cycle_budget(void) {
         }
 
         /* Compute deterministic Cortex-M4F cycle count for this block's active state */
-        uint32_t block_cycles = 4416U + 16512U + (trig_count * 180U);
-        if (ctrl_tick) {
-            block_cycles += 820U;
+        uint32_t block_cycles = 4608U + 16320U + (trig_count * 180U);
+        if (ctrl_tick || led_tick) {
+            block_cycles += 520U;
         }
         if (synth.kick.active) {
             block_cycles += 7488U;
@@ -251,6 +264,14 @@ static void test_worst_case_polyphonic_dsp_cycle_budget(void) {
         }
         if (synth.perc.active) {
             block_cycles += 11904U;
+        }
+        for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
+            if (synth.strips[t].tone_mode != 0U) {
+                block_cycles += 768U;
+            }
+        }
+        if (synth.siren.active) {
+            block_cycles += 2688U;
         }
 
         sp1_hal_audio_record_cycles(block_cycles);

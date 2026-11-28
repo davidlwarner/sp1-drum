@@ -7,10 +7,18 @@
 #define SP1_FX_S16_SCALE            32767.0f
 #define SP1_FX_INV_S16_SCALE        0.000030518509476f  /* 1.0f / 32767.0f */
 #define SP1_FX_INV_DJ_SPAN          2.22222222f         /* 1.0f / 0.45f */
+#define SP1_FX_INV_6                0.16666667f         /* 1.0f / 6.0f (8 kHz BBD rate) */
 
-/* Precomputed 3x BBD linear interpolation fractions (0/3, 1/3, 2/3) in Flash */
+/* Precomputed 6x BBD linear interpolation fractions (0/6 .. 5/6) in Flash */
 static const float k_bbd_interp_frac[SP1_FX_DELAY_DECIM_FACTOR] = {
-    0.0f, 0.33333334f, 0.66666669f
+    0.0f, 0.16666667f, 0.33333334f, 0.50f, 0.66666669f, 0.83333331f
+};
+
+/* 6 Musical Dub Delay Tempo Divisions as multiples of one 16th-note step:
+ *  0: 1/32 (0.5x), 1: 1/16 (1.0x), 2: dotted 1/16 (1.5x, default),
+ *  3: 1/8  (2.0x), 4: dotted 1/8 (3.0x), 5: 1/4 (4.0x) */
+static const float k_delay_div_16th_mult[SP1_DELAY_DIV_COUNT] = {
+    0.50f, 1.00f, 1.50f, 2.00f, 3.00f, 4.00f
 };
 
 /* Precomputed bitcrusher quantization scales & reciprocals in Flash (zero division) */
@@ -85,16 +93,36 @@ static uint32_t compute_stutter_loop_frames(uint32_t step_16th_frames,
     return len;
 }
 
-static uint32_t compute_dub_delay_tap_samples(uint32_t step_16th_frames) {
-    /* Dotted-16th / 1/8th dub bounce at 16 kHz BBD rate (step_16th_frames / 3 ~= step * 341 >> 10) */
-    uint32_t base = (step_16th_frames > 0U) ? step_16th_frames : 6000U;
-    /* 1.5 * step_16th_frames at 16 kHz = 0.5 * step_16th_frames in BBD samples */
-    uint32_t tap = base >> 1U;
-    if (tap < 128U) {
-        tap = 128U;
+static float compute_dub_delay_target_samples(const sp1_master_fx_t *fx,
+                                              uint32_t step_16th_frames) {
+    const float base_16th_bbd =
+        (float)((step_16th_frames > 0U) ? step_16th_frames : 6000U) * SP1_FX_INV_6;
+
+    float mult = 1.50f;
+    if (fx->delay_free_dragging) {
+        /* Continuous piecewise-linear tape-speed curve passing through all 6 division knots */
+        const float pos5 = fx->delay_time_norm * 5.0f;
+        uint32_t seg = (uint32_t)pos5;
+        if (seg >= ((uint32_t)SP1_DELAY_DIV_COUNT - 1U)) {
+            seg = (uint32_t)SP1_DELAY_DIV_COUNT - 2U;
+        }
+        const float frac = pos5 - (float)seg;
+        const float a = k_delay_div_16th_mult[seg];
+        const float b = k_delay_div_16th_mult[seg + 1U];
+        mult = a + ((b - a) * frac);
+    } else {
+        const uint8_t div = (fx->delay_locked_div < (uint8_t)SP1_DELAY_DIV_COUNT)
+                                ? fx->delay_locked_div
+                                : (uint8_t)SP1_DELAY_DIV_DOT_1_16;
+        mult = k_delay_div_16th_mult[div];
     }
-    if (tap > (SP1_FX_DELAY_TAP_SAMPLES - 8U)) {
-        tap = SP1_FX_DELAY_TAP_SAMPLES - 8U;
+
+    float tap = base_16th_bbd * mult;
+    const float max_tap = (float)(SP1_FX_DELAY_TAP_SAMPLES - 8U);
+    if (tap < 48.0f) {
+        tap = 48.0f;
+    } else if (tap > max_tap) {
+        tap = max_tap;
     }
     return tap;
 }
@@ -110,7 +138,12 @@ void sp1_master_fx_init(sp1_master_fx_t *fx) {
     fx->stutter_active_div = SP1_STUTTER_OFF;
     fx->stutter_wet_env = 0.0f;
 
-    fx->delay_tap_len = 1500U;
+    fx->delay_locked_div = (uint8_t)SP1_DELAY_DIV_DOT_1_16;
+    fx->delay_free_dragging = false;
+    fx->delay_tap_initialized = false;
+    fx->delay_time_norm = 0.40f; /* Knot 2 = Dotted 1/16 */
+    fx->delay_tap_target = 1500.0f;
+    fx->delay_tap_smooth = 1500.0f;
     fx->delay_wet = 0.22f;
     fx->delay_feedback = 0.45f;
 
@@ -143,13 +176,17 @@ void sp1_master_fx_reset(sp1_master_fx_t *fx) {
     fx->stutter_target_div = SP1_STUTTER_OFF;
     fx->stutter_wet_env = 0.0f;
     fx->delay_write_pos = 0U;
+    fx->delay_active_samples = 0U;
     fx->delay_decim_cnt = 0U;
+    fx->delay_tap_initialized = false;
     fx->delay_prev_l = 0.0f;
     fx->delay_curr_l = 0.0f;
     fx->delay_prev_r = 0.0f;
     fx->delay_curr_r = 0.0f;
     fx->delay_lp_l = 0.0f;
     fx->delay_lp_r = 0.0f;
+    fx->siren_wet_env = 0.0f;
+    fx->siren_fb_env = 0.0f;
     sp1_svf_reset(&fx->dj_svf_l);
     sp1_svf_reset(&fx->dj_svf_r);
 }
@@ -186,7 +223,6 @@ void sp1_master_fx_set_bitcrusher(sp1_master_fx_t *fx, float crush_0_to_1) {
     const float c = clamp01(crush_0_to_1);
     fx->crush_amount = c;
 
-    /* Map [0.0f..1.0f] to ZOH hold period 1..16 samples and LUT quantization step 0..15 */
     uint32_t idx = (uint32_t)(c * 15.0f + 0.5f);
     if (idx > 15U) {
         idx = 15U;
@@ -206,9 +242,49 @@ void sp1_master_fx_set_dub_delay(sp1_master_fx_t *fx,
     fx->delay_wet = clamp01(wet_0_to_1) * 0.65f;
     float fb = clamp01(feedback_0_to_1);
     if (fb > 0.85f) {
-        fb = 0.85f; /* Guard against infinite dub runaway */
+        fb = 0.85f;
     }
     fx->delay_feedback = fb;
+}
+
+void sp1_master_fx_set_dub_delay_time(sp1_master_fx_t *fx,
+                                      float time_0_to_1,
+                                      bool free_dragging) {
+    if (fx == NULL) {
+        return;
+    }
+    const float c = clamp01(time_0_to_1);
+    fx->delay_time_norm = c;
+    fx->delay_free_dragging = free_dragging;
+
+    uint32_t div = (uint32_t)(c * 5.0f + 0.5f);
+    if (div >= (uint32_t)SP1_DELAY_DIV_COUNT) {
+        div = (uint32_t)SP1_DELAY_DIV_COUNT - 1U;
+    }
+    fx->delay_locked_div = (uint8_t)div;
+}
+
+sp1_delay_div_t sp1_master_fx_get_dub_delay_div(const sp1_master_fx_t *fx) {
+    if (fx == NULL || fx->delay_locked_div >= (uint8_t)SP1_DELAY_DIV_COUNT) {
+        return SP1_DELAY_DIV_DOT_1_16;
+    }
+    return (sp1_delay_div_t)fx->delay_locked_div;
+}
+
+void sp1_master_fx_set_siren_throw(sp1_master_fx_t *fx,
+                                   bool siren_gate,
+                                   float throw_0_to_1) {
+    if (fx == NULL) {
+        return;
+    }
+    if (siren_gate) {
+        const float th = clamp01(throw_0_to_1);
+        fx->siren_wet_target = th * 0.58f;
+        fx->siren_fb_target = 0.30f + (th * 0.57f); /* Up to 0.87f dub echo throw */
+    } else {
+        fx->siren_wet_target = 0.0f;
+        fx->siren_fb_target = 0.0f;
+    }
 }
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -218,38 +294,68 @@ void sp1_master_fx_set_dub_delay(sp1_master_fx_t *fx,
 #endif
 
 static inline float fast_round_nearest(float x) {
-    /* Bitcrusher inputs are bounded within ~[-65536, +65536], safe for int32_t. */
     return (float)((int32_t)(x + ((x >= 0.0f) ? 0.5f : -0.5f)));
 }
 
-/* Register-resident fast path for normal playback (DJ filter centered, crush off, stutter off).
- * Keeps all Dub Delay + Stutter record state in local registers with zero stack spills and
- * fits completely inside the nRF52840 2 KB Flash ICACHE. */
+static bool block_has_send_energy(const float *in_send_l,
+                                  const float *in_send_r,
+                                  uint32_t num_frames) {
+    if (in_send_l == NULL || in_send_r == NULL) {
+        return false;
+    }
+    for (uint32_t i = 0U; i < num_frames; ++i) {
+        if (fabsf(in_send_l[i]) > 1.0e-5f || fabsf(in_send_r[i]) > 1.0e-5f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Register-resident fast path for normal playback (DJ filter centered, crush off, stutter off). */
 static SP1_FX_NOINLINE void process_block_normal_fast(sp1_master_fx_t *fx,
+                                                      bool run_delay,
+                                                      float eff_wet,
+                                                      float eff_fb,
                                                       const float *in_main_l,
                                                       const float *in_main_r,
                                                       const float *in_send_l,
                                                       const float *in_send_r,
                                                       int16_t *out_interleaved_pcm,
                                                       uint32_t num_frames) {
+    int16_t *const stutter_buf = fx->stutter_buf;
+    uint32_t stut_wpos = fx->stutter_write_pos;
+    const float master_drive = fx->master_drive;
+
+    if (!run_delay) {
+        for (uint32_t i = 0U; i < num_frames; ++i) {
+            const float sig_l = in_main_l[i];
+            const float sig_r = in_main_r[i];
+
+            const uint32_t w_idx = stut_wpos << 1U;
+            stutter_buf[w_idx] = float_to_s16_clamped(sig_l);
+            stutter_buf[w_idx + 1U] = float_to_s16_clamped(sig_r);
+            stut_wpos = (stut_wpos + 1U) & SP1_FX_STUTTER_MASK;
+
+            out_interleaved_pcm[i << 1U] = float_to_s16_clamped(sp1_soft_clip(sig_l * master_drive));
+            out_interleaved_pcm[(i << 1U) + 1U] = float_to_s16_clamped(sp1_soft_clip(sig_r * master_drive));
+        }
+        fx->stutter_write_pos = stut_wpos;
+        return;
+    }
+
     int16_t *const delay_buf_l = fx->delay_buf_l;
     int16_t *const delay_buf_r = fx->delay_buf_r;
-    int16_t *const stutter_buf = fx->stutter_buf;
-
     uint32_t delay_wpos = fx->delay_write_pos;
-    const uint32_t delay_tap = fx->delay_tap_len;
+    uint32_t active_rem = fx->delay_active_samples;
     uint32_t decim_cnt = fx->delay_decim_cnt;
+    float tap_smooth = fx->delay_tap_smooth;
+    const float tap_target = fx->delay_tap_target;
     float prev_l = fx->delay_prev_l;
     float prev_r = fx->delay_prev_r;
     float curr_l = fx->delay_curr_l;
     float curr_r = fx->delay_curr_r;
     float lp_l = fx->delay_lp_l;
     float lp_r = fx->delay_lp_r;
-    const float delay_wet = fx->delay_wet;
-    const float delay_fb = fx->delay_feedback;
-
-    uint32_t stut_wpos = fx->stutter_write_pos;
-    const float master_drive = fx->master_drive;
     const bool has_send = (in_send_l != NULL && in_send_r != NULL);
 
     for (uint32_t i = 0U; i < num_frames; ++i) {
@@ -259,15 +365,25 @@ static SP1_FX_NOINLINE void process_block_normal_fast(sp1_master_fx_t *fx,
         if (decim_cnt == 0U) {
             const float send_l = has_send ? in_send_l[i] : 0.0f;
             const float send_r = has_send ? in_send_r[i] : 0.0f;
-            const uint32_t read_idx = (delay_wpos - delay_tap) & SP1_FX_DELAY_TAP_MASK;
+
+            /* Smooth physical tape capstan inertia (tau ~ 70 ms @ 8 kHz) */
+            tap_smooth += 0.0018f * (tap_target - tap_smooth);
+            const int32_t tap_i = (int32_t)tap_smooth;
+            const float tap_frac = tap_smooth - (float)tap_i;
+            const uint32_t r0 = (delay_wpos - (uint32_t)tap_i) & SP1_FX_DELAY_TAP_MASK;
+            const uint32_t r1 = (r0 - 1U) & SP1_FX_DELAY_TAP_MASK;
 
             prev_l = curr_l;
             prev_r = curr_r;
-            curr_l = (float)delay_buf_l[read_idx] * SP1_FX_INV_S16_SCALE;
-            curr_r = (float)delay_buf_r[read_idx] * SP1_FX_INV_S16_SCALE;
+            const float l0 = (float)delay_buf_l[r0] * SP1_FX_INV_S16_SCALE;
+            const float l1 = (float)delay_buf_l[r1] * SP1_FX_INV_S16_SCALE;
+            const float r_0 = (float)delay_buf_r[r0] * SP1_FX_INV_S16_SCALE;
+            const float r_1 = (float)delay_buf_r[r1] * SP1_FX_INV_S16_SCALE;
+            curr_l = l0 + ((l1 - l0) * tap_frac);
+            curr_r = r_0 + ((r_1 - r_0) * tap_frac);
 
-            lp_l += 0.36f * (curr_l - lp_l);
-            lp_r += 0.36f * (curr_r - lp_r);
+            lp_l += 0.42f * (curr_l - lp_l);
+            lp_r += 0.42f * (curr_r - lp_r);
 #if !defined(__ARM_FP) || (__ARM_FP == 0)
             if (fabsf(lp_l) < SP1_DSP_DENORMAL_FLOOR) {
                 lp_l = 0.0f;
@@ -277,8 +393,14 @@ static SP1_FX_NOINLINE void process_block_normal_fast(sp1_master_fx_t *fx,
             }
 #endif
 
-            const float in_bbd_l = sp1_soft_clip((send_l * 0.80f) + (lp_r * delay_fb));
-            const float in_bbd_r = sp1_soft_clip((send_r * 0.35f) + (lp_l * delay_fb));
+            const float in_bbd_l = sp1_soft_clip((send_l * 0.80f) + (lp_r * eff_fb));
+            const float in_bbd_r = sp1_soft_clip((send_r * 0.35f) + (lp_l * eff_fb));
+
+            if ((fabsf(in_bbd_l) + fabsf(in_bbd_r)) > 1.0e-4f) {
+                active_rem = SP1_FX_DELAY_TAP_SAMPLES + 64U;
+            } else if (active_rem > 0U) {
+                active_rem--;
+            }
 
             delay_buf_l[delay_wpos] = float_to_s16_clamped(in_bbd_l);
             delay_buf_r[delay_wpos] = float_to_s16_clamped(in_bbd_r);
@@ -286,28 +408,27 @@ static SP1_FX_NOINLINE void process_block_normal_fast(sp1_master_fx_t *fx,
         }
 
         const float bbd_t = k_bbd_interp_frac[decim_cnt];
-        sig_l += (prev_l + ((curr_l - prev_l) * bbd_t)) * delay_wet;
-        sig_r += (prev_r + ((curr_r - prev_r) * bbd_t)) * delay_wet;
+        sig_l += (prev_l + ((curr_l - prev_l) * bbd_t)) * eff_wet;
+        sig_r += (prev_r + ((curr_r - prev_r) * bbd_t)) * eff_wet;
 
         decim_cnt++;
         if (decim_cnt >= SP1_FX_DELAY_DECIM_FACTOR) {
             decim_cnt = 0U;
         }
 
-        /* Continuously record dry+delay stereo stream so stutter engages click-free */
         const uint32_t w_idx = stut_wpos << 1U;
         stutter_buf[w_idx] = float_to_s16_clamped(sig_l);
         stutter_buf[w_idx + 1U] = float_to_s16_clamped(sig_r);
         stut_wpos = (stut_wpos + 1U) & SP1_FX_STUTTER_MASK;
 
-        const float out_l = sp1_soft_clip(sig_l * master_drive);
-        const float out_r = sp1_soft_clip(sig_r * master_drive);
-        out_interleaved_pcm[i << 1U] = float_to_s16_clamped(out_l);
-        out_interleaved_pcm[(i << 1U) + 1U] = float_to_s16_clamped(out_r);
+        out_interleaved_pcm[i << 1U] = float_to_s16_clamped(sp1_soft_clip(sig_l * master_drive));
+        out_interleaved_pcm[(i << 1U) + 1U] = float_to_s16_clamped(sp1_soft_clip(sig_r * master_drive));
     }
 
     fx->delay_write_pos = delay_wpos;
-    fx->delay_decim_cnt = decim_cnt;
+    fx->delay_active_samples = active_rem;
+    fx->delay_decim_cnt = (uint8_t)decim_cnt;
+    fx->delay_tap_smooth = tap_smooth;
     fx->delay_prev_l = prev_l;
     fx->delay_prev_r = prev_r;
     fx->delay_curr_l = curr_l;
@@ -330,9 +451,41 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
         return;
     }
 
-    /* ── Block-Rate Setup (500 Hz for 96-frame blocks; zero per-sample division) ── */
+    /* ── Block-Rate Setup (zero per-sample division) ── */
 
-    fx->delay_tap_len = compute_dub_delay_tap_samples(step_16th_frames);
+    fx->delay_tap_target = compute_dub_delay_target_samples(fx, step_16th_frames);
+    if (!fx->delay_tap_initialized) {
+        fx->delay_tap_smooth = fx->delay_tap_target;
+        fx->delay_tap_initialized = true;
+    }
+
+    /* Update Dub Siren echo throw & ~1.5 s smooth feedback decay */
+    if (fx->siren_wet_target > fx->siren_wet_env) {
+        fx->siren_wet_env += 0.20f * (fx->siren_wet_target - fx->siren_wet_env);
+    } else {
+        fx->siren_wet_env *= 0.9972f;
+        if (fx->siren_wet_env < 1.0e-4f) {
+            fx->siren_wet_env = 0.0f;
+        }
+    }
+    if (fx->siren_fb_target > fx->siren_fb_env) {
+        fx->siren_fb_env += 0.20f * (fx->siren_fb_target - fx->siren_fb_env);
+    } else {
+        fx->siren_fb_env *= 0.9972f;
+        if (fx->siren_fb_env < 1.0e-4f) {
+            fx->siren_fb_env = 0.0f;
+        }
+    }
+
+    const float eff_wet = (fx->delay_wet > fx->siren_wet_env) ? fx->delay_wet : fx->siren_wet_env;
+    float eff_fb = (fx->delay_feedback > fx->siren_fb_env) ? fx->delay_feedback : fx->siren_fb_env;
+    if (eff_fb > 0.87f) {
+        eff_fb = 0.87f;
+    }
+
+    const bool has_send_in =
+        (eff_wet > 0.0005f) && block_has_send_energy(in_send_l, in_send_r, num_frames);
+    const bool run_delay = (eff_wet > 0.0005f) && (has_send_in || (fx->delay_active_samples > 0U));
 
     if (fx->stutter_target_div != SP1_STUTTER_OFF &&
         fx->stutter_active_div != fx->stutter_target_div) {
@@ -349,36 +502,26 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
         fx->stutter_active_div = fx->stutter_target_div;
     }
 
-    /* Smooth DJ isolator position at block rate and update Cytomic TPT SVF coefficients */
     fx->dj_filter_smooth += 0.28f * (fx->dj_filter_target - fx->dj_filter_smooth);
     if (fabsf(fx->dj_filter_target - fx->dj_filter_smooth) < 0.001f) {
         fx->dj_filter_smooth = fx->dj_filter_target;
     }
 
     const float dj_pos = fx->dj_filter_smooth;
-    int dj_mode = 0; /* 0 = center bypass deadzone, -1 = Low-Pass, +1 = High-Pass */
+    int dj_mode = 0;
 
     if (dj_pos < SP1_FX_DJ_DEADZONE_LOW) {
-        /* Low-Pass sweep: norm 0.0f (at 0.0) -> 1.0f (at 0.45)
-         * Quadratic curve from 60 Hz up to 20,000 Hz */
         const float t = dj_pos * SP1_FX_INV_DJ_SPAN;
-        const float t2 = t * t;
-        const float cutoff_hz = 60.0f + (19940.0f * t2);
+        const float cutoff_hz = 60.0f + (19940.0f * t * t);
         sp1_svf_set_params(&fx->dj_svf_l, cutoff_hz, fx->dj_resonance_q);
         sp1_svf_set_params(&fx->dj_svf_r, cutoff_hz, fx->dj_resonance_q);
         dj_mode = -1;
     } else if (dj_pos > SP1_FX_DJ_DEADZONE_HIGH) {
-        /* High-Pass sweep: norm 0.0f (at 0.55) -> 1.0f (at 1.0)
-         * Quadratic curve from 30 Hz up to 12,000 Hz */
         const float t = (dj_pos - SP1_FX_DJ_DEADZONE_HIGH) * SP1_FX_INV_DJ_SPAN;
-        const float t2 = t * t;
-        const float cutoff_hz = 30.0f + (11970.0f * t2);
+        const float cutoff_hz = 30.0f + (11970.0f * t * t);
         sp1_svf_set_params(&fx->dj_svf_l, cutoff_hz, fx->dj_resonance_q);
         sp1_svf_set_params(&fx->dj_svf_r, cutoff_hz, fx->dj_resonance_q);
         dj_mode = 1;
-    } else {
-        /* Center deadzone [0.45..0.55]: SVF bypassed; skip coefficient recomputation */
-        dj_mode = 0;
     }
 
     const bool crush_enabled = (fx->crush_amount > 0.005f);
@@ -386,7 +529,8 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
     if (dj_mode == 0 && !crush_enabled &&
         fx->stutter_target_div == SP1_STUTTER_OFF &&
         fx->stutter_active_div == SP1_STUTTER_OFF) {
-        process_block_normal_fast(fx, in_main_l, in_main_r, in_send_l, in_send_r,
+        process_block_normal_fast(fx, run_delay, eff_wet, eff_fb,
+                                  in_main_l, in_main_r, in_send_l, in_send_r,
                                   out_interleaved_pcm, num_frames);
         return;
     }
@@ -396,59 +540,69 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
     for (uint32_t i = 0U; i < num_frames; ++i) {
         float sig_l = in_main_l[i];
         float sig_r = in_main_r[i];
-        const float send_l = (in_send_l != NULL) ? in_send_l[i] : 0.0f;
-        const float send_r = (in_send_r != NULL) ? in_send_r[i] : 0.0f;
 
-        /* 1. Selective Dub Ping-Pong Delay (3x BBD decimated @ 16 kHz + LP feedback) */
-        if (fx->delay_decim_cnt == 0U) {
-            const uint32_t read_idx =
-                (fx->delay_write_pos - fx->delay_tap_len) & SP1_FX_DELAY_TAP_MASK;
+        if (run_delay) {
+            const float send_l = (in_send_l != NULL) ? in_send_l[i] : 0.0f;
+            const float send_r = (in_send_r != NULL) ? in_send_r[i] : 0.0f;
 
-            fx->delay_prev_l = fx->delay_curr_l;
-            fx->delay_prev_r = fx->delay_curr_r;
-            fx->delay_curr_l = (float)fx->delay_buf_l[read_idx] * SP1_FX_INV_S16_SCALE;
-            fx->delay_curr_r = (float)fx->delay_buf_r[read_idx] * SP1_FX_INV_S16_SCALE;
+            if (fx->delay_decim_cnt == 0U) {
+                fx->delay_tap_smooth += 0.0018f * (fx->delay_tap_target - fx->delay_tap_smooth);
+                const int32_t tap_i = (int32_t)fx->delay_tap_smooth;
+                const float tap_frac = fx->delay_tap_smooth - (float)tap_i;
+                const uint32_t r0 = (fx->delay_write_pos - (uint32_t)tap_i) & SP1_FX_DELAY_TAP_MASK;
+                const uint32_t r1 = (r0 - 1U) & SP1_FX_DELAY_TAP_MASK;
 
-            /* Warm one-pole low-pass damper (~3.2 kHz) inside the ping-pong feedback loop */
-            fx->delay_lp_l += 0.36f * (fx->delay_curr_l - fx->delay_lp_l);
-            fx->delay_lp_r += 0.36f * (fx->delay_curr_r - fx->delay_lp_r);
+                fx->delay_prev_l = fx->delay_curr_l;
+                fx->delay_prev_r = fx->delay_curr_r;
+                const float l0 = (float)fx->delay_buf_l[r0] * SP1_FX_INV_S16_SCALE;
+                const float l1 = (float)fx->delay_buf_l[r1] * SP1_FX_INV_S16_SCALE;
+                const float r_0 = (float)fx->delay_buf_r[r0] * SP1_FX_INV_S16_SCALE;
+                const float r_1 = (float)fx->delay_buf_r[r1] * SP1_FX_INV_S16_SCALE;
+                fx->delay_curr_l = l0 + ((l1 - l0) * tap_frac);
+                fx->delay_curr_r = r_0 + ((r_1 - r_0) * tap_frac);
+
+                fx->delay_lp_l += 0.42f * (fx->delay_curr_l - fx->delay_lp_l);
+                fx->delay_lp_r += 0.42f * (fx->delay_curr_r - fx->delay_lp_r);
 #if !defined(__ARM_FP) || (__ARM_FP == 0)
-            if (fabsf(fx->delay_lp_l) < SP1_DSP_DENORMAL_FLOOR) {
-                fx->delay_lp_l = 0.0f;
-            }
-            if (fabsf(fx->delay_lp_r) < SP1_DSP_DENORMAL_FLOOR) {
-                fx->delay_lp_r = 0.0f;
-            }
+                if (fabsf(fx->delay_lp_l) < SP1_DSP_DENORMAL_FLOOR) {
+                    fx->delay_lp_l = 0.0f;
+                }
+                if (fabsf(fx->delay_lp_r) < SP1_DSP_DENORMAL_FLOOR) {
+                    fx->delay_lp_r = 0.0f;
+                }
 #endif
 
-            /* Ping-Pong topology:
-             * - Left tap receives selective send + feedback from Right tap
-             * - Right tap receives cross-fed output from Left tap + subtle right send */
-            const float in_bbd_l =
-                sp1_soft_clip((send_l * 0.80f) + (fx->delay_lp_r * fx->delay_feedback));
-            const float in_bbd_r =
-                sp1_soft_clip((send_r * 0.35f) + (fx->delay_lp_l * fx->delay_feedback));
+                const float in_bbd_l =
+                    sp1_soft_clip((send_l * 0.80f) + (fx->delay_lp_r * eff_fb));
+                const float in_bbd_r =
+                    sp1_soft_clip((send_r * 0.35f) + (fx->delay_lp_l * eff_fb));
 
-            fx->delay_buf_l[fx->delay_write_pos] = float_to_s16_clamped(in_bbd_l);
-            fx->delay_buf_r[fx->delay_write_pos] = float_to_s16_clamped(in_bbd_r);
-            fx->delay_write_pos = (fx->delay_write_pos + 1U) & SP1_FX_DELAY_TAP_MASK;
+                if ((fabsf(in_bbd_l) + fabsf(in_bbd_r)) > 1.0e-4f) {
+                    fx->delay_active_samples = SP1_FX_DELAY_TAP_SAMPLES + 64U;
+                } else if (fx->delay_active_samples > 0U) {
+                    fx->delay_active_samples--;
+                }
+
+                fx->delay_buf_l[fx->delay_write_pos] = float_to_s16_clamped(in_bbd_l);
+                fx->delay_buf_r[fx->delay_write_pos] = float_to_s16_clamped(in_bbd_r);
+                fx->delay_write_pos = (fx->delay_write_pos + 1U) & SP1_FX_DELAY_TAP_MASK;
+            }
+
+            const float bbd_t = k_bbd_interp_frac[fx->delay_decim_cnt];
+            const float dub_l = fx->delay_prev_l + ((fx->delay_curr_l - fx->delay_prev_l) * bbd_t);
+            const float dub_r = fx->delay_prev_r + ((fx->delay_curr_r - fx->delay_prev_r) * bbd_t);
+
+            fx->delay_decim_cnt++;
+            if (fx->delay_decim_cnt >= SP1_FX_DELAY_DECIM_FACTOR) {
+                fx->delay_decim_cnt = 0U;
+            }
+
+            sig_l += dub_l * eff_wet;
+            sig_r += dub_r * eff_wet;
         }
 
-        const float bbd_t = k_bbd_interp_frac[fx->delay_decim_cnt];
-        const float dub_l = fx->delay_prev_l + ((fx->delay_curr_l - fx->delay_prev_l) * bbd_t);
-        const float dub_r = fx->delay_prev_r + ((fx->delay_curr_r - fx->delay_prev_r) * bbd_t);
-
-        fx->delay_decim_cnt++;
-        if (fx->delay_decim_cnt >= SP1_FX_DELAY_DECIM_FACTOR) {
-            fx->delay_decim_cnt = 0U;
-        }
-
-        sig_l += dub_l * fx->delay_wet;
-        sig_r += dub_r * fx->delay_wet;
-
-        /* 2. Tempo-Synced Beat-Repeat / Stutter Looper (64 KB circular buffer + 64-frame crossfade) */
+        /* 2. Tempo-Synced Beat-Repeat / Stutter Looper */
         if (fx->stutter_target_div == SP1_STUTTER_OFF) {
-            /* Continuously record dry+delay stereo stream while stutter is not held */
             const uint32_t w_idx = fx->stutter_write_pos * 2U;
             fx->stutter_buf[w_idx] = float_to_s16_clamped(sig_l);
             fx->stutter_buf[w_idx + 1U] = float_to_s16_clamped(sig_r);
@@ -478,9 +632,8 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
             float stut_l = (float)fx->stutter_buf[main_frame * 2U] * SP1_FX_INV_S16_SCALE;
             float stut_r = (float)fx->stutter_buf[(main_frame * 2U) + 1U] * SP1_FX_INV_S16_SCALE;
 
-            /* 64-frame linear boundary crossfade with pre-anchor lead-in to prevent loop clicks */
             if ((roff + SP1_FX_STUTTER_XFADE_FRAMES) >= loop_len) {
-                const uint32_t rem = loop_len - roff; /* 1..64 */
+                const uint32_t rem = loop_len - roff;
                 const float alpha =
                     (float)(SP1_FX_STUTTER_XFADE_FRAMES - rem) * SP1_FX_STUTTER_INV_XFADE;
                 const uint32_t lead_frame =
@@ -536,7 +689,7 @@ void sp1_master_fx_process_block(sp1_master_fx_t *fx,
             }
         }
 
-        /* 5. Anti-Aliased Master Soft-Clipper / Limiter -> int16_t Stereo Output */
+        /* 5. Master Soft-Clipper -> int16_t Stereo Output */
         const float out_l = sp1_soft_clip(sig_l * fx->master_drive);
         const float out_r = sp1_soft_clip(sig_r * fx->master_drive);
 

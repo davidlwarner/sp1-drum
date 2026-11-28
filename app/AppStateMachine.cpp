@@ -91,6 +91,13 @@ bool check_fn_hold_shutdown(AppMachine& m) {
     }
     m.fn_was_pressed = pressed;
 
+    if (m.seq != nullptr && sp1_seq_is_running(m.seq)) {
+        /* During playback, holding Function gates on the Dub Siren instead of powering off.
+         * Keep wait_for_release armed if Function is down so stopping requires a fresh hold. */
+        sp1_ui_power_hold_init(&m.power_hold, pressed);
+        return false;
+    }
+
     return sp1_ui_power_hold_update(&m.power_hold,
                                     pressed,
                                     static_cast<uint32_t>(kPollCadenceMs),
@@ -323,6 +330,21 @@ static smf_state_result running_run(void* o) {
     core::reset_breadcrumbs::mark_control_phase(0x04U);
     if (m.power != nullptr) {
         m.power->service_tick();
+        const float batt = m.power->get_battery_level();
+        const float clamped_batt = (batt < 0.0f) ? 0.0f : ((batt > 1.0f) ? 1.0f : batt);
+        const uint32_t batt_u8 = static_cast<uint32_t>(clamped_batt * 255.0f + 0.5f);
+        const uint32_t charging_bit = m.power->is_charging() ? (1U << 8U) : 0U;
+        const uint32_t usb_bit = m.power->is_external_power_present() ? (1U << 9U) : 0U;
+        if (m.power_status_packed != nullptr) {
+            __atomic_store_n(
+                m.power_status_packed, batt_u8 | charging_bit | usb_bit, __ATOMIC_RELEASE);
+        }
+        if (!m.audio_active && m.ui != nullptr) {
+            sp1_ui_mapper_set_power_state(m.ui,
+                                          clamped_batt,
+                                          m.power->is_charging(),
+                                          m.power->is_external_power_present());
+        }
     }
     sp1_audio_cycle_stats_t cyc_stats{};
     sp1_hal_audio_get_cycle_stats(&cyc_stats);

@@ -77,8 +77,10 @@ typedef struct {
     uint64_t frames_per_tick_q32;     /* Active Q32.32 frames per 24 PPQN tick */
     uint64_t next_tick_frame;         /* Integer 48 kHz frame of next internal tick */
     uint32_t next_tick_frac;          /* Fractional Q32 remainder of next internal tick */
-    uint32_t reserved;
+    int8_t tempo_bend_dir;            /* Momentary DJ bend: -1 (-6%), 0 (nominal), +1 (+6%) */
+    uint8_t reserved[3];
 
+    uint64_t base_frames_per_tick_q32;/* Unbent internal Q32.32 frames per tick */
     uint64_t last_ext_rx_frame;       /* Sample frame of most recent external clock/transport msg */
     uint64_t prev_ext_tick_frame;     /* Sample frame of previous external 0xF8 tick */
     uint64_t ext_frames_per_tick_q32; /* PLL-smoothed external Q32.32 frames per tick */
@@ -127,6 +129,13 @@ uint32_t sp1_clock_get_bpm_x100(const sp1_clock_sync_t *clk);
  * Division-free RT-safe helper used by the 1-step lookahead scheduler.
  */
 uint32_t sp1_clock_get_step_frames(const sp1_clock_sync_t *clk);
+
+/**
+ * Set momentary DJ tempo bend (-1 = -6% drag, 0 = nominal, +1 = +6% push) in internal
+ * clock mode without altering the stored nominal BPM.
+ */
+void sp1_clock_set_tempo_bend(sp1_clock_sync_t *clk, int8_t bend_dir);
+int8_t sp1_clock_get_tempo_bend(const sp1_clock_sync_t *clk);
 
 sp1_clock_mode_t sp1_clock_get_mode(const sp1_clock_sync_t *clk);
 bool sp1_clock_is_running(const sp1_clock_sync_t *clk);

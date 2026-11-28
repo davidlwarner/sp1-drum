@@ -254,7 +254,7 @@ int main(int argc, char **argv) {
             (rem > (uint64_t)SP1_AUDIO_BLOCK_FRAMES) ? SP1_AUDIO_BLOCK_FRAMES : (uint32_t)rem;
 
         sp1_hal_controls_poll(&snap);
-        sp1_ui_mapper_update(&ui, &seq, &snap);
+        sp1_ui_mapper_update_ex(&ui, &seq, &snap, 2U);
 
         if (fx_showcase) {
             apply_showcase_automation(&synth, &fx, frame, total_frames);

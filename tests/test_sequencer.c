@@ -631,6 +631,117 @@ static void test_strict_monotonic_midi_tx_ordering_and_live_channel_step_guards(
     TEST_ASSERT(rows > 100U);
 }
 
+static void test_per_track_clock_speeds_probability_audition_and_tempo_bend(void) {
+    init_host_hal(NULL);
+
+    sp1_sequencer_t seq;
+    sp1_seq_init(&seq);
+    sp1_seq_set_bpm_x100(&seq, 12000U); /* 120 BPM: 6,000 frames per 16th-note */
+    sp1_seq_set_swing(&seq, 0.50f);
+
+    /* 1. Per-track clock speeds (0.25x, 0.5x, 1x, 2x) over 2 bars (192,000 frames = 32 16ths):
+     *    Track 0 = 0.25x (quarter notes) ->  8 hits
+     *    Track 1 = 0.50x (eighth notes)  -> 16 hits
+     *    Track 2 = 1.00x (16th notes)    -> 32 hits
+     *    Track 3 = 2.00x (32nd notes)    -> 64 hits */
+    const sp1_track_speed_t speeds[4] = {
+        SP1_TRACK_SPEED_DIV4,
+        SP1_TRACK_SPEED_DIV2,
+        SP1_TRACK_SPEED_1X,
+        SP1_TRACK_SPEED_2X,
+    };
+    for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
+        sp1_seq_set_track_pattern(&seq, t, 8U, 8U, 0U);
+        sp1_seq_set_track_speed(&seq, t, speeds[t]);
+        TEST_ASSERT_EQ_INT(speeds[t], sp1_seq_get_track_speed(&seq, t));
+    }
+
+    sp1_seq_start(&seq);
+    uint32_t speed_hits[4] = { 0U, 0U, 0U, 0U };
+    sp1_seq_trigger_event_t trigs[SP1_SEQ_MAX_BLOCK_TRIGGERS];
+
+    for (uint64_t frame = 0ULL; frame < 192000ULL; frame += SP1_AUDIO_BLOCK_FRAMES) {
+        const uint32_t n = sp1_seq_process_block(
+            &seq, frame, SP1_AUDIO_BLOCK_FRAMES, trigs, SP1_SEQ_MAX_BLOCK_TRIGGERS);
+        for (uint32_t i = 0U; i < n; ++i) {
+            speed_hits[trigs[i].track]++;
+        }
+        sp1_hal_service_background();
+    }
+    sp1_seq_stop(&seq);
+
+    TEST_ASSERT_EQ_U32(8U, speed_hits[0]);
+    TEST_ASSERT_EQ_U32(16U, speed_hits[1]);
+    TEST_ASSERT_EQ_U32(32U, speed_hits[2]);
+    TEST_ASSERT_EQ_U32(64U, speed_hits[3]);
+
+    /* 2. Per-track hit probability: 0% = 0 hits, 50% = partial hits, 100% = all hits */
+    sp1_seq_init(&seq);
+    sp1_seq_set_bpm_x100(&seq, 12000U);
+    for (uint8_t t = 0U; t < 3U; ++t) {
+        sp1_seq_set_track_pattern(&seq, t, 16U, 16U, 0U);
+    }
+    sp1_seq_set_track_pattern(&seq, 3U, 0U, 16U, 0U);
+    sp1_seq_set_track_probability(&seq, 0U, 0.0f);
+    sp1_seq_set_track_probability(&seq, 1U, 0.50f);
+    sp1_seq_set_track_probability(&seq, 2U, 1.0f);
+
+    sp1_seq_start(&seq);
+    uint32_t prob_hits[4] = { 0U, 0U, 0U, 0U };
+    for (uint64_t frame = 0ULL; frame < 384000ULL; frame += SP1_AUDIO_BLOCK_FRAMES) {
+        const uint32_t n = sp1_seq_process_block(
+            &seq, frame, SP1_AUDIO_BLOCK_FRAMES, trigs, SP1_SEQ_MAX_BLOCK_TRIGGERS);
+        for (uint32_t i = 0U; i < n; ++i) {
+            prob_hits[trigs[i].track]++;
+        }
+        sp1_hal_service_background();
+    }
+    sp1_seq_stop(&seq);
+
+    TEST_ASSERT_EQ_U32(0U, prob_hits[0]);
+    TEST_ASSERT(prob_hits[1] >= 16U && prob_hits[1] <= 48U);
+    TEST_ASSERT_EQ_U32(64U, prob_hits[2]);
+
+    /* 3. Live Audition while STOPPED emits audio trigger + clean Note-On / Note-Off pair */
+    sp1_hal_shutdown();
+    init_host_hal(NULL);
+    sp1_seq_init(&seq);
+    sp1_seq_trigger_audition(&seq, 2U, 115U);
+
+    uint32_t aud_fired = 0U;
+    for (uint64_t frame = 0ULL; frame < 4800ULL; frame += SP1_AUDIO_BLOCK_FRAMES) {
+        const uint32_t n = sp1_seq_process_block(
+            &seq, frame, SP1_AUDIO_BLOCK_FRAMES, trigs, SP1_SEQ_MAX_BLOCK_TRIGGERS);
+        for (uint32_t i = 0U; i < n; ++i) {
+            TEST_ASSERT_EQ_INT(2, trigs[i].track);
+            TEST_ASSERT_EQ_INT(115, trigs[i].velocity);
+            aud_fired++;
+        }
+        sp1_hal_service_background();
+    }
+    TEST_ASSERT_EQ_U32(1U, aud_fired);
+    sp1_hal_host_stats_t stats;
+    sp1_hal_host_get_stats(&stats);
+    TEST_ASSERT_EQ_U32(1U, stats.midi_tx_note_on_count);
+    TEST_ASSERT_EQ_U32(1U, stats.midi_tx_note_off_count);
+
+    /* 4. Momentary DJ Tempo Bend (-6% / +6%) alters step interval without mutating nominal BPM */
+    sp1_seq_init(&seq);
+    sp1_seq_set_bpm_x100(&seq, 12000U);
+    const uint32_t step_nom = sp1_clock_get_step_frames(sp1_seq_clock_const(&seq));
+    sp1_seq_set_tempo_bend(&seq, -1); /* -6% slower -> longer step_frames */
+    const uint32_t step_slow = sp1_clock_get_step_frames(sp1_seq_clock_const(&seq));
+    sp1_seq_set_tempo_bend(&seq, 1);  /* +6% faster -> shorter step_frames */
+    const uint32_t step_fast = sp1_clock_get_step_frames(sp1_seq_clock_const(&seq));
+    sp1_seq_set_tempo_bend(&seq, 0);
+
+    TEST_ASSERT_EQ_U32(12000U, sp1_seq_get_bpm_x100(&seq));
+    TEST_ASSERT(step_slow > step_nom + 300U);
+    TEST_ASSERT(step_fast + 300U < step_nom);
+
+    sp1_hal_shutdown();
+}
+
 int main(void) {
     RUN_TEST(test_straight_grid_and_gm_drum_midi_notes);
     RUN_TEST(test_dilla_negative_and_positive_nudge_stacked_with_swing);
@@ -640,5 +751,7 @@ int main(void) {
     RUN_TEST(test_mid_step_tempo_jump_180_to_60_and_60_to_180_reanchoring);
     RUN_TEST(test_external_stop_continue_with_negative_nudge_and_500ms_timeout_continuity);
     RUN_TEST(test_strict_monotonic_midi_tx_ordering_and_live_channel_step_guards);
+    RUN_TEST(test_per_track_clock_speeds_probability_audition_and_tempo_bend);
     return sp1_test_summary();
 }
+

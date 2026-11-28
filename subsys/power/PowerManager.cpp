@@ -2,6 +2,7 @@
 #include "system/ResetBreadcrumbs.hpp"
 #include "system/Watchdog.hpp"
 #include "charger/charger_bq24232.h"
+#include "hal/hal_controls.h"
 #include <zephyr/drivers/charger.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/hwinfo.h>
@@ -176,6 +177,12 @@ void PowerManager::feed_watchdog() const {
 
 void PowerManager::run_poll() {
     refresh_usb_power_state();
+
+    const int32_t batt_mv = sp1_hal_controls_get_battery_mv();
+    if (batt_mv > 0) {
+        battery_mv_.store(batt_mv, std::memory_order_relaxed);
+        battery_level_.store(battery_level_from_mv(batt_mv), std::memory_order_relaxed);
+    }
 
     const bool charging_now = charger_sample_charge_active();
     const int32_t temp_x1000 = sample_die_temperature_milli_c();

@@ -277,6 +277,85 @@ static void test_sample_accurate_intra_block_trigger_dispatch(void) {
     TEST_ASSERT(fabsf(main_l[47]) > 0.05f);
 }
 
+static void test_kits_channel_strip_tone_detent_and_dub_siren(void) {
+    sp1_drum_synth_t synth;
+    sp1_drum_voices_init(&synth);
+
+    /* 1. Verify all 4 synth kits load distinct parameters and 4x4 voice setters round-trip */
+    sp1_drum_voices_load_kit(&synth, 2U); /* Gritty Industrial */
+    TEST_ASSERT(sp1_drum_voices_get_voice_param(&synth, 0U, 3U) > 0.80f);
+    sp1_drum_voices_set_voice_param(&synth, 3U, 1U, 0.91f);
+    TEST_ASSERT_FLOAT_NEAR(0.91f, sp1_drum_voices_get_voice_param(&synth, 3U, 1U), 1e-5f);
+
+    /* 2. Per-track channel strip: Tone Filter flat bypass detent [0.45..0.55], Pan, Delay Send */
+    sp1_drum_voices_init(&synth);
+    TEST_ASSERT_EQ_INT(0, synth.strips[0].tone_mode);
+
+    sp1_drum_voices_set_track_mix(&synth, 0U, 0.90f, 0.48f, 0.0f, 0.45f);
+    TEST_ASSERT_EQ_INT(0, synth.strips[0].tone_mode); /* Exact flat bypass at 0.45 */
+    sp1_drum_voices_set_track_mix(&synth, 0U, 0.90f, 0.48f, 0.0f, 0.55f);
+    TEST_ASSERT_EQ_INT(0, synth.strips[0].tone_mode); /* Exact flat bypass at 0.55 */
+
+    sp1_drum_voices_set_track_mix(&synth, 0U, 0.90f, 0.0f, 0.80f, 0.10f);
+    TEST_ASSERT_EQ_INT(1, synth.strips[0].tone_mode); /* Low-pass (< 0.45) */
+    sp1_drum_voices_set_track_mix(&synth, 2U, 0.90f, 1.0f, 0.0f, 0.90f);
+    TEST_ASSERT_EQ_INT(2, synth.strips[2].tone_mode); /* High-pass (> 0.55) */
+
+    float main_l[SP1_AUDIO_BLOCK_FRAMES];
+    float main_r[SP1_AUDIO_BLOCK_FRAMES];
+    float send_l[SP1_AUDIO_BLOCK_FRAMES];
+    float send_r[SP1_AUDIO_BLOCK_FRAMES];
+
+    /* Hard-left Kick with 0.80 delay send now feeds Left main & send while Right stays 0 */
+    sp1_drum_voices_trigger(&synth, 0U, 120U, true);
+    sp1_drum_voices_render_block(
+        &synth, NULL, 0U, main_l, main_r, send_l, send_r, SP1_AUDIO_BLOCK_FRAMES);
+
+    float sum_l = 0.0f, sum_r = 0.0f, sum_send = 0.0f;
+    for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_FRAMES; ++i) {
+        sum_l += fabsf(main_l[i]);
+        sum_r += fabsf(main_r[i]);
+        sum_send += fabsf(send_l[i]);
+    }
+    TEST_ASSERT(sum_l > 1.0f);
+    TEST_ASSERT_FLOAT_NEAR(0.0f, sum_r, 1e-6f);
+    TEST_ASSERT(sum_send > 0.5f);
+
+    /* 3. Live Dub Siren: steady horn, wail, and 2-tone square LFO modes + smooth release */
+    sp1_drum_voices_init(&synth);
+    const float shapes[3] = { 0.50f, 0.15f, 0.90f }; /* Center horn, smooth wail, square siren */
+    for (uint32_t mode_i = 0U; mode_i < 3U; ++mode_i) {
+        sp1_drum_voices_set_siren(&synth, true, 0.55f, 0.65f, shapes[mode_i], 0.75f);
+        float siren_peak = 0.0f;
+        float siren_send_peak = 0.0f;
+        for (uint32_t blk = 0U; blk < 15U; ++blk) {
+            sp1_drum_voices_render_block(
+                &synth, NULL, 0U, main_l, main_r, send_l, send_r, SP1_AUDIO_BLOCK_FRAMES);
+            for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_FRAMES; ++i) {
+                TEST_ASSERT(is_finite_sample(main_l[i]));
+                if (fabsf(main_l[i]) > siren_peak) {
+                    siren_peak = fabsf(main_l[i]);
+                }
+                if (fabsf(send_l[i]) > siren_send_peak) {
+                    siren_send_peak = fabsf(send_l[i]);
+                }
+            }
+        }
+        TEST_ASSERT(siren_peak > 0.10f && siren_peak <= 1.0f);
+        TEST_ASSERT(siren_send_peak > 0.05f);
+        const float vis = sp1_drum_voices_get_siren_lfo_level(&synth);
+        TEST_ASSERT(vis >= 0.0f && vis <= 1.0f);
+    }
+
+    /* Release Siren gate -> decays cleanly to inactive silence */
+    sp1_drum_voices_set_siren(&synth, false, 0.55f, 0.65f, 0.90f, 0.75f);
+    for (uint32_t blk = 0U; blk < 60U; ++blk) {
+        sp1_drum_voices_render_block(
+            &synth, NULL, 0U, main_l, main_r, send_l, send_r, SP1_AUDIO_BLOCK_FRAMES);
+    }
+    TEST_ASSERT(!synth.siren.active);
+}
+
 int main(void) {
     RUN_TEST(test_flash_luts_and_inline_primitives);
     RUN_TEST(test_track1_kick_pitch_envelope_and_dry_send);
@@ -284,5 +363,7 @@ int main(void) {
     RUN_TEST(test_track3_hihat_6osc_metallic_closed_vs_open_decay);
     RUN_TEST(test_track4_fm_wavefold_perc_clamped_phase_scale);
     RUN_TEST(test_sample_accurate_intra_block_trigger_dispatch);
+    RUN_TEST(test_kits_channel_strip_tone_detent_and_dub_siren);
     return sp1_test_summary();
 }
+

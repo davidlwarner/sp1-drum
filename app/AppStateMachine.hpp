@@ -35,6 +35,7 @@ struct AppMachine {
     const uint32_t* led_track_packed = nullptr;
     const uint32_t* led_play_packed = nullptr;
     const uint32_t* target_volume = nullptr;
+    uint32_t* power_status_packed = nullptr;
     bool (*start_runtime)(void) = nullptr;
     int main_watchdog_channel = -1;
     bool audio_active = false;

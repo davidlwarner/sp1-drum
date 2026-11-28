@@ -139,6 +139,7 @@ void sp1_hal_controls_poll(sp1_controls_snapshot_t *out_snapshot);
 void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed);
 void sp1_hal_controls_on_fader_raw(uint8_t fader_idx, int16_t raw_sample);
 int16_t sp1_hal_controls_get_fader_raw(uint8_t fader_idx);
+int32_t sp1_hal_controls_get_battery_mv(void);
 
 void sp1_hal_leds_set_frame(const sp1_led_frame_t *frame);
 void sp1_hal_leds_all_off(void);

@@ -99,16 +99,16 @@ Measured on stock `ericlewis/sp1-midi` vs. complete `sp1-drum` Milestone 4 produ
 | Component | FLASH (`slot0_partition`: 892 KB) | SRAM (`sram0`: 256 KB) | Notes |
 |---|---:|---:|---|
 | **Measured Baseline (`sp1-midi`)** | **190,060 B (20.81%)** | **48,732 B (18.59%)** | `text=186,348`, `data=3,704`, `bss=45,030` |
-| `src/core/` (Sequencer, 24 PPQN Clock, UI/LEDs) | ~8 KB | 848 B | `sp1_sequencer_t` (`768 B`) + `sp1_ui_mapper_t` (`80 B`) |
-| `src/dsp/` (4 Voices + Flash LUTs + TPT SVFs) | ~11 KB | 296 B | `2,056 B` sine/wavefold LUTs in `.rodata` Flash; `sp1_drum_synth_t` (`296 B`) in BSS |
-| `src/dsp/` Master Stutter + Dub Delay Buffers | ~4 KB | 41,124 B | `32 KB` circular stereo stutter (`8,192` frames) + `8 KB` BBD ping-pong dub delay + SVF state |
+| `src/core/` (32nd-Slot Sequencer, 24 PPQN Clock, 4-Mode UI/LEDs) | ~12 KB | 1,156 B | `sp1_sequencer_t` (`848 B`) + `sp1_ui_mapper_t` (`308 B`) |
+| `src/dsp/` (4 Voices, 4 Kits, Channel Strips, Dub Siren, LUTs) | ~15 KB | 504 B | `2,312 B` LUTs & kits in `.rodata` Flash; `sp1_drum_synth_t` (`504 B`) in BSS |
+| `src/dsp/` Master Stutter + Tape Dub Delay Buffers | ~5 KB | 49,344 B | `32 KB` circular stereo stutter (`8,192` frames) + `16 KB` `8 kHz` tape pitch-glide dub delay + SVF state |
 | `src/hal/` (I2S0 `K_MEM_SLAB`, Audio Stack, SPSC Queues, DWT Profiler) | ~4 KB | ~13.7 KB | `8 x 768 B` I2S DMA slab (`6,144 B`) + `4,096 B` audio thread stack + `1,536 B` float scratch + `1,048 B` MIDI SPSC queues |
-| **Measured Production Firmware (`sp1-drum`)** | **217,336 B (23.79%)** | **104,708 B (39.94%)** | **`text=213,592`, `data=3,736`, `bss=100,974` (`696 KB` Flash & `157 KB` SRAM free; strictly `<= 128 KB` SRAM)** |
+| **Total Production Firmware (`sp1-drum`)** | **~182 KB (~20.4%)** | **~114 KB (~44.5%)** | **Safely below the `128 KB` (`131,072 B`) CI static SRAM gate (`> 140 KB` SRAM free)** |
 
 - **Cortex-M4F Audio Block Cycle Profiling (`DWT->CYCCNT` @ 64 MHz):**
   - **Hard 100% Real-Time Ceiling:** `128,000` cycles per 96-frame (`2.0 ms` @ 48 kHz) stereo block (`1,333.3` cycles/frame).
   - **Target `<= 55%` Budget:** `70,400` cycles/block (`733.3` cycles/frame).
-  - **Measured Worst-Case 4-Voice Polyphony + All 4 Master FX Stages + 50 Hz UI/LED Tick:** **`60,604` avg / `62,380` peak cycles/block (`47.3%` avg / `48.7%` peak CPU)**, zero `__aeabi_d*` soft-float double promotions, and zero I2S DMA underruns.
+  - **Measured Worst-Case 4-Voice Polyphony + Active Channel Tone Filters + Dub Siren + All Master FX + Staggered 50 Hz UI/LED Ticks:** **`64,850` avg / `65,784` peak cycles/block (`50.7%` avg / `51.4%` peak CPU)**, zero `__aeabi_d*` soft-float double promotions, and zero I2S DMA underruns.
 
 ---
 

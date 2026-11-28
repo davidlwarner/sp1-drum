@@ -112,6 +112,36 @@ uint32_t sp1_clock_frame_to_us(uint64_t sample_frame) {
     return (q_mod32 * 125U) + (uint32_t)k_rem_us[r_final];
 }
 
+static uint64_t apply_bend_to_tick_q32(uint64_t base_tick_q32, int8_t bend_dir) {
+    if (bend_dir == 0) {
+        return base_tick_q32;
+    }
+    /* -6% slower => tick period * (100 / 94) ~= * 69730 / 65536
+     * +6% faster => tick period * (100 / 106) ~= * 61826 / 65536
+     * Split (hi, lo) multiply prevents uint64_t overflow. */
+    const uint64_t scale_q16 = (bend_dir < 0) ? 69730ULL : 61826ULL;
+    const uint64_t hi = base_tick_q32 >> 16U;
+    const uint64_t lo = base_tick_q32 & 0xFFFFULL;
+    const uint64_t scaled = (hi * scale_q16) + ((lo * scale_q16 + 0x8000ULL) >> 16U);
+    return clamp_tick_q32(scaled);
+}
+
+static void refresh_internal_tick_period(sp1_clock_sync_t *clk) {
+    const uint64_t bent_q32 =
+        apply_bend_to_tick_q32(clk->base_frames_per_tick_q32, clk->tempo_bend_dir);
+    if (clk->mode == SP1_CLOCK_MODE_INTERNAL || !clk->ext_bpm_locked) {
+        clk->frames_per_tick_q32 = bent_q32;
+    }
+    if (clk->mode == SP1_CLOCK_MODE_INTERNAL && clk->running && !clk->pending_start) {
+        const uint64_t new_period_int = bent_q32 >> 32U;
+        const uint64_t max_next = clk->current_frame + new_period_int;
+        if (clk->next_tick_frame > max_next) {
+            clk->next_tick_frame = max_next;
+            clk->next_tick_frac = (uint32_t)(bent_q32 & 0xFFFFFFFFULL);
+        }
+    }
+}
+
 void sp1_clock_init(sp1_clock_sync_t *clk) {
     if (clk == NULL) {
         return;
@@ -119,8 +149,10 @@ void sp1_clock_init(sp1_clock_sync_t *clk) {
     memset(clk, 0, sizeof(*clk));
     clk->mode = SP1_CLOCK_MODE_INTERNAL;
     clk->bpm_x100 = SP1_CLOCK_BPM_DEFAULT_X100;
-    clk->frames_per_tick_q32 = bpm_x100_to_tick_q32(clk->bpm_x100);
-    clk->ext_frames_per_tick_q32 = clk->frames_per_tick_q32;
+    clk->tempo_bend_dir = 0;
+    clk->base_frames_per_tick_q32 = bpm_x100_to_tick_q32(clk->bpm_x100);
+    clk->frames_per_tick_q32 = clk->base_frames_per_tick_q32;
+    clk->ext_frames_per_tick_q32 = clk->base_frames_per_tick_q32;
 }
 
 void sp1_clock_set_midi_passthrough(sp1_clock_sync_t *clk,
@@ -140,24 +172,8 @@ void sp1_clock_set_bpm_x100(sp1_clock_sync_t *clk, uint32_t bpm_x100) {
 
     const uint32_t clamped = clamp_bpm_x100(bpm_x100);
     clk->bpm_x100 = clamped;
-
-    const uint64_t new_tick_q32 = bpm_x100_to_tick_q32(clamped);
-    if (clk->mode == SP1_CLOCK_MODE_INTERNAL || !clk->ext_bpm_locked) {
-        clk->frames_per_tick_q32 = new_tick_q32;
-    }
-
-    if (clk->mode == SP1_CLOCK_MODE_INTERNAL) {
-        /* If tempo increased while running, pull next_tick_frame within one new period
-         * so fast tempo ramps respond immediately without stalling or double-firing. */
-        if (clk->running && !clk->pending_start) {
-            const uint64_t new_period_int = new_tick_q32 >> 32U;
-            const uint64_t max_next = clk->current_frame + new_period_int;
-            if (clk->next_tick_frame > max_next) {
-                clk->next_tick_frame = max_next;
-                clk->next_tick_frac = (uint32_t)(new_tick_q32 & 0xFFFFFFFFULL);
-            }
-        }
-    }
+    clk->base_frames_per_tick_q32 = bpm_x100_to_tick_q32(clamped);
+    refresh_internal_tick_period(clk);
 }
 
 void sp1_clock_set_bpm(sp1_clock_sync_t *clk, float bpm) {
@@ -180,7 +196,7 @@ uint32_t sp1_clock_get_bpm_x100(const sp1_clock_sync_t *clk) {
         return tick_q32_to_bpm_x100(clk->ext_frames_per_tick_q32);
     }
     if (clk->bpm_x100 == 0U) {
-        return tick_q32_to_bpm_x100(clk->frames_per_tick_q32);
+        return tick_q32_to_bpm_x100(clk->base_frames_per_tick_q32);
     }
     return clk->bpm_x100;
 }
@@ -191,6 +207,21 @@ uint32_t sp1_clock_get_step_frames(const sp1_clock_sync_t *clk) {
     }
     const uint64_t step_q32 = clk->frames_per_tick_q32 * (uint64_t)SP1_CLOCK_TICKS_PER_16TH;
     return (uint32_t)((step_q32 + 0x80000000ULL) >> 32U);
+}
+
+void sp1_clock_set_tempo_bend(sp1_clock_sync_t *clk, int8_t bend_dir) {
+    if (clk == NULL) {
+        return;
+    }
+    const int8_t norm_dir = (bend_dir < 0) ? -1 : ((bend_dir > 0) ? 1 : 0);
+    if (clk->tempo_bend_dir != norm_dir) {
+        clk->tempo_bend_dir = norm_dir;
+        refresh_internal_tick_period(clk);
+    }
+}
+
+int8_t sp1_clock_get_tempo_bend(const sp1_clock_sync_t *clk) {
+    return (clk != NULL) ? clk->tempo_bend_dir : 0;
 }
 
 sp1_clock_mode_t sp1_clock_get_mode(const sp1_clock_sync_t *clk) {
@@ -347,7 +378,9 @@ uint32_t sp1_clock_process_block(sp1_clock_sync_t *clk,
         /* Adopt PLL-locked Q32.32 tick period directly without runtime division;
          * sp1_clock_get_bpm_x100() lazily derives centi-BPM when bpm_x100 == 0. */
         if (clk->ext_bpm_locked) {
-            clk->frames_per_tick_q32 = clk->ext_frames_per_tick_q32;
+            clk->base_frames_per_tick_q32 = clk->ext_frames_per_tick_q32;
+            clk->frames_per_tick_q32 =
+                apply_bend_to_tick_q32(clk->base_frames_per_tick_q32, clk->tempo_bend_dir);
             clk->bpm_x100 = 0U;
         }
 

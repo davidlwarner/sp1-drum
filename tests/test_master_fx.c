@@ -253,8 +253,8 @@ static void test_12_second_polyrhythm_stress_and_sram_budget(void) {
            (double)total_engine_bytes / 1024.0);
 
     TEST_ASSERT(synth_bytes <= 1024U);
-    TEST_ASSERT(fx_bytes <= 81920U);
-    TEST_ASSERT(total_engine_bytes <= 131072U); /* Strictly <= 128 KB */
+    TEST_ASSERT(fx_bytes <= 53248U);          /* <= 52 KB (32 KB stutter + 16 KB tape delay) */
+    TEST_ASSERT(total_engine_bytes <= 65536U);/* Strictly <= 64 KB so firmware stays < 115 KB */
 
     init_silent_hal();
 
@@ -298,6 +298,7 @@ static void test_12_second_polyrhythm_stress_and_sram_budget(void) {
         sp1_drum_voices_set_perc_timbre(&synth, t);
         sp1_master_fx_set_dj_filter(&fx, t, 3.5f);
         sp1_master_fx_set_bitcrusher(&fx, 0.25f * t);
+        sp1_master_fx_set_dub_delay_time(&fx, t, (blk % 50U) < 25U);
         sp1_master_fx_set_stutter(
             &fx, ((blk % 500U) >= 420U) ? SP1_STUTTER_DIV_1_32 : SP1_STUTTER_OFF);
 
@@ -344,10 +345,123 @@ static void test_12_second_polyrhythm_stress_and_sram_budget(void) {
     sp1_hal_shutdown();
 }
 
+static void test_tape_delay_doppler_glide_division_lock_and_siren_throw(void) {
+    static sp1_master_fx_t fx;
+    sp1_master_fx_init(&fx);
+
+    float main_l[SP1_AUDIO_BLOCK_FRAMES];
+    float main_r[SP1_AUDIO_BLOCK_FRAMES];
+    float send_l[SP1_AUDIO_BLOCK_FRAMES];
+    float send_r[SP1_AUDIO_BLOCK_FRAMES];
+    int16_t out_pcm[SP1_AUDIO_BLOCK_SAMPLES];
+
+    for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_FRAMES; ++i) {
+        main_l[i] = 0.0f;
+        main_r[i] = 0.0f;
+        send_l[i] = 0.0f;
+        send_r[i] = 0.0f;
+    }
+
+    /* 1. Idle Dub Delay bypass: when wet == 0 and sends == 0, delay_active_samples stays 0 */
+    sp1_master_fx_set_dub_delay(&fx, 0.0f, 0.0f);
+    sp1_master_fx_process_block(
+        &fx, 6000U, main_l, main_r, send_l, send_r, out_pcm, SP1_AUDIO_BLOCK_FRAMES);
+    TEST_ASSERT_EQ_U32(0U, fx.delay_active_samples);
+
+    /* 2. Tape Doppler pitch-shift during delay time glide + magnetic tempo division lock:
+     *    Write a steady 300 Hz sine into the tape buffer at long delay (1/4 note = 4000 samples
+     *    @ 8 kHz when step_16th_frames = 6000), then sweep delay shorter -> Doppler pitch-up
+     *    produces MORE zero crossings than steady playback, then converges cleanly onto 1/8 note! */
+    sp1_master_fx_init(&fx);
+    sp1_master_fx_set_dub_delay(&fx, 0.90f, 0.75f);
+    sp1_master_fx_set_dub_delay_time(&fx, 1.0f, false); /* Lock 1/4 note (div 5) */
+    TEST_ASSERT_EQ_INT(SP1_DELAY_DIV_1_4, sp1_master_fx_get_dub_delay_div(&fx));
+
+    uint32_t phase = 0U;
+    const uint32_t inc_300 = sp1_hz_to_phase_inc(300.0f);
+    for (uint32_t blk = 0U; blk < 280U; ++blk) {
+        for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_FRAMES; ++i) {
+            phase += inc_300;
+            send_l[i] = sp1_sine_lut(phase) * 0.65f;
+        }
+        sp1_master_fx_process_block(
+            &fx, 6000U, main_l, main_r, send_l, send_r, out_pcm, SP1_AUDIO_BLOCK_FRAMES);
+    }
+    for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_FRAMES; ++i) {
+        send_l[i] = 0.0f;
+    }
+
+    /* Measure baseline zero-crossings over 60 blocks at steady 1/4-note tape speed */
+    uint32_t steady_zc = 0U;
+    int16_t prev = 0;
+    for (uint32_t blk = 0U; blk < 60U; ++blk) {
+        sp1_master_fx_process_block(
+            &fx, 6000U, main_l, main_r, send_l, send_r, out_pcm, SP1_AUDIO_BLOCK_FRAMES);
+        for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_FRAMES; ++i) {
+            const int16_t s = out_pcm[i * 2U];
+            if (prev <= 0 && s > 0) {
+                steady_zc++;
+            }
+            prev = s;
+        }
+    }
+
+    /* Now pull delay slider rapidly shorter toward 1/16 note (0.20) -> Doppler pitch-up! */
+    sp1_master_fx_set_dub_delay_time(&fx, 0.20f, true);
+    uint32_t speedup_zc = 0U;
+    for (uint32_t blk = 0U; blk < 60U; ++blk) {
+        sp1_master_fx_process_block(
+            &fx, 6000U, main_l, main_r, send_l, send_r, out_pcm, SP1_AUDIO_BLOCK_FRAMES);
+        for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_FRAMES; ++i) {
+            const int16_t s = out_pcm[i * 2U];
+            if (prev <= 0 && s > 0) {
+                speedup_zc++;
+            }
+            prev = s;
+        }
+    }
+    TEST_ASSERT(speedup_zc > steady_zc + 8U);
+
+    /* Release slider near 0.62 -> locks onto 1/8 note (div 3 = 2.0 * 16th = 2000 @ 8 kHz) */
+    sp1_master_fx_set_dub_delay_time(&fx, 0.62f, false);
+    TEST_ASSERT_EQ_INT(SP1_DELAY_DIV_1_8, sp1_master_fx_get_dub_delay_div(&fx));
+    for (uint32_t blk = 0U; blk < 400U; ++blk) {
+        sp1_master_fx_process_block(
+            &fx, 6000U, main_l, main_r, send_l, send_r, out_pcm, SP1_AUDIO_BLOCK_FRAMES);
+    }
+    TEST_ASSERT_FLOAT_NEAR(2000.0f, fx.delay_tap_smooth, 1.0f);
+
+    /* 3. Dub Siren echo throw activates repeats even when drum delay_wet == 0.0f */
+    sp1_master_fx_init(&fx);
+    sp1_master_fx_set_dub_delay(&fx, 0.0f, 0.30f);
+    sp1_master_fx_set_siren_throw(&fx, true, 0.90f);
+    for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_FRAMES; ++i) {
+        send_l[i] = 0.70f;
+    }
+    sp1_master_fx_process_block(
+        &fx, 1000U, main_l, main_r, send_l, send_r, out_pcm, SP1_AUDIO_BLOCK_FRAMES);
+    for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_FRAMES; ++i) {
+        send_l[i] = 0.0f;
+    }
+    sp1_master_fx_set_siren_throw(&fx, false, 0.90f);
+
+    double siren_echo_energy = 0.0;
+    for (uint32_t blk = 0U; blk < 80U; ++blk) {
+        sp1_master_fx_process_block(
+            &fx, 1000U, main_l, main_r, send_l, send_r, out_pcm, SP1_AUDIO_BLOCK_FRAMES);
+        for (uint32_t i = 0U; i < SP1_AUDIO_BLOCK_SAMPLES; ++i) {
+            siren_echo_energy += (double)out_pcm[i] * (double)out_pcm[i];
+        }
+    }
+    TEST_ASSERT(siren_echo_energy > 1.0e6);
+}
+
 int main(void) {
     RUN_TEST(test_dj_svf_isolator_deadzone_lp_hp_and_sweep_stability);
     RUN_TEST(test_stutter_looper_wrap_and_crossfade_continuity);
     RUN_TEST(test_dub_ping_pong_delay_selective_send);
     RUN_TEST(test_12_second_polyrhythm_stress_and_sram_budget);
+    RUN_TEST(test_tape_delay_doppler_glide_division_lock_and_siren_throw);
     return sp1_test_summary();
 }
+

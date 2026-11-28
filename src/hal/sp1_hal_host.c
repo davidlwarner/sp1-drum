@@ -210,6 +210,10 @@ int16_t sp1_hal_controls_get_fader_raw(uint8_t fader_idx) {
     return (int16_t)g_live_controls.fader_raw[fader_idx];
 }
 
+int32_t sp1_hal_controls_get_battery_mv(void) {
+    return 4100;
+}
+
 void sp1_hal_controls_poll(sp1_controls_snapshot_t *out_snapshot) {
     sp1_controls_snapshot_t snap;
     sp1_controls_bus_read(&g_controls_bus, &snap);

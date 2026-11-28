@@ -41,10 +41,7 @@ const float k_sine_lut_256[SP1_DSP_LUT_TABLE_LEN] = {
      0.00000000f
 };
 
-/* ── Flash-Resident 257-Entry West-Coast Wavefolder LUT (1028 B in .rodata) ── *
- * Precomputed transfer curve for x in [-4.0f, +4.0f]:
- *   y(x) = 0.72f * sin(0.5f * pi * 1.75f * x) + 0.28f * tanh(0.85f * x)
- * Odd-symmetric with exact 0.0f at center index 128. */
+/* ── Flash-Resident 257-Entry West-Coast Wavefolder LUT (1028 B in .rodata) ── */
 
 const float k_wavefold_lut_256[SP1_DSP_LUT_TABLE_LEN] = {
      0.43935567f,  0.48341686f,  0.52287185f,  0.55742943f,  0.58683461f,  0.61087024f,  0.62935907f,  0.64216560f,
@@ -87,6 +84,42 @@ static const float k_hat_metallic_hz[SP1_DSP_HAT_NUM_OSC] = {
     205.0f, 304.0f, 369.0f, 522.0f, 540.0f, 800.0f
 };
 
+/* 4 Curated Drum Synth Kit Presets in .rodata Flash (256 B, 0 B SRAM):
+ *  - Kit 0: Classic 808 / 909 (Boot Default)
+ *  - Kit 1: Dry Woody Rim & Tight Sub
+ *  - Kit 2: Industrial FM & Buchla Metal
+ *  - Kit 3: Lo-Fi Dub & Open Sizzle */
+static const float k_drum_kit_presets[SP1_DRUM_NUM_KITS][SP1_SEQ_NUM_TRACKS][SP1_DRUM_NUM_VOICE_PARAMS] = {
+    {   /* Kit 0: Classic 808 / 909 */
+        { 0.50f, 0.45f, 0.50f, 0.35f }, /* Kick: 45 Hz, balanced punch & drive */
+        { 0.50f, 0.65f, 0.65f, 0.50f }, /* Snare: crisp rim-snare */
+        { 0.50f, 0.20f, 0.50f, 0.50f }, /* Hat: tight closed metallic 808 hat */
+        { 0.50f, 0.45f, 0.45f, 0.45f }, /* Perc: balanced FM / wavefold */
+    },
+    {   /* Kit 1: Dry Woody Rim & Tight Sub */
+        { 0.64f, 0.22f, 0.35f, 0.18f }, /* Kick: tight warm 54 Hz punch */
+        { 0.52f, 0.08f, 0.15f, 0.35f }, /* Snare: pure woody 808 rimshot */
+        { 0.66f, 0.08f, 0.65f, 0.30f }, /* Hat: ultra-short high metallic tick */
+        { 0.38f, 0.12f, 0.28f, 0.12f }, /* Perc: hollow woody FM conga/clave */
+    },
+    {   /* Kit 2: Industrial FM & Buchla Metal */
+        { 0.34f, 0.72f, 0.88f, 0.88f }, /* Kick: aggressive folded sub */
+        { 0.72f, 0.82f, 0.75f, 0.84f }, /* Snare: bright metallic crack */
+        { 0.22f, 0.55f, 0.32f, 0.15f }, /* Hat: dark clangorous gong cluster */
+        { 0.68f, 0.88f, 0.68f, 0.92f }, /* Perc: gnarly West-Coast wavefold clang */
+    },
+    {   /* Kit 3: Lo-Fi Dub & Open Sizzle */
+        { 0.20f, 0.84f, 0.28f, 0.45f }, /* Kick: deep 35 Hz sound-system sub */
+        { 0.38f, 0.55f, 0.80f, 0.26f }, /* Snare: dark vintage dub snare */
+        { 0.56f, 0.72f, 0.68f, 0.78f }, /* Hat: shimmering open sizzle hat */
+        { 0.76f, 0.28f, 0.86f, 0.42f }, /* Perc: dub syndrum / laser sweep */
+    },
+};
+
+#define SP1_DSP_BIPOLAR_LOW     0.45f
+#define SP1_DSP_BIPOLAR_HIGH    0.55f
+#define SP1_DSP_INV_BIPOLAR     2.22222222f /* 1.0f / 0.45f */
+
 static inline float clamp01(float x) {
     if (x < 0.0f) {
         return 0.0f;
@@ -97,12 +130,36 @@ static inline float clamp01(float x) {
     return x;
 }
 
-/* ── Cytomic TPT SVF Coefficient Update (Control/Block Rate Only) ────────── */
+/* Maps [0.0..1.0] with [0.45..0.55] center detent to [-1.0..+1.0]. */
+static inline float bipolar_detent(float norm) {
+    const float c = clamp01(norm);
+    if (c >= SP1_DSP_BIPOLAR_LOW && c <= SP1_DSP_BIPOLAR_HIGH) {
+        return 0.0f;
+    }
+    if (c < SP1_DSP_BIPOLAR_LOW) {
+        return -((SP1_DSP_BIPOLAR_LOW - c) * SP1_DSP_INV_BIPOLAR);
+    }
+    return (c - SP1_DSP_BIPOLAR_HIGH) * SP1_DSP_INV_BIPOLAR;
+}
+
+/* ── Cytomic TPT SVF & 1-Pole Coefficient Updates (Control Rate Only) ────── */
 
 static inline float fast_tan_pi_control(float w) {
     const float x = 3.14159265f * w;
     const float x2 = x * x;
     return x * (15.0f - x2) / (15.0f - (6.0f * x2));
+}
+
+static inline float fast_onepole_g_control(float cutoff_hz) {
+    float w = cutoff_hz * SP1_DSP_INV_FS_HZ;
+    if (w < 0.0005f) {
+        w = 0.0005f;
+    }
+    if (w > 0.42f) {
+        w = 0.42f;
+    }
+    const float g = fast_tan_pi_control(w);
+    return g / (1.0f + g);
 }
 
 void sp1_svf_set_params(sp1_svf_t *f, float cutoff_hz, float q) {
@@ -136,66 +193,92 @@ void sp1_svf_set_params(sp1_svf_t *f, float cutoff_hz, float q) {
 /* ── Control-Rate Parameter Helpers ──────────────────────────────────────── */
 
 static void update_kick_coeffs(sp1_kick_voice_t *k) {
-    /* Morph amp decay from ~110 ms (0.99935f) to ~290 ms (0.99975f) */
-    k->amp_decay_coeff = 0.99935f + (0.00040f * k->decay_param);
-    /* Exponential pitch sweep (200 Hz -> 45 Hz) with tau ~ 14 ms */
+    const float tune_bi = bipolar_detent(k->tune_param);
+    k->base_freq_hz = (tune_bi < 0.0f) ? (45.0f + (13.0f * tune_bi))   /* 32..45 Hz */
+                                       : (45.0f + (30.0f * tune_bi));  /* 45..75 Hz */
+
+    /* Morph amp decay from ~80 ms (0.99915f) to ~450 ms (0.99982f) */
+    k->amp_decay_coeff = 0.99915f + (0.00067f * k->decay_param);
     k->pitch_decay_coeff = 0.99820f;
-    /* Fast transient phase-distortion punch with tau ~ 2.2 ms */
     k->click_decay_coeff = 0.99050f;
-    k->base_freq_hz = 45.0f;
+    k->pitch_span_base_hz = 65.0f + (180.0f * k->punch_param); /* 155 Hz at default 0.50 */
+    k->pd_depth_scale = (1.2e8f + (6.0e8f * k->punch_param));  /* 4.2e8f at default 0.50 */
 }
 
 static void update_snare_coeffs(sp1_snare_voice_t *s) {
+    const float pitch_bi = bipolar_detent(s->pitch_param);
+    const float pitch_scale = (pitch_bi < 0.0f) ? (1.0f + (0.30f * pitch_bi))
+                                                : (1.0f + (0.45f * pitch_bi));
     const float m = s->tone_morph;
-    /* Rimshot (m = 0.0f): tight woody dual-resonator decay (~22 ms -> 0.99885f),
-     * high rim overtone (~465 Hz), and short/minimal wire noise (~14 ms -> 0.99820f).
-     * Snare (m = 1.0f): fuller drum body (~55 ms -> 0.99945f), classic ~335 Hz overtone,
-     * and extended snappy wire tail (~125 ms -> 0.99968f). */
-    s->body_decay_coeff = 0.99885f + (0.00060f * m);
-    s->noise_decay_coeff = 0.99820f + (0.00148f * m);
-    s->knock_decay_coeff = 0.99350f; /* ~3.2 ms woody transient pitch knock */
-    s->rim_freq_hz = 465.0f - (130.0f * m);
+    const float wd = s->wire_decay_param;
+    const float wf = s->wire_filter_param;
 
-    const float svf_cutoff = 1900.0f + (950.0f * m);
+    s->body_decay_coeff = 0.99885f + (0.00060f * m);
+    s->noise_decay_coeff = 0.99820f + (0.00154f * wd);
+    s->knock_decay_coeff = 0.99350f;
+    s->body_freq_hz = 185.0f * pitch_scale;
+    s->rim_freq_hz = (465.0f - (130.0f * m)) * pitch_scale;
+
+    const float filter_offset = (wf - 0.50f) * 2400.0f;
+    float svf_cutoff = 1900.0f + (950.0f * m) + filter_offset;
+    if (svf_cutoff < 900.0f) {
+        svf_cutoff = 900.0f;
+    } else if (svf_cutoff > 5200.0f) {
+        svf_cutoff = 5200.0f;
+    }
     const float svf_q = 2.4f - (0.8f * m);
     sp1_svf_set_params(&s->wire_svf, svf_cutoff, svf_q);
 }
 
 static void update_hat_coeffs(sp1_hat_voice_t *h) {
+    const float tune_bi = bipolar_detent(h->tune_param);
+    const float tune_scale = (tune_bi < 0.0f) ? (1.0f + (0.35f * tune_bi))
+                                               : (1.0f + (0.55f * tune_bi));
+    for (uint32_t i = 0U; i < SP1_DSP_HAT_NUM_OSC; ++i) {
+        h->phase_inc[i] = sp1_hz_to_phase_inc(k_hat_metallic_hz[i] * tune_scale);
+    }
+
     const float m = h->decay_morph;
-    /* Closed Hat (m = 0.0f): ~24 ms decay (0.99895f).
-     * Open Hat   (m = 1.0f): ~260 ms decay (0.99988f). */
     h->amp_decay_coeff = 0.99895f + (0.00093f * m);
-    sp1_svf_set_params(&h->hp_svf, 5600.0f, 2.25f);
+
+    const float cutoff = 2500.0f + (6200.0f * h->cutoff_param); /* 5,600 Hz at default 0.50 */
+    sp1_svf_set_params(&h->hp_svf, cutoff, 2.25f);
+
+    /* Default 0.50 -> metal_gain = 0.036f, noise_gain = 0.35f (matches original balance) */
+    const float nm = h->noise_mix_param;
+    h->metal_gain = 0.060f * (1.0f - (0.80f * nm));
+    h->noise_gain = 0.70f * nm;
 }
 
 static void update_perc_coeffs(sp1_perc_voice_t *p) {
+    const float pitch_bi = bipolar_detent(p->pitch_param);
+    const float pitch_scale = (pitch_bi < 0.0f) ? (1.0f + (0.48f * pitch_bi))
+                                                : (1.0f + (0.80f * pitch_bi));
+    const float r = p->ratio_param;
+    const float d = p->decay_param;
     const float m = p->timbre_morph;
-    p->amp_decay_coeff = 0.99915f + (0.00035f * m);
-    p->pitch_decay_coeff = 0.99680f;
-    p->index_decay_coeff = 0.99840f;
-    p->carrier_base_hz = 290.0f + (190.0f * m);
-    p->pitch_span_hz = 240.0f + (220.0f * m);
-    /* Inharmonic metallic FM ratio (1.414 .. 2.718) */
-    p->mod_ratio = 1.4142135f + (1.304f * m);
 
-    float mod_scale = (3.5e8f + (1.35e9f * m));
+    p->amp_decay_coeff = 0.99890f + (0.00075f * d);
+    p->pitch_decay_coeff = 0.99580f + (0.00220f * d);
+    p->index_decay_coeff = 0.99840f;
+    p->carrier_base_hz = (290.0f + (190.0f * m)) * pitch_scale;
+    p->pitch_span_hz = (140.0f + (320.0f * d)) * pitch_scale;
+    p->mod_ratio = 1.00f + (2.40f * r);
+
+    float mod_scale = (2.5e8f + (1.50e9f * m));
     if (mod_scale > SP1_DSP_MAX_MOD_PHASE_SCALE) {
         mod_scale = SP1_DSP_MAX_MOD_PHASE_SCALE;
     }
     p->mod_phase_scale = mod_scale;
 
-    float fb_scale = (1.2e8f + (3.2e8f * m));
+    float fb_scale = (1.0e8f + (3.5e8f * m));
     if (fb_scale > SP1_DSP_MAX_FB_PHASE_SCALE) {
         fb_scale = SP1_DSP_MAX_FB_PHASE_SCALE;
     }
     p->fb_phase_scale = fb_scale;
 }
 
-/* ── Division-Free Register-Resident Voice Segment Renderers ─────────────── *
- * Rendering one voice at a time across a contiguous [start, end) segment keeps
- * each voice's inner loop well inside the nRF52840 2 KB Flash ICACHE and keeps
- * hot phase/envelope/SVF state in Cortex-M4F registers with zero stack spills. */
+/* ── Division-Free Register-Resident Voice Segment Renderers ─────────────── */
 
 #if defined(__GNUC__) || defined(__clang__)
 #define SP1_DSP_NOINLINE __attribute__((noinline))
@@ -204,8 +287,11 @@ static void update_perc_coeffs(sp1_perc_voice_t *p) {
 #endif
 
 static SP1_DSP_NOINLINE void render_kick_segment(sp1_kick_voice_t *v,
+                                                 sp1_track_strip_t *strip,
                                                  float *out_main_l,
                                                  float *out_main_r,
+                                                 float *out_send_l,
+                                                 float *out_send_r,
                                                  uint32_t start,
                                                  uint32_t end) {
     if (!v->active || start >= end) {
@@ -227,7 +313,15 @@ static SP1_DSP_NOINLINE void render_kick_segment(sp1_kick_voice_t *v,
     const float drive_gain = 1.15f + (drive_param * 1.15f);
     const float fold_mix = drive_param * 0.30f;
     const bool use_fold = (drive_param > 0.01f);
-    const float vel_gain = v->velocity_gain;
+
+    const float ch_gain = v->velocity_gain * strip->level_gain;
+    const float gain_l = ch_gain * strip->pan_l;
+    const float gain_r = ch_gain * strip->pan_r;
+    const float send_amt = strip->delay_send * ch_gain;
+    const bool has_send = (send_amt > 0.001f) && (out_send_l != NULL) && (out_send_r != NULL);
+    const uint8_t tone_mode = strip->tone_mode;
+    const float tone_g = strip->tone_g;
+    float tone_z = strip->tone_z;
     bool active = true;
 
     for (uint32_t i = start; i < end; ++i) {
@@ -264,9 +358,19 @@ static SP1_DSP_NOINLINE void render_kick_segment(sp1_kick_voice_t *v,
             shaped = sat + ((folded - sat) * fold_mix);
         }
 
-        const float out = shaped * amp_env * vel_gain;
-        out_main_l[i] += out;
-        out_main_r[i] += out;
+        float sig = shaped * amp_env;
+        if (tone_mode != 0U) {
+            tone_z += tone_g * (sig - tone_z);
+            sig = (tone_mode == 1U) ? tone_z : (sig - tone_z);
+        }
+
+        out_main_l[i] += sig * gain_l;
+        out_main_r[i] += sig * gain_r;
+        if (has_send) {
+            const float snd = sig * send_amt;
+            out_send_l[i] += snd;
+            out_send_r[i] += snd;
+        }
 
         amp_env *= amp_decay;
         if (amp_env < SP1_DSP_ENV_FLOOR) {
@@ -278,6 +382,12 @@ static SP1_DSP_NOINLINE void render_kick_segment(sp1_kick_voice_t *v,
         }
     }
 
+#if !defined(__ARM_FP) || (__ARM_FP == 0)
+    if (fabsf(tone_z) < SP1_DSP_DENORMAL_FLOOR) {
+        tone_z = 0.0f;
+    }
+#endif
+    strip->tone_z = tone_z;
     v->phase = phase;
     v->amp_env = amp_env;
     v->pitch_env = pitch_env;
@@ -286,6 +396,7 @@ static SP1_DSP_NOINLINE void render_kick_segment(sp1_kick_voice_t *v,
 }
 
 static SP1_DSP_NOINLINE void render_snare_segment(sp1_snare_voice_t *v,
+                                                  sp1_track_strip_t *strip,
                                                   float *out_main_l,
                                                   float *out_main_r,
                                                   float *out_send_l,
@@ -319,9 +430,17 @@ static SP1_DSP_NOINLINE void render_snare_segment(sp1_snare_voice_t *v,
     const float knock_m = (1.0f - m) * 0.85f;
     const float rim_leak = 0.12f * (1.0f - m);
     const float wire_gain = 0.05f + (0.75f * m);
-    const float vel_gain = v->velocity_gain;
 
-    const uint32_t body_base_inc = sp1_hz_to_phase_inc(185.0f);
+    const float ch_gain = v->velocity_gain * strip->level_gain;
+    const float gain_l = ch_gain * 0.96f * strip->pan_l;
+    const float gain_r = ch_gain * 1.02f * strip->pan_r;
+    const float send_amt = ch_gain * strip->delay_send;
+    const bool has_send = (send_amt > 0.001f) && (out_send_l != NULL) && (out_send_r != NULL);
+    const uint8_t tone_mode = strip->tone_mode;
+    const float tone_g = strip->tone_g;
+    float tone_z = strip->tone_z;
+
+    const uint32_t body_base_inc = sp1_hz_to_phase_inc(v->body_freq_hz);
     const uint32_t rim_base_inc = sp1_hz_to_phase_inc(v->rim_freq_hz);
     const float body_knock_inc_f = 135.0f * SP1_DSP_PHASE_SCALE;
     const float rim_knock_inc_f = 245.0f * SP1_DSP_PHASE_SCALE;
@@ -329,7 +448,6 @@ static SP1_DSP_NOINLINE void render_snare_segment(sp1_snare_voice_t *v,
     bool active = true;
     uint32_t i = start;
 
-    /* Phase 1: Dual-resonator body + wire noise (active only during initial 22..55 ms) */
     while (i < end && body_env > 0.0f) {
         if (knock_env > 0.0f) {
             phase_body += body_base_inc + (uint32_t)(body_knock_inc_f * knock_env);
@@ -358,15 +476,18 @@ static SP1_DSP_NOINLINE void render_snare_segment(sp1_snare_voice_t *v,
         const float svf_hp = v0 - (svf_k * v1) - v2;
 
         const float wire_sig = ((v1 * 0.62f) + (svf_hp * 0.52f)) * noise_env * wire_gain;
-        const float out = sp1_soft_clip(resonator + wire_sig) * vel_gain;
-
-        out_main_l[i] += out * 0.96f;
-        out_main_r[i] += out * 1.02f;
-        if (out_send_l != NULL) {
-            out_send_l[i] += out * 0.55f;
+        float sig = sp1_soft_clip(resonator + wire_sig);
+        if (tone_mode != 0U) {
+            tone_z += tone_g * (sig - tone_z);
+            sig = (tone_mode == 1U) ? tone_z : (sig - tone_z);
         }
-        if (out_send_r != NULL) {
-            out_send_r[i] += out * 0.55f;
+
+        out_main_l[i] += sig * gain_l;
+        out_main_r[i] += sig * gain_r;
+        if (has_send) {
+            const float snd = sig * send_amt;
+            out_send_l[i] += snd;
+            out_send_r[i] += snd;
         }
 
         body_env *= body_decay;
@@ -390,7 +511,6 @@ static SP1_DSP_NOINLINE void render_snare_segment(sp1_snare_voice_t *v,
         }
     }
 
-    /* Phase 2: Noise-only wire tail (tight register-only loop, zero oscillator work) */
     if (active) {
         const float wire_scale = wire_gain;
         for (; i < end; ++i) {
@@ -403,15 +523,18 @@ static SP1_DSP_NOINLINE void render_snare_segment(sp1_snare_voice_t *v,
             const float svf_hp = v0 - (svf_k * v1) - v2;
 
             const float wire_sig = ((v1 * 0.62f) + (svf_hp * 0.52f)) * noise_env * wire_scale;
-            const float out = sp1_soft_clip(wire_sig) * vel_gain;
-
-            out_main_l[i] += out * 0.96f;
-            out_main_r[i] += out * 1.02f;
-            if (out_send_l != NULL) {
-                out_send_l[i] += out * 0.55f;
+            float sig = sp1_soft_clip(wire_sig);
+            if (tone_mode != 0U) {
+                tone_z += tone_g * (sig - tone_z);
+                sig = (tone_mode == 1U) ? tone_z : (sig - tone_z);
             }
-            if (out_send_r != NULL) {
-                out_send_r[i] += out * 0.55f;
+
+            out_main_l[i] += sig * gain_l;
+            out_main_r[i] += sig * gain_r;
+            if (has_send) {
+                const float snd = sig * send_amt;
+                out_send_l[i] += snd;
+                out_send_r[i] += snd;
             }
 
             noise_env *= noise_decay;
@@ -431,8 +554,12 @@ static SP1_DSP_NOINLINE void render_snare_segment(sp1_snare_voice_t *v,
     if (fabsf(ic2) < SP1_DSP_DENORMAL_FLOOR) {
         ic2 = 0.0f;
     }
+    if (fabsf(tone_z) < SP1_DSP_DENORMAL_FLOOR) {
+        tone_z = 0.0f;
+    }
 #endif
 
+    strip->tone_z = tone_z;
     v->phase_body = phase_body;
     v->phase_rim = phase_rim;
     v->rng = rng;
@@ -445,8 +572,11 @@ static SP1_DSP_NOINLINE void render_snare_segment(sp1_snare_voice_t *v,
 }
 
 static SP1_DSP_NOINLINE void render_hat_segment(sp1_hat_voice_t *v,
+                                                sp1_track_strip_t *strip,
                                                 float *out_main_l,
                                                 float *out_main_r,
+                                                float *out_send_l,
+                                                float *out_send_r,
                                                 uint32_t start,
                                                 uint32_t end) {
     if (!v->active || start >= end) {
@@ -470,11 +600,20 @@ static SP1_DSP_NOINLINE void render_hat_segment(sp1_hat_voice_t *v,
 
     float amp_env = v->amp_env;
     const float amp_decay = v->amp_decay_coeff;
-    const float vel_gain = v->velocity_gain;
+    const float metal_gain = v->metal_gain;
+    const float noise_gain = v->noise_gain;
+
+    const float ch_gain = v->velocity_gain * strip->level_gain;
+    const float gain_l = ch_gain * 0.76f * strip->pan_l;
+    const float gain_r = ch_gain * 1.06f * strip->pan_r;
+    const float send_amt = ch_gain * strip->delay_send;
+    const bool has_send = (send_amt > 0.001f) && (out_send_l != NULL) && (out_send_r != NULL);
+    const uint8_t tone_mode = strip->tone_mode;
+    const float tone_g = strip->tone_g;
+    float tone_z = strip->tone_z;
     bool active = true;
 
     for (uint32_t i = start; i < end; ++i) {
-        /* 3 inharmonic metallic square oscillators (205, 522, 800 Hz) + 8x harmonic tap */
         p0 += inc0;
         p1 += inc1;
         p2 += inc2;
@@ -486,8 +625,7 @@ static SP1_DSP_NOINLINE void render_hat_segment(sp1_hat_voice_t *v,
         metal_i += (((int32_t)(p2 >> 31U) * 2) - 1) * 4 +
                    (((int32_t)((p2 >> 28U) & 1U) * 2) - 1) * 6;
 
-        /* 0.20f * 0.18f = 0.036f combined metallic mix gain */
-        const float v0 = ((float)metal_i * 0.036f) + (sp1_xorshift32_noise(&rng) * 0.35f);
+        const float v0 = ((float)metal_i * metal_gain) + (sp1_xorshift32_noise(&rng) * noise_gain);
 
         const float v3 = v0 - ic2;
         const float v1 = (a1 * ic1) + (a2 * v3);
@@ -496,9 +634,19 @@ static SP1_DSP_NOINLINE void render_hat_segment(sp1_hat_voice_t *v,
         ic2 = (2.0f * v2) - ic2;
         const float hp_out = v0 - (svf_k * v1) - v2;
 
-        const float out = sp1_soft_clip((hp_out * 0.82f) + (v1 * 0.32f)) * amp_env * vel_gain;
-        out_main_l[i] += out * 0.76f;
-        out_main_r[i] += out * 1.06f;
+        float sig = sp1_soft_clip((hp_out * 0.82f) + (v1 * 0.32f)) * amp_env;
+        if (tone_mode != 0U) {
+            tone_z += tone_g * (sig - tone_z);
+            sig = (tone_mode == 1U) ? tone_z : (sig - tone_z);
+        }
+
+        out_main_l[i] += sig * gain_l;
+        out_main_r[i] += sig * gain_r;
+        if (has_send) {
+            const float snd = sig * send_amt;
+            out_send_l[i] += snd;
+            out_send_r[i] += snd;
+        }
 
         amp_env *= amp_decay;
         if (amp_env < SP1_DSP_ENV_FLOOR) {
@@ -515,8 +663,12 @@ static SP1_DSP_NOINLINE void render_hat_segment(sp1_hat_voice_t *v,
     if (fabsf(ic2) < SP1_DSP_DENORMAL_FLOOR) {
         ic2 = 0.0f;
     }
+    if (fabsf(tone_z) < SP1_DSP_DENORMAL_FLOOR) {
+        tone_z = 0.0f;
+    }
 #endif
 
+    strip->tone_z = tone_z;
     v->phase[0] = p0;
     v->phase[3] = p1;
     v->phase[5] = p2;
@@ -528,6 +680,7 @@ static SP1_DSP_NOINLINE void render_hat_segment(sp1_hat_voice_t *v,
 }
 
 static SP1_DSP_NOINLINE void render_perc_segment(sp1_perc_voice_t *v,
+                                                 sp1_track_strip_t *strip,
                                                  float *out_main_l,
                                                  float *out_main_r,
                                                  float *out_send_l,
@@ -556,7 +709,16 @@ static SP1_DSP_NOINLINE void render_perc_segment(sp1_perc_voice_t *v,
     const float fb_scale = v->fb_phase_scale;
     const float mod_scale = v->mod_phase_scale;
     const float timbre_scale = v->timbre_morph * 2.10f;
-    const float vel_gain = v->velocity_gain;
+
+    const float ch_gain = v->velocity_gain * strip->level_gain;
+    const float gain_l = ch_gain * 1.05f * strip->pan_l;
+    const float gain_r = ch_gain * 0.78f * strip->pan_r;
+    const float send_l_gain = ch_gain * 1.15f * strip->delay_send;
+    const float send_r_gain = ch_gain * 0.85f * strip->delay_send;
+    const bool has_send = (strip->delay_send > 0.001f) && (out_send_l != NULL) && (out_send_r != NULL);
+    const uint8_t tone_mode = strip->tone_mode;
+    const float tone_g = strip->tone_g;
+    float tone_z = strip->tone_z;
     bool active = true;
 
     for (uint32_t i = start; i < end; ++i) {
@@ -572,25 +734,25 @@ static SP1_DSP_NOINLINE void render_perc_segment(sp1_perc_voice_t *v,
             mod_phase += mod_base_inc;
         }
 
-        /* |prev_mod| <= 1.0f, 0 <= index_env <= 1.0f, fb_scale <= 5e8f (< INT32_MAX) */
         const uint32_t fb_offset = (uint32_t)((int32_t)(prev_mod * fb_scale * index_env));
         const float mod_sample = sp1_sine_lut(mod_phase + fb_offset);
         prev_mod = mod_sample;
 
-        /* |mod_sample| <= 1.0f, 0 <= index_env <= 1.0f, mod_scale <= 2e9f (< INT32_MAX) */
         const uint32_t pm_offset = (uint32_t)((int32_t)(mod_sample * mod_scale * index_env));
         const float carrier = sp1_sine_lut(carrier_phase + pm_offset);
 
         const float fold_drive = 1.10f + (timbre_scale * index_env);
-        const float out = sp1_wavefold_lut(carrier * fold_drive) * amp_env * vel_gain;
-
-        out_main_l[i] += out * 1.05f;
-        out_main_r[i] += out * 0.78f;
-        if (out_send_l != NULL) {
-            out_send_l[i] += out * 0.70f;
+        float sig = sp1_wavefold_lut(carrier * fold_drive) * amp_env;
+        if (tone_mode != 0U) {
+            tone_z += tone_g * (sig - tone_z);
+            sig = (tone_mode == 1U) ? tone_z : (sig - tone_z);
         }
-        if (out_send_r != NULL) {
-            out_send_r[i] += out * 0.50f;
+
+        out_main_l[i] += sig * gain_l;
+        out_main_r[i] += sig * gain_r;
+        if (has_send) {
+            out_send_l[i] += sig * send_l_gain;
+            out_send_r[i] += sig * send_r_gain;
         }
 
         amp_env *= amp_decay;
@@ -604,6 +766,13 @@ static SP1_DSP_NOINLINE void render_perc_segment(sp1_perc_voice_t *v,
         }
     }
 
+#if !defined(__ARM_FP) || (__ARM_FP == 0)
+    if (fabsf(tone_z) < SP1_DSP_DENORMAL_FLOOR) {
+        tone_z = 0.0f;
+    }
+#endif
+
+    strip->tone_z = tone_z;
     v->carrier_phase = carrier_phase;
     v->mod_phase = mod_phase;
     v->prev_mod = prev_mod;
@@ -613,7 +782,114 @@ static SP1_DSP_NOINLINE void render_perc_segment(sp1_perc_voice_t *v,
     v->active = active;
 }
 
+static SP1_DSP_NOINLINE void render_siren_block(sp1_dub_siren_t *s,
+                                                float *out_main_l,
+                                                float *out_main_r,
+                                                float *out_send_l,
+                                                float *out_send_r,
+                                                uint32_t num_frames) {
+    if (!s->gate && !s->active) {
+        return;
+    }
+
+    uint32_t osc_phase = s->osc_phase;
+    uint32_t lfo_phase = s->lfo_phase;
+    const uint32_t lfo_inc = s->lfo_inc;
+    const float base_hz = s->base_freq_hz;
+    const float depth = s->lfo_depth_oct;
+    const uint8_t lfo_mode = s->lfo_mode;
+    const float send_gain = s->delay_send * 0.72f;
+    const bool has_send = (send_gain > 0.001f) && (out_send_l != NULL) && (out_send_r != NULL);
+    float env = s->amp_env;
+    float lfo_vis = s->last_lfo_vis;
+    bool active = true;
+
+    for (uint32_t i = 0U; i < num_frames; ++i) {
+        if (s->gate) {
+            env += 0.0085f * (1.0f - env); /* ~2.5 ms smooth clickless attack */
+        } else {
+            env *= 0.9975f;                /* ~8.3 ms smooth release (< 1e-5 in < 100 ms) */
+            if (env < SP1_DSP_ENV_FLOOR) {
+                env = 0.0f;
+                active = false;
+                break;
+            }
+        }
+
+        lfo_phase += lfo_inc;
+        float mod_bi = 0.0f;
+        if (lfo_mode == 1U) {
+            /* Smooth wailing triangle LFO */
+            mod_bi = sp1_triangle_osc(lfo_phase);
+            lfo_vis = (mod_bi * 0.5f) + 0.5f;
+        } else if (lfo_mode == 2U) {
+            /* Classic Jamaican 2-tone square siren */
+            const bool high_tone = ((lfo_phase & 0x80000000U) == 0U);
+            mod_bi = high_tone ? 1.0f : -0.65f;
+            lfo_vis = high_tone ? 1.0f : 0.0f;
+        } else {
+            lfo_vis = 0.5f;
+        }
+
+        /* Fast division-free pitch modulation around base_hz */
+        float mod_mult = 1.0f + (mod_bi * depth);
+        if (mod_mult < 0.35f) {
+            mod_mult = 0.35f;
+        }
+        osc_phase += sp1_hz_to_phase_inc(base_hz * mod_mult);
+
+        const float sine_core = sp1_sine_lut(osc_phase);
+        const float sq_core = ((osc_phase & 0x80000000U) != 0U) ? -0.55f : 0.55f;
+        const float sig = sp1_soft_clip((sine_core * 0.65f) + (sq_core * 0.65f)) * env * 0.36f;
+
+        out_main_l[i] += sig;
+        out_main_r[i] += sig;
+        if (has_send) {
+            const float snd = sig * send_gain;
+            out_send_l[i] += snd;
+            out_send_r[i] += snd;
+        }
+    }
+
+    s->osc_phase = osc_phase;
+    s->lfo_phase = lfo_phase;
+    s->amp_env = env;
+    s->last_lfo_vis = lfo_vis;
+    s->active = s->gate || active;
+}
+
 /* ── Public API Implementation ───────────────────────────────────────────── */
+
+void sp1_drum_voices_load_kit(sp1_drum_synth_t *synth, uint8_t kit_idx) {
+    if (synth == NULL) {
+        return;
+    }
+    const uint8_t k = (kit_idx < SP1_DRUM_NUM_KITS) ? kit_idx : 0U;
+
+    synth->kick.tune_param  = k_drum_kit_presets[k][0][0];
+    synth->kick.decay_param = k_drum_kit_presets[k][0][1];
+    synth->kick.punch_param = k_drum_kit_presets[k][0][2];
+    synth->kick.drive_param = k_drum_kit_presets[k][0][3];
+    update_kick_coeffs(&synth->kick);
+
+    synth->snare.pitch_param       = k_drum_kit_presets[k][1][0];
+    synth->snare.tone_morph        = k_drum_kit_presets[k][1][1];
+    synth->snare.wire_decay_param  = k_drum_kit_presets[k][1][2];
+    synth->snare.wire_filter_param = k_drum_kit_presets[k][1][3];
+    update_snare_coeffs(&synth->snare);
+
+    synth->hat.tune_param      = k_drum_kit_presets[k][2][0];
+    synth->hat.decay_morph     = k_drum_kit_presets[k][2][1];
+    synth->hat.cutoff_param    = k_drum_kit_presets[k][2][2];
+    synth->hat.noise_mix_param = k_drum_kit_presets[k][2][3];
+    update_hat_coeffs(&synth->hat);
+
+    synth->perc.pitch_param  = k_drum_kit_presets[k][3][0];
+    synth->perc.ratio_param  = k_drum_kit_presets[k][3][1];
+    synth->perc.decay_param  = k_drum_kit_presets[k][3][2];
+    synth->perc.timbre_morph = k_drum_kit_presets[k][3][3];
+    update_perc_coeffs(&synth->perc);
+}
 
 void sp1_drum_voices_init(sp1_drum_synth_t *synth) {
     if (synth == NULL) {
@@ -621,31 +897,29 @@ void sp1_drum_voices_init(sp1_drum_synth_t *synth) {
     }
     memset(synth, 0, sizeof(*synth));
 
-    /* Track 1: Kick defaults */
-    synth->kick.decay_param = 0.45f;
-    synth->kick.drive_param = 0.35f;
-    synth->kick.pitch_span_hz = 155.0f; /* 200 Hz -> 45 Hz */
-    synth->kick.pd_depth_scale = 4.2e8f;
-    update_kick_coeffs(&synth->kick);
-
-    /* Track 2: Snare / Rimshot defaults (0.65 = snappy snare with woody rim transient) */
     synth->snare.rng = 0x2468ACE1U;
-    synth->snare.tone_morph = 0.65f;
     sp1_svf_reset(&synth->snare.wire_svf);
-    update_snare_coeffs(&synth->snare);
 
-    /* Track 3: 6-Oscillator Inharmonic Metallic Hi-Hat defaults */
     synth->hat.rng = 0xA5A55A5AU;
-    synth->hat.decay_morph = 0.20f;
-    for (uint32_t i = 0U; i < SP1_DSP_HAT_NUM_OSC; ++i) {
-        synth->hat.phase_inc[i] = sp1_hz_to_phase_inc(k_hat_metallic_hz[i]);
-    }
     sp1_svf_reset(&synth->hat.hp_svf);
-    update_hat_coeffs(&synth->hat);
 
-    /* Track 4: 2-Op FM / Wavefold Perc defaults */
-    synth->perc.timbre_morph = 0.45f;
-    update_perc_coeffs(&synth->perc);
+    sp1_drum_voices_load_kit(synth, 0U);
+    synth->kick.pitch_span_hz = synth->kick.pitch_span_base_hz;
+
+    /* Default Channel Strip: unity level (1.0), centered pan, flat tone bypass,
+     * and selective Dub Delay sends on Snare (0.55) + Perc (0.60), keeping Kick & Hat dry. */
+    static const float k_default_sends[SP1_SEQ_NUM_TRACKS] = { 0.0f, 0.55f, 0.0f, 0.60f };
+    for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
+        synth->strips[t].level_gain = 1.0f;
+        synth->strips[t].pan_l = 1.0f;
+        synth->strips[t].pan_r = 1.0f;
+        synth->strips[t].delay_send = k_default_sends[t];
+        synth->strips[t].tone_g = 0.5f;
+        synth->strips[t].tone_z = 0.0f;
+        synth->strips[t].tone_mode = 0U; /* Bypassed inside [0.45..0.55] */
+    }
+
+    sp1_drum_voices_set_siren(synth, false, 0.42f, 0.35f, 0.78f, 0.65f);
 }
 
 void sp1_drum_voices_set_kick_params(sp1_drum_synth_t *synth,
@@ -664,7 +938,9 @@ void sp1_drum_voices_set_snare_morph(sp1_drum_synth_t *synth,
     if (synth == NULL) {
         return;
     }
-    synth->snare.tone_morph = clamp01(morph_0_rim_to_1_snare);
+    const float c = clamp01(morph_0_rim_to_1_snare);
+    synth->snare.tone_morph = c;
+    synth->snare.wire_decay_param = c;
     update_snare_coeffs(&synth->snare);
 }
 
@@ -686,6 +962,173 @@ void sp1_drum_voices_set_perc_timbre(sp1_drum_synth_t *synth,
     update_perc_coeffs(&synth->perc);
 }
 
+void sp1_drum_voices_set_voice_param(sp1_drum_synth_t *synth,
+                                     uint8_t track,
+                                     uint8_t param_idx,
+                                     float norm_0_to_1) {
+    if (synth == NULL || track >= SP1_SEQ_NUM_TRACKS || param_idx >= SP1_DRUM_NUM_VOICE_PARAMS) {
+        return;
+    }
+    const float c = clamp01(norm_0_to_1);
+    if (sp1_drum_voices_get_voice_param(synth, track, param_idx) == c) {
+        return;
+    }
+
+    switch (track) {
+    case 0U:
+        if (param_idx == 0U) { synth->kick.tune_param = c; }
+        else if (param_idx == 1U) { synth->kick.decay_param = c; }
+        else if (param_idx == 2U) { synth->kick.punch_param = c; }
+        else { synth->kick.drive_param = c; }
+        update_kick_coeffs(&synth->kick);
+        break;
+    case 1U:
+        if (param_idx == 0U) { synth->snare.pitch_param = c; }
+        else if (param_idx == 1U) { synth->snare.tone_morph = c; }
+        else if (param_idx == 2U) { synth->snare.wire_decay_param = c; }
+        else { synth->snare.wire_filter_param = c; }
+        update_snare_coeffs(&synth->snare);
+        break;
+    case 2U:
+        if (param_idx == 0U) { synth->hat.tune_param = c; }
+        else if (param_idx == 1U) { synth->hat.decay_morph = c; }
+        else if (param_idx == 2U) { synth->hat.cutoff_param = c; }
+        else { synth->hat.noise_mix_param = c; }
+        update_hat_coeffs(&synth->hat);
+        break;
+    case 3U:
+        if (param_idx == 0U) { synth->perc.pitch_param = c; }
+        else if (param_idx == 1U) { synth->perc.ratio_param = c; }
+        else if (param_idx == 2U) { synth->perc.decay_param = c; }
+        else { synth->perc.timbre_morph = c; }
+        update_perc_coeffs(&synth->perc);
+        break;
+    default:
+        break;
+    }
+}
+
+float sp1_drum_voices_get_voice_param(const sp1_drum_synth_t *synth,
+                                      uint8_t track,
+                                      uint8_t param_idx) {
+    if (synth == NULL || track >= SP1_SEQ_NUM_TRACKS || param_idx >= SP1_DRUM_NUM_VOICE_PARAMS) {
+        return 0.5f;
+    }
+    switch (track) {
+    case 0U:
+        if (param_idx == 0U) { return synth->kick.tune_param; }
+        if (param_idx == 1U) { return synth->kick.decay_param; }
+        if (param_idx == 2U) { return synth->kick.punch_param; }
+        return synth->kick.drive_param;
+    case 1U:
+        if (param_idx == 0U) { return synth->snare.pitch_param; }
+        if (param_idx == 1U) { return synth->snare.tone_morph; }
+        if (param_idx == 2U) { return synth->snare.wire_decay_param; }
+        return synth->snare.wire_filter_param;
+    case 2U:
+        if (param_idx == 0U) { return synth->hat.tune_param; }
+        if (param_idx == 1U) { return synth->hat.decay_morph; }
+        if (param_idx == 2U) { return synth->hat.cutoff_param; }
+        return synth->hat.noise_mix_param;
+    case 3U:
+        if (param_idx == 0U) { return synth->perc.pitch_param; }
+        if (param_idx == 1U) { return synth->perc.ratio_param; }
+        if (param_idx == 2U) { return synth->perc.decay_param; }
+        return synth->perc.timbre_morph;
+    default:
+        return 0.5f;
+    }
+}
+
+void sp1_drum_voices_set_track_mix(sp1_drum_synth_t *synth,
+                                   uint8_t track,
+                                   float level_0_to_1,
+                                   float pan_0_to_1,
+                                   float delay_send_0_to_1,
+                                   float tone_0_to_1) {
+    if (synth == NULL || track >= SP1_SEQ_NUM_TRACKS) {
+        return;
+    }
+    sp1_track_strip_t *st = &synth->strips[track];
+
+    /* 0.87f default maps to ~1.00f unity gain, with +1.2 dB headroom at 1.0f */
+    st->level_gain = clamp01(level_0_to_1) * 1.15f;
+
+    const float pan_bi = bipolar_detent(pan_0_to_1);
+    if (pan_bi == 0.0f) {
+        st->pan_l = 1.0f;
+        st->pan_r = 1.0f;
+    } else if (pan_bi < 0.0f) {
+        st->pan_l = 1.0f + (-0.30f * pan_bi); /* up to 1.30f hard left */
+        st->pan_r = 1.0f + pan_bi;            /* down to 0.0f */
+    } else {
+        st->pan_l = 1.0f - pan_bi;            /* down to 0.0f */
+        st->pan_r = 1.0f + (0.30f * pan_bi);  /* up to 1.30f hard right */
+    }
+
+    st->delay_send = clamp01(delay_send_0_to_1);
+
+    /* Per-track Tone Filter: strictly bypassed (tone_mode = 0) inside [0.45..0.55] */
+    const float tone_bi = bipolar_detent(tone_0_to_1);
+    if (tone_bi == 0.0f) {
+        st->tone_mode = 0U;
+    } else if (tone_bi < 0.0f) {
+        const float mag = -tone_bi;
+        const float inv = 1.0f - mag;
+        const float cutoff = 180.0f + (inv * inv * 14000.0f);
+        st->tone_g = fast_onepole_g_control(cutoff);
+        st->tone_mode = 1U;
+    } else {
+        const float cutoff = 30.0f + (tone_bi * tone_bi * 4500.0f);
+        st->tone_g = fast_onepole_g_control(cutoff);
+        st->tone_mode = 2U;
+    }
+}
+
+void sp1_drum_voices_set_siren(sp1_drum_synth_t *synth,
+                               bool gate,
+                               float pitch_0_to_1,
+                               float lfo_rate_0_to_1,
+                               float lfo_shape_0_to_1,
+                               float delay_send_0_to_1) {
+    if (synth == NULL) {
+        return;
+    }
+    sp1_dub_siren_t *sr = &synth->siren;
+    if (gate && !sr->gate && !sr->active) {
+        sr->lfo_phase = 0U;
+    }
+    sr->gate = gate;
+    if (gate) {
+        sr->active = true;
+    }
+
+    const float p = clamp01(pitch_0_to_1);
+    sr->base_freq_hz = 140.0f + (p * p * 1260.0f); /* 140 Hz .. 1,400 Hz */
+
+    const float r = clamp01(lfo_rate_0_to_1);
+    const float rate_hz = 0.40f + (r * r * 17.60f); /* 0.4 Hz .. 18.0 Hz */
+    sr->lfo_inc = sp1_hz_to_phase_inc(rate_hz);
+
+    const float sh = clamp01(lfo_shape_0_to_1);
+    if (sh >= 0.42f && sh <= 0.58f) {
+        sr->lfo_mode = 0U;
+        sr->lfo_depth_oct = 0.0f;
+    } else if (sh < 0.42f) {
+        sr->lfo_mode = 1U;
+        sr->lfo_depth_oct = ((0.42f - sh) * (1.0f / 0.42f)) * 0.65f;
+    } else {
+        sr->lfo_mode = 2U;
+        sr->lfo_depth_oct = ((sh - 0.58f) * (1.0f / 0.42f)) * 0.55f;
+    }
+
+    sr->delay_send = clamp01(delay_send_0_to_1);
+}
+
+float sp1_drum_voices_get_siren_lfo_level(const sp1_drum_synth_t *synth) {
+    return (synth != NULL) ? synth->siren.last_lfo_vis : 0.5f;
+}
+
 void sp1_drum_voices_trigger(sp1_drum_synth_t *synth,
                              uint8_t track,
                              uint8_t velocity,
@@ -699,13 +1142,13 @@ void sp1_drum_voices_trigger(sp1_drum_synth_t *synth,
     const float gain = vel_norm * accent_boost;
 
     switch (track) {
-    case 0U: { /* Track 1: Kick / Sub (200 Hz -> 45 Hz) */
+    case 0U: { /* Track 1: Kick / Sub */
         sp1_kick_voice_t *k = &synth->kick;
         k->phase = 0U;
         k->amp_env = 1.0f;
         k->pitch_env = 1.0f;
         k->click_env = 1.0f;
-        k->pitch_span_hz = accent ? 175.0f : 155.0f;
+        k->pitch_span_hz = k->pitch_span_base_hz + (accent ? 20.0f : 0.0f);
         k->velocity_gain = gain * 0.72f;
         k->active = true;
         break;
@@ -713,7 +1156,7 @@ void sp1_drum_voices_trigger(sp1_drum_synth_t *synth,
     case 1U: { /* Track 2: Snare / Rimshot */
         sp1_snare_voice_t *s = &synth->snare;
         s->phase_body = 0U;
-        s->phase_rim = 0x20000000U; /* 45-degree initial phase offset for crisp rim knock */
+        s->phase_rim = 0x20000000U;
         s->body_env = 1.0f;
         s->noise_env = 1.0f;
         s->knock_env = 1.0f;
@@ -767,56 +1210,61 @@ void sp1_drum_voices_render_block(sp1_drum_synth_t *synth,
         memset(out_send_r, 0, bytes);
     }
 
-    if (num_triggers == 0U &&
-        !synth->kick.active && !synth->snare.active &&
-        !synth->hat.active && !synth->perc.active) {
+    const bool any_drum = (num_triggers > 0U) ||
+                          synth->kick.active || synth->snare.active ||
+                          synth->hat.active || synth->perc.active;
+    const bool any_siren = synth->siren.gate || synth->siren.active;
+    if (!any_drum && !any_siren) {
         return;
     }
 
-    uint32_t next_trig = 0U;
-    uint32_t cursor = 0U;
+    if (any_drum) {
+        uint32_t next_trig = 0U;
+        uint32_t cursor = 0U;
 
-    while (cursor < num_frames) {
-        /* Dispatch all triggers scheduled at or before cursor */
-        while (triggers != NULL && next_trig < num_triggers &&
-               triggers[next_trig].block_offset <= cursor) {
-            const sp1_seq_trigger_event_t *ev = &triggers[next_trig];
-            sp1_drum_voices_trigger(synth, ev->track, ev->velocity, ev->accent);
-            next_trig++;
-        }
+        while (cursor < num_frames) {
+            while (triggers != NULL && next_trig < num_triggers &&
+                   triggers[next_trig].block_offset <= cursor) {
+                const sp1_seq_trigger_event_t *ev = &triggers[next_trig];
+                sp1_drum_voices_trigger(synth, ev->track, ev->velocity, ev->accent);
+                next_trig++;
+            }
 
-        uint32_t seg_end = num_frames;
-        if (triggers != NULL && next_trig < num_triggers) {
-            const uint32_t next_off = (uint32_t)triggers[next_trig].block_offset;
-            if (next_off < seg_end) {
-                seg_end = next_off;
+            uint32_t seg_end = num_frames;
+            if (triggers != NULL && next_trig < num_triggers) {
+                const uint32_t next_off = (uint32_t)triggers[next_trig].block_offset;
+                if (next_off < seg_end) {
+                    seg_end = next_off;
+                }
             }
-        }
 
-        if (seg_end > cursor) {
-            /* Render each active voice across [cursor, seg_end) with full ICACHE residency */
-            if (synth->kick.active) {
-                render_kick_segment(&synth->kick, out_main_l, out_main_r, cursor, seg_end);
+            if (seg_end > cursor) {
+                if (synth->kick.active) {
+                    render_kick_segment(&synth->kick, &synth->strips[0],
+                                        out_main_l, out_main_r, out_send_l, out_send_r,
+                                        cursor, seg_end);
+                }
+                if (synth->snare.active) {
+                    render_snare_segment(&synth->snare, &synth->strips[1],
+                                         out_main_l, out_main_r, out_send_l, out_send_r,
+                                         cursor, seg_end);
+                }
+                if (synth->hat.active) {
+                    render_hat_segment(&synth->hat, &synth->strips[2],
+                                       out_main_l, out_main_r, out_send_l, out_send_r,
+                                       cursor, seg_end);
+                }
+                if (synth->perc.active) {
+                    render_perc_segment(&synth->perc, &synth->strips[3],
+                                        out_main_l, out_main_r, out_send_l, out_send_r,
+                                        cursor, seg_end);
+                }
+                cursor = seg_end;
             }
-            if (synth->snare.active) {
-                render_snare_segment(&synth->snare, out_main_l, out_main_r,
-                                     out_send_l, out_send_r, cursor, seg_end);
-            }
-            if (synth->hat.active) {
-                render_hat_segment(&synth->hat, out_main_l, out_main_r, cursor, seg_end);
-            }
-            if (synth->perc.active) {
-                render_perc_segment(&synth->perc, out_main_l, out_main_r,
-                                    out_send_l, out_send_r, cursor, seg_end);
-            }
-            cursor = seg_end;
         }
     }
 
-    /* Fire any trailing triggers clamped past num_frames - 1 */
-    while (triggers != NULL && next_trig < num_triggers) {
-        const sp1_seq_trigger_event_t *ev = &triggers[next_trig];
-        sp1_drum_voices_trigger(synth, ev->track, ev->velocity, ev->accent);
-        next_trig++;
+    if (any_siren) {
+        render_siren_block(&synth->siren, out_main_l, out_main_r, out_send_l, out_send_r, num_frames);
     }
 }

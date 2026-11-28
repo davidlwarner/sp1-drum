@@ -281,6 +281,7 @@ static const char *sp1_button_name(sp1_button_id_t btn) {
 }
 
 static int16_t g_fader_raw_latest[SP1_NUM_FADERS];
+static int32_t g_battery_mv_latest = 4100;
 static int8_t g_prev_ain0_btn = -1;
 static int8_t g_prev_ain1_btn = -1;
 
@@ -315,6 +316,10 @@ int16_t sp1_hal_controls_get_fader_raw(uint8_t fader_idx) {
         return 0;
     }
     return __atomic_load_n(&g_fader_raw_latest[fader_idx], __ATOMIC_ACQUIRE);
+}
+
+int32_t sp1_hal_controls_get_battery_mv(void) {
+    return __atomic_load_n(&g_battery_mv_latest, __ATOMIC_ACQUIRE);
 }
 
 void sp1_hal_controls_on_button_event(sp1_button_id_t btn, bool pressed) {
@@ -958,14 +963,15 @@ static int8_t sp1_decode_ain1_btn(int32_t mv) {
     return best_btn;
 }
 
-static void sp1_saadc_scan_6ch(void) {
-    static const uint32_t k_pselp[6] = {
+static void sp1_saadc_scan_7ch(void) {
+    static const uint32_t k_pselp[7] = {
         SAADC_CH_PSELP_PSELP_AnalogInput0, /* 0: AIN0 tracks */
         SAADC_CH_PSELP_PSELP_AnalogInput1, /* 1: AIN1 volume */
         SAADC_CH_PSELP_PSELP_AnalogInput2, /* 2: AIN2 fader3 */
         SAADC_CH_PSELP_PSELP_AnalogInput3, /* 3: AIN3 fader1 */
-        SAADC_CH_PSELP_PSELP_AnalogInput6, /* 4: AIN6 fader2 */
-        SAADC_CH_PSELP_PSELP_AnalogInput7, /* 5: AIN7 fader4 */
+        SAADC_CH_PSELP_PSELP_AnalogInput4, /* 4: AIN4 battery divider (P0.28) */
+        SAADC_CH_PSELP_PSELP_AnalogInput6, /* 5: AIN6 fader2 */
+        SAADC_CH_PSELP_PSELP_AnalogInput7, /* 6: AIN7 fader4 */
     };
     static const uint32_t k_ch_cfg =
         (SAADC_CH_CONFIG_RESP_Bypass << SAADC_CH_CONFIG_RESP_Pos) |
@@ -976,7 +982,7 @@ static void sp1_saadc_scan_6ch(void) {
         (SAADC_CH_CONFIG_MODE_SE << SAADC_CH_CONFIG_MODE_Pos) |
         (SAADC_CH_CONFIG_BURST_Disabled << SAADC_CH_CONFIG_BURST_Pos);
 
-    int16_t buf[6] = { 0 };
+    int16_t buf[7] = { 0 };
 
     NRF_SAADC->ENABLE = 0U;
     NRF_SAADC->INTENCLR = 0xFFFFFFFFUL;
@@ -984,18 +990,16 @@ static void sp1_saadc_scan_6ch(void) {
     NRF_SAADC->OVERSAMPLE = SAADC_OVERSAMPLE_OVERSAMPLE_Bypass;
     NRF_SAADC->SAMPLERATE = 0U;
 
-    for (uint32_t ch = 0U; ch < 6U; ++ch) {
+    for (uint32_t ch = 0U; ch < 7U; ++ch) {
         NRF_SAADC->CH[ch].PSELP = k_pselp[ch];
         NRF_SAADC->CH[ch].PSELN = SAADC_CH_PSELN_PSELN_NC;
         NRF_SAADC->CH[ch].CONFIG = k_ch_cfg;
     }
-    for (uint32_t ch = 6U; ch < 8U; ++ch) {
-        NRF_SAADC->CH[ch].PSELP = SAADC_CH_PSELP_PSELP_NC;
-        NRF_SAADC->CH[ch].PSELN = SAADC_CH_PSELN_PSELN_NC;
-    }
+    NRF_SAADC->CH[7].PSELP = SAADC_CH_PSELP_PSELP_NC;
+    NRF_SAADC->CH[7].PSELN = SAADC_CH_PSELN_PSELN_NC;
 
     NRF_SAADC->RESULT.PTR = (uint32_t)(uintptr_t)buf;
-    NRF_SAADC->RESULT.MAXCNT = 6U;
+    NRF_SAADC->RESULT.MAXCNT = 7U;
     NRF_SAADC->EVENTS_STARTED = 0U;
     NRF_SAADC->EVENTS_END = 0U;
     NRF_SAADC->EVENTS_STOPPED = 0U;
@@ -1016,8 +1020,8 @@ static void sp1_saadc_scan_6ch(void) {
         return;
     }
 
-    /* Update 4 faders: fader0=AIN3(buf[3]), fader1=AIN6(buf[4]), fader2=AIN2(buf[2]), fader3=AIN7(buf[5]) */
-    const int16_t raw_faders[SP1_NUM_FADERS] = { buf[3], buf[4], buf[2], buf[5] };
+    /* Update 4 faders: fader0=AIN3(buf[3]), fader1=AIN6(buf[5]), fader2=AIN2(buf[2]), fader3=AIN7(buf[6]) */
+    const int16_t raw_faders[SP1_NUM_FADERS] = { buf[3], buf[5], buf[2], buf[6] };
     for (uint8_t i = 0U; i < SP1_NUM_FADERS; ++i) {
         int16_t s = raw_faders[i];
         if (s < 0) {
@@ -1027,6 +1031,15 @@ static void sp1_saadc_scan_6ch(void) {
         }
         __atomic_store_n(&g_fader_raw_latest[i], s, __ATOMIC_RELEASE);
         sp1_hal_controls_on_fader_raw(i, s);
+    }
+
+    /* Update AIN4 (buf[4]) divided LiPo battery voltage with 7/8 IIR smoothing */
+    const int32_t ain4_mv = (buf[4] <= 0) ? 0 : (((int32_t)buf[4] * 3300) / 4096);
+    if (ain4_mv >= 1200) {
+        const int32_t est_batt_mv = (ain4_mv < 2800) ? (ain4_mv * 2) : ain4_mv;
+        const int32_t prev_mv = __atomic_load_n(&g_battery_mv_latest, __ATOMIC_RELAXED);
+        const int32_t smooth_mv = ((prev_mv * 7) + est_batt_mv + 4) / 8;
+        __atomic_store_n(&g_battery_mv_latest, smooth_mv, __ATOMIC_RELEASE);
     }
 
     /* Decode AIN0 (tracks + Play) and AIN1 (RWD/Vol-/FWD/Vol+) */
@@ -1059,7 +1072,7 @@ static void sp1_saadc_scan_6ch(void) {
 
 void sp1_hal_service_background(void) {
 #if defined(NRF_SAADC)
-    sp1_saadc_scan_6ch();
+    sp1_saadc_scan_7ch();
 #endif
     sp1_hal_midi_flush_tx();
 }

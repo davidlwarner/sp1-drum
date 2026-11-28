@@ -87,7 +87,7 @@ static midi::MidiController g_midi;
 static leds::Leds g_leds;
 static power::PowerManager g_power;
 
-/* Static RAM: 768 B sequencer + 80 B UI mapper + 296 B 4-voice synth + 41,124 B master FX */
+/* Static RAM: ~808 B sequencer + ~248 B UI mapper + ~520 B synth + ~49,352 B master FX */
 static sp1_sequencer_t g_sequencer;
 static sp1_ui_mapper_t g_ui_mapper;
 static sp1_drum_synth_t g_drum_synth;
@@ -97,6 +97,8 @@ static uint32_t g_audio_ctrl_decim = 0U;
 static uint32_t g_led_track_packed = 0U;
 static uint32_t g_led_play_packed = 0U;
 static uint32_t g_target_volume = SP1_UI_VOLUME_DEFAULT;
+static uint32_t g_power_status_packed = 255U;
+static uint8_t g_applied_kit_seq = 0U;
 static int g_main_wdt_channel = -1;
 
 static constexpr uint32_t kAudioCtrlDecimBlocks = 12U; /* 12 * 80 frames = 960 frames = 20 ms (50 Hz) */
@@ -121,24 +123,50 @@ static void sp1_audio_render_cb(int16_t *interleaved_stereo,
     const uint32_t block_frames =
         (num_frames > SP1_AUDIO_BLOCK_FRAMES) ? SP1_AUDIO_BLOCK_FRAMES : num_frames;
 
-    const bool run_ctrl_tick = (g_audio_ctrl_decim == 0U);
-    const bool run_led_tick = (g_audio_ctrl_decim == 6U);
+    /* Stagger UI update (sub-block 1) and LED render (sub-block 7) off downbeat block 0 */
+    const bool run_ctrl_tick = (g_audio_ctrl_decim == 1U);
+    const bool run_led_tick = (g_audio_ctrl_decim == 7U);
     g_audio_ctrl_decim++;
     if (g_audio_ctrl_decim >= kAudioCtrlDecimBlocks) {
         g_audio_ctrl_decim = 0U;
     }
 
     if (run_ctrl_tick) {
+        const uint32_t pwr_w = __atomic_load_n(&g_power_status_packed, __ATOMIC_ACQUIRE);
+        const float batt_norm = static_cast<float>(pwr_w & 0xFFU) * (1.0f / 255.0f);
+        const bool charging = (pwr_w & (1U << 8U)) != 0U;
+        const bool usb_present = (pwr_w & (1U << 9U)) != 0U;
+        sp1_ui_mapper_set_power_state(&g_ui_mapper, batt_norm, charging, usb_present);
+
         sp1_controls_snapshot_t snap{};
         sp1_hal_controls_poll(&snap);
         sp1_ui_mapper_update(&g_ui_mapper, &g_sequencer, &snap);
 
         const sp1_ui_dsp_params_t *dsp = sp1_ui_mapper_get_dsp_params(&g_ui_mapper);
         if (dsp != nullptr) {
-            sp1_drum_voices_set_kick_params(&g_drum_synth, dsp->kick_decay, dsp->kick_drive);
-            sp1_drum_voices_set_snare_morph(&g_drum_synth, dsp->snare_morph);
-            sp1_drum_voices_set_hat_decay(&g_drum_synth, dsp->hat_decay);
-            sp1_drum_voices_set_perc_timbre(&g_drum_synth, dsp->perc_timbre);
+            if (dsp->kit_change_seq != g_applied_kit_seq) {
+                sp1_drum_voices_load_kit(&g_drum_synth, dsp->active_kit);
+                g_applied_kit_seq = dsp->kit_change_seq;
+            }
+            for (uint8_t t = 0U; t < SP1_SEQ_NUM_TRACKS; ++t) {
+                for (uint8_t p = 0U; p < SP1_UI_NUM_VOICE_PARAMS; ++p) {
+                    sp1_drum_voices_set_voice_param(
+                        &g_drum_synth, t, p, dsp->voice_params[t][p]);
+                }
+                sp1_drum_voices_set_track_mix(&g_drum_synth,
+                                              t,
+                                              dsp->track_level[t],
+                                              dsp->track_pan[t],
+                                              dsp->track_delay_send[t],
+                                              dsp->track_tone[t]);
+            }
+
+            sp1_drum_voices_set_siren(&g_drum_synth,
+                                      dsp->siren_gate,
+                                      dsp->siren_pitch,
+                                      dsp->siren_lfo_rate,
+                                      dsp->siren_lfo_shape,
+                                      dsp->siren_delay_send);
 
             sp1_master_fx_set_dj_filter(&g_master_fx, dsp->dj_filter_pos, dsp->dj_resonance_q);
             sp1_master_fx_set_stutter(
@@ -146,6 +174,10 @@ static void sp1_audio_render_cb(int16_t *interleaved_stereo,
             sp1_master_fx_set_bitcrusher(&g_master_fx, dsp->crush_amount);
             sp1_master_fx_set_dub_delay(
                 &g_master_fx, dsp->dub_delay_wet, dsp->dub_delay_feedback);
+            sp1_master_fx_set_dub_delay_time(
+                &g_master_fx, dsp->dub_delay_time, dsp->dub_delay_free_dragging);
+            sp1_master_fx_set_siren_throw(
+                &g_master_fx, dsp->siren_gate, dsp->siren_delay_send);
 
             __atomic_store_n(&g_target_volume,
                              static_cast<uint32_t>(dsp->master_volume),
@@ -161,7 +193,18 @@ static void sp1_audio_render_cb(int16_t *interleaved_stereo,
                                                       SP1_SEQ_MAX_BLOCK_TRIGGERS);
     sp1_ui_mapper_on_triggers(&g_ui_mapper, triggers, trig_count);
 
+    sp1_drum_voices_render_block(&g_drum_synth,
+                                 triggers,
+                                 trig_count,
+                                 g_dsp_main_l,
+                                 g_dsp_main_r,
+                                 g_dsp_send_l,
+                                 g_dsp_send_r,
+                                 block_frames);
+
     if (run_led_tick) {
+        sp1_ui_mapper_set_siren_visual(
+            &g_ui_mapper, sp1_drum_voices_get_siren_lfo_level(&g_drum_synth));
         sp1_led_frame_t led_frame{};
         sp1_ui_mapper_render_leds(&g_ui_mapper, &g_sequencer, kAudioCtrlCadenceMs, &led_frame);
         const uint32_t track_w =
@@ -177,15 +220,6 @@ static void sp1_audio_render_cb(int16_t *interleaved_stereo,
         __atomic_store_n(&g_led_track_packed, track_w, __ATOMIC_RELEASE);
         __atomic_store_n(&g_led_play_packed, play_w, __ATOMIC_RELEASE);
     }
-
-    sp1_drum_voices_render_block(&g_drum_synth,
-                                 triggers,
-                                 trig_count,
-                                 g_dsp_main_l,
-                                 g_dsp_main_r,
-                                 g_dsp_send_l,
-                                 g_dsp_send_r,
-                                 block_frames);
 
     const uint32_t step_16th_frames =
         sp1_clock_get_step_frames(sp1_seq_clock_const(&g_sequencer));
@@ -402,7 +436,9 @@ int main(void) {
     sp1_master_fx_init(&g_master_fx);
     g_audio_frame_counter = 0ULL;
     g_audio_ctrl_decim = 0U;
+    g_applied_kit_seq = 0U;
     __atomic_store_n(&g_target_volume, SP1_UI_VOLUME_DEFAULT, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_power_status_packed, 255U, __ATOMIC_RELEASE);
     core::watchdog::feed(main_wdt);
 
     // ── Start HSM (always reached; STATE_IDLE gates battery SYSTEM_OFF wake) ─
@@ -417,6 +453,7 @@ int main(void) {
     machine.led_track_packed = &g_led_track_packed;
     machine.led_play_packed = &g_led_play_packed;
     machine.target_volume = &g_target_volume;
+    machine.power_status_packed = &g_power_status_packed;
     machine.start_runtime = start_sp1_runtime;
     machine.main_watchdog_channel = main_wdt;
     machine.audio_active = false;
